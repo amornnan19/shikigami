@@ -55,6 +55,41 @@ describe("applyEvent", () => {
   });
 });
 
+describe("notices", () => {
+  it("shows a notice once when its event follows a refetch that already has it", () => {
+    const notice = { kind: "notice", itemId: "n", text: "New session" };
+    const once = apply(base, notice);
+    const twice = apply(once, notice);
+    expect(twice.turns[0]?.items).toEqual([{ type: "notice", id: "n", text: "New session" }]);
+  });
+});
+
+describe("refetch during a stream", () => {
+  const running = (text: string): Conversation => ({
+    turns: [{ ...turn("t1"), items: [{ type: "text", id: "i", text }] }],
+    hasMore: false,
+  });
+
+  it("keeps the longer streamed text of a running turn", () => {
+    const merged = mergeNewest(running("pong and more"), running("pong"));
+    expect(merged.turns[0]?.items).toEqual([{ type: "text", id: "i", text: "pong and more" }]);
+  });
+
+  it("takes the fresh text when it is longer", () => {
+    const merged = mergeNewest(running("po"), running("pong"));
+    expect(merged.turns[0]?.items).toEqual([{ type: "text", id: "i", text: "pong" }]);
+  });
+
+  it("takes the saved text of a turn that has ended", () => {
+    const ended = running("pong");
+    const first = ended.turns[0];
+    if (!first) throw new Error("no turn");
+    ended.turns[0] = { ...first, status: "completed" };
+    const merged = mergeNewest(running("pong and more"), ended);
+    expect(merged.turns[0]?.items).toEqual([{ type: "text", id: "i", text: "pong" }]);
+  });
+});
+
 describe("paging", () => {
   it("keeps older turns that a refetch of the newest page does not return", () => {
     const previous = { turns: [turn("t1"), turn("t2"), turn("t3")], hasMore: true };

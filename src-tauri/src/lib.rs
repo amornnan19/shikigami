@@ -90,8 +90,16 @@ pub fn run() {
             turns::send_message,
             turns::get_conversation
         ])
-        .run(app_context())
-        .expect("error while running tauri application");
+        .build(app_context())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if matches!(
+                event,
+                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+            ) {
+                turns::stop_all_turns(app);
+            }
+        });
 }
 
 #[cfg(test)]

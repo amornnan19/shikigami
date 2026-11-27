@@ -28,8 +28,10 @@ export function useConversation(agentId: string) {
   const [loadingOlder, setLoadingOlder] = useState(false);
   const query = useQuery({
     queryKey: key(agentId),
-    queryFn: async () =>
-      mergeNewest(client.getQueryData<Conversation>(key(agentId)), await getConversation(agentId)),
+    queryFn: async () => {
+      const fresh = await getConversation(agentId);
+      return mergeNewest(client.getQueryData<Conversation>(key(agentId)), fresh);
+    },
     retry: false,
   });
   const oldestId = query.data?.turns[0]?.id;

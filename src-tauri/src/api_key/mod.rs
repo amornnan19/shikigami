@@ -19,6 +19,8 @@ const LAST_FOUR: usize = 4;
 pub struct ApiKeyError {
     pub code: &'static str,
     pub message: String,
+    #[serde(skip)]
+    pub status: Option<i32>,
 }
 
 impl ApiKeyError {
@@ -26,6 +28,7 @@ impl ApiKeyError {
         Self {
             code,
             message: message.into(),
+            status: None,
         }
     }
 
@@ -57,7 +60,14 @@ impl ApiKeyError {
 
 impl From<SecretError> for ApiKeyError {
     fn from(error: SecretError) -> Self {
-        Self::new("keychain-failed", error.to_string())
+        let status = match error {
+            SecretError::Read(status) => status,
+            SecretError::Write | SecretError::Delete => None,
+        };
+        Self {
+            status,
+            ..Self::new("keychain-failed", error.to_string())
+        }
     }
 }
 
@@ -225,7 +235,10 @@ pub fn key_for_turn(
     if provider != CLAUDE_CODE_ID || !switch_is_on(db)? || !store.exists(ACCOUNT)? {
         return Ok(None);
     }
-    Ok(store.get(ACCOUNT)?)
+    store
+        .get(ACCOUNT)?
+        .map(Some)
+        .ok_or_else(|| SecretError::Read(None).into())
 }
 
 pub fn api_key_for_turn(
@@ -436,10 +449,10 @@ mod tests {
 
     impl SecretStore for Broken {
         fn exists(&self, _: &str) -> Result<bool, SecretError> {
-            Err(SecretError::Read)
+            Err(SecretError::Read(None))
         }
         fn get(&self, _: &str) -> Result<Option<SecretString>, SecretError> {
-            Err(SecretError::Read)
+            Err(SecretError::Read(None))
         }
         fn set(&self, _: &str, _: &SecretString) -> Result<(), SecretError> {
             Err(SecretError::Write)
@@ -585,6 +598,41 @@ mod tests {
         let fx = fixture();
         let error = key_for_turn(&fx.db, &Broken, PROVIDER).unwrap_err();
         assert_eq!(error.code, "keychain-failed");
+    }
+
+    struct Vanished;
+
+    impl SecretStore for Vanished {
+        fn exists(&self, _: &str) -> Result<bool, SecretError> {
+            Ok(true)
+        }
+        fn get(&self, _: &str) -> Result<Option<SecretString>, SecretError> {
+            Ok(None)
+        }
+        fn set(&self, _: &str, _: &SecretString) -> Result<(), SecretError> {
+            Ok(())
+        }
+        fn delete(&self, _: &str) -> Result<(), SecretError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_saved_item_that_cannot_be_read_back_is_an_error_for_a_turn() {
+        let fx = fixture();
+        let error = key_for_turn(&fx.db, &Vanished, PROVIDER).unwrap_err();
+        assert_eq!(error.code, "keychain-failed");
+        assert_eq!(error.status, None);
+    }
+
+    #[test]
+    fn the_keychain_status_code_is_kept_for_diagnostics_and_never_serialised() {
+        let error = ApiKeyError::from(SecretError::Read(Some(-25293)));
+        assert_eq!(error.status, Some(-25293));
+        assert_eq!(
+            serde_json::to_value(&error).unwrap(),
+            serde_json::json!({"code": "keychain-failed", "message": "could not read the saved API key from the Keychain"})
+        );
     }
 
     #[test]

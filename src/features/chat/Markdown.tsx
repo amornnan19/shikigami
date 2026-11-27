@@ -59,8 +59,19 @@ function ExternalLink({ href, children }: { href?: string; children?: ReactNode 
   );
 }
 
+function ImageAsLink({ src, alt }: { src?: string | Blob; alt?: string }) {
+  const url = typeof src === "string" ? src : "";
+  return (
+    <span>
+      {alt ? `${alt} ` : null}
+      {url ? <ExternalLink href={url}>{url}</ExternalLink> : null}
+    </span>
+  );
+}
+
 const components: Components = {
   a: ExternalLink,
+  img: ImageAsLink,
   pre: CodeBlock,
   code: ({ className, children }) => (
     <code

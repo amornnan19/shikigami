@@ -40,7 +40,7 @@ impl fmt::Debug for SecretString {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum SecretError {
     #[error("could not read the saved API key from the Keychain")]
-    Read,
+    Read(Option<i32>),
     #[error("could not save the API key in the Keychain")]
     Write,
     #[error("could not remove the API key from the Keychain")]

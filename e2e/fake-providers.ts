@@ -1,4 +1,4 @@
-import { chmodSync, copyFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -8,7 +8,12 @@ export const fakeProviderDir = join(root, "e2e", "artifacts", "fake-providers");
 export const fakeClaudeVersionFile = join(fakeProviderDir, "claude-version");
 export const fakeClaudeInvocations = join(fakeProviderDir, "invocations.log");
 const fixtureDir = join(root, "src-tauri", "tests", "fixtures");
-const fixtureNames = ["claude-stream-basic.jsonl", "claude-stream-tool.jsonl"];
+const fixtureNames = ["claude-stream-basic.jsonl", "claude-stream-denied.jsonl"];
+
+export function fakeClaudeSessionId(): string {
+  const [init = ""] = readFileSync(join(fixtureDir, fixtureNames[0] ?? ""), "utf8").split("\n");
+  return JSON.parse(init).session_id;
+}
 
 export function setFakeClaudeVersion(version: string) {
   writeFileSync(fakeClaudeVersionFile, `${version}\n`);
@@ -32,9 +37,17 @@ case "$1" in
   auth) echo '{"loggedIn": true}' ;;
   -p)
     echo "$*" >> "$dir/invocations.log"
+    case " $* " in
+      *" --setting-sources project --strict-mcp-config --permission-mode manual --permission-prompts none "*) ;;
+      *) echo "Claude Code was not started isolated." >&2; exit 2 ;;
+    esac
+    case "$*" in
+      *bypassPermissions*|*acceptEdits*|*dontAsk*|*dangerously*|*allowedTools*|*" auto"*)
+        echo "Claude Code was started with a widened permission." >&2; exit 2 ;;
+    esac
     message=$(cat)
     case "$message" in
-      *files*) fixture="$dir/claude-stream-tool.jsonl" ;;
+      *files*) fixture="$dir/claude-stream-denied.jsonl" ;;
       *) fixture="$dir/claude-stream-basic.jsonl" ;;
     esac
     while IFS= read -r line; do
