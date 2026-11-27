@@ -13,7 +13,7 @@
     "e2e": "tauri build --debug --no-bundle --features e2e && wdio run e2e/wdio.conf.ts && wdio run e2e/wdio.startup-error.conf.ts",
     "lint": "biome check --error-on-warnings .",
     "format": "biome check --write .",
-    "typecheck": "tsc --noEmit && tsc --noEmit -p e2e",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p e2e && tsc --noEmit -p scripts",
     "test": "vitest run",
     "rust:fmt": "cargo fmt --manifest-path src-tauri/Cargo.toml --check",
     "rust:lint": "cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings",

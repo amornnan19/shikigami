@@ -1,0 +1,67 @@
+name: Version
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: version
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    name: bump
+    if: "!startsWith(github.event.head_commit.message, 'chore(release):')"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.5
+
+      - run: bun install --frozen-lockfile
+
+      - id: bump
+        run: bun scripts/bump-version.ts --write
+
+      - name: Open and merge the release pull request
+        if: steps.bump.outputs.bump != 'none'
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          branch="release/v${VERSION}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "${branch}"
+          git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock
+          git commit -m "chore(release): v${VERSION}"
+          git push origin "${branch}"
+          gh pr create --base main --head "${branch}" \
+            --title "chore(release): v${VERSION}" \
+            --body "Automated version bump from the commits since the previous tag."
+          merged=0
+          for _ in $(seq 1 10); do
+            if gh pr merge "${branch}" --rebase --delete-branch; then
+              merged=1
+              break
+            fi
+            sleep 6
+          done
+          test "${merged}" = 1
+          git fetch origin main
+          release_commit=$(git log origin/main --fixed-strings --grep="chore(release): v${VERSION}" --format=%H -n 1)
+          test -n "${release_commit}"
+          git tag "v${VERSION}" "${release_commit}"
+          git push origin "v${VERSION}"
