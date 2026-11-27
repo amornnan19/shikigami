@@ -8,6 +8,7 @@ pub mod secrets;
 mod settings;
 mod turns;
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use tauri::Manager;
@@ -21,8 +22,11 @@ pub struct DataDir(pub PathBuf);
 
 pub struct AppStartupError(pub String);
 
-fn resolve_data_dir(app: &tauri::App) -> Result<PathBuf, String> {
-    match std::env::var_os(DATA_DIR_ENV) {
+fn data_dir_from(
+    override_dir: Option<OsString>,
+    default_dir: impl FnOnce() -> Result<PathBuf, String>,
+) -> Result<PathBuf, String> {
+    match override_dir {
         Some(dir) if !dir.is_empty() => {
             let path = PathBuf::from(dir);
             if path.is_absolute() {
@@ -34,11 +38,16 @@ fn resolve_data_dir(app: &tauri::App) -> Result<PathBuf, String> {
                 ))
             }
         }
-        _ => app
-            .path()
-            .app_data_dir()
-            .map_err(|error| format!("could not find the data folder: {error}")),
+        _ => default_dir(),
     }
+}
+
+fn resolve_data_dir(app: &tauri::App) -> Result<PathBuf, String> {
+    data_dir_from(std::env::var_os(DATA_DIR_ENV), || {
+        app.path()
+            .app_data_dir()
+            .map_err(|error| format!("could not find the data folder: {error}"))
+    })
 }
 
 fn open_database(data_dir: &Path) -> Result<db::Database, String> {
@@ -82,6 +91,7 @@ pub fn run() {
             app.manage(turns::TurnRegistry::default());
             app.manage(agents::WorkspacesRoot(agents::resolve_workspaces_root(
                 app.path().home_dir().ok(),
+                std::env::var_os(agents::WORKSPACES_DIR_ENV),
             )));
             app.manage(DataDir(data_dir));
             Ok(())
@@ -124,13 +134,33 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::app_context;
+    use super::{app_context, data_dir_from};
+    use std::ffi::OsString;
+    use std::path::PathBuf;
 
     #[test]
     fn product_name_is_shikigami() {
         assert_eq!(
             app_context().config().product_name.as_deref(),
             Some("Shikigami")
+        );
+    }
+
+    #[test]
+    fn the_data_folder_override_must_be_absolute_and_the_default_is_the_fallback() {
+        let default = || Ok(PathBuf::from("/Users/me/Library/Data"));
+        assert_eq!(
+            data_dir_from(None, default).unwrap(),
+            PathBuf::from("/Users/me/Library/Data")
+        );
+        assert_eq!(
+            data_dir_from(Some(OsString::new()), default).unwrap(),
+            PathBuf::from("/Users/me/Library/Data")
+        );
+        assert!(data_dir_from(Some("relative/dir".into()), default).is_err());
+        assert_eq!(
+            data_dir_from(Some("/tmp/elsewhere".into()), default).unwrap(),
+            PathBuf::from("/tmp/elsewhere")
         );
     }
 }

@@ -62,6 +62,8 @@ impl AppAuth {
 pub struct AuthError {
     pub code: &'static str,
     pub message: String,
+    #[serde(skip)]
+    pub status: Option<i32>,
 }
 
 impl AuthError {
@@ -69,15 +71,21 @@ impl AuthError {
         Self {
             code: "database-failed",
             message: format!("Could not use the sign-in setting: {error}"),
+            status: None,
         }
     }
 
     pub const KEYCHAIN_FAILED: &'static str = "keychain-failed";
 
     fn keychain(error: SecretError) -> Self {
+        let status = match error {
+            SecretError::Read(status) => status,
+            SecretError::Write | SecretError::Delete => None,
+        };
         Self {
             code: Self::KEYCHAIN_FAILED,
             message: error.to_string(),
+            status,
         }
     }
 
@@ -85,6 +93,7 @@ impl AuthError {
         Self {
             code: "unavailable",
             message: "The app database is not available.".to_owned(),
+            status: None,
         }
     }
 }
@@ -94,6 +103,7 @@ impl From<ApiKeyError> for AuthError {
         Self {
             code: error.code,
             message: error.message,
+            status: error.status,
         }
     }
 }

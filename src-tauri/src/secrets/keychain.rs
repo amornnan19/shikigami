@@ -59,3 +59,33 @@ impl SecretStore for KeychainStore {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn platform_failure(code: i32) -> Error {
+        Error::PlatformFailure(Box::new(security_framework::base::Error::from_code(code)))
+    }
+
+    #[test]
+    fn a_platform_failure_keeps_the_os_status_code() {
+        assert_eq!(
+            read_failure(&platform_failure(-25293)),
+            SecretError::Read(Some(-25293))
+        );
+        let denied =
+            Error::NoStorageAccess(Box::new(security_framework::base::Error::from_code(-128)));
+        assert_eq!(read_failure(&denied), SecretError::Read(Some(-128)));
+    }
+
+    #[test]
+    fn a_failure_without_an_os_status_has_no_code() {
+        let other = Error::PlatformFailure(Box::new(std::fmt::Error));
+        assert_eq!(read_failure(&other), SecretError::Read(None));
+        assert_eq!(
+            read_failure(&Error::TooLong("x".into(), 1)),
+            SecretError::Read(None)
+        );
+    }
+}

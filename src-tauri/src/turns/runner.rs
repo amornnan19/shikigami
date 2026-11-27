@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::env;
+use std::ffi::OsStr;
 use std::io;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -26,6 +27,8 @@ const STDERR_LINE_LIMIT: usize = 4096;
 const TEXT_WRITE_INTERVAL: Duration = Duration::from_millis(500);
 const EXIT_GRACE: Duration = Duration::from_secs(5);
 const STDERR_GRACE: Duration = Duration::from_secs(2);
+const ALLOWED_VARIABLES: [&str; 7] = ["HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "TERM"];
+const ALLOWED_PREFIX: &str = "LC_";
 const SESSION_MISSING: &str = "No conversation found";
 
 const RESUME_NOTICE: &str =
@@ -38,14 +41,14 @@ pub enum ApiKey {
     Present(SecretString),
     Subscription,
     Missing,
-    Unreadable,
+    Unreadable(Option<i32>),
     Unresolved,
 }
 
 impl ApiKey {
     pub fn from_read(mode: AuthMode, read: Result<Option<SecretString>, ApiKeyError>) -> Self {
         match (mode, read) {
-            (_, Err(_)) => Self::Unreadable,
+            (_, Err(error)) => Self::Unreadable(error.status),
             (_, Ok(Some(key))) => Self::Present(key),
             (AuthMode::Subscription, Ok(None)) => Self::Subscription,
             (AuthMode::ApiKey, Ok(None)) => Self::Missing,
@@ -55,20 +58,28 @@ impl ApiKey {
     fn redactor(&self) -> Redactor {
         match self {
             Self::Present(key) => Redactor::for_key(Some(key)),
-            Self::Subscription | Self::Missing | Self::Unreadable | Self::Unresolved => {
+            Self::Subscription | Self::Missing | Self::Unreadable(_) | Self::Unresolved => {
                 Redactor::none()
             }
         }
     }
 
-    fn refusal(&self) -> Option<&'static str> {
+    fn refusal(&self) -> Option<String> {
         match self {
             Self::Present(_) | Self::Subscription => None,
-            Self::Missing => Some(NO_KEY_SAVED),
-            Self::Unreadable => Some("Could not read the saved API key."),
-            Self::Unresolved => Some("Could not read the sign-in setting."),
+            Self::Missing => Some(NO_KEY_SAVED.to_owned()),
+            Self::Unreadable(Some(status)) => Some(format!(
+                "Could not read the saved API key (Keychain error {status})."
+            )),
+            Self::Unreadable(None) => Some("Could not read the saved API key.".to_owned()),
+            Self::Unresolved => Some("Could not read the sign-in setting.".to_owned()),
         }
     }
+}
+
+fn is_allowed_variable(name: &OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| ALLOWED_VARIABLES.contains(&name) || name.starts_with(ALLOWED_PREFIX))
 }
 
 enum Line {
@@ -113,6 +124,7 @@ struct StderrSummary {
 async fn read_stderr<R: AsyncReadExt + Unpin>(mut stderr: R) -> StderrSummary {
     let mut kept: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 8192];
+    let mut trimmed = false;
     loop {
         match stderr.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
@@ -120,9 +132,14 @@ async fn read_stderr<R: AsyncReadExt + Unpin>(mut stderr: R) -> StderrSummary {
                 kept.extend_from_slice(&chunk[..count]);
                 if kept.len() > STDERR_KEEP {
                     kept.drain(..kept.len() - STDERR_KEEP);
+                    trimmed = true;
                 }
             }
         }
+    }
+    if trimmed {
+        let first_line_end = kept.iter().position(|byte| *byte == b'\n');
+        kept.drain(..first_line_end.map_or(kept.len(), |end| end + 1));
     }
     let text = String::from_utf8_lossy(&kept);
     StderrSummary {
@@ -419,26 +436,21 @@ impl Runner<'_> {
             .args(claude_code::arguments(&launch.model, session))
             .current_dir(&launch.workspace)
             .env_clear()
-            .envs(launch.environment.iter().cloned())
+            .envs(
+                launch
+                    .environment
+                    .iter()
+                    .filter(|(name, _)| is_allowed_variable(name))
+                    .cloned(),
+            )
             .env("PATH", search_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0)
             .kill_on_drop(true);
-        command
-            .env_remove("ANTHROPIC_API_KEY")
-            .env_remove("ANTHROPIC_AUTH_TOKEN");
-        match key {
-            ApiKey::Present(secret) => {
-                command
-                    .env_remove("ANTHROPIC_BASE_URL")
-                    .env("ANTHROPIC_API_KEY", secret.expose());
-            }
-            ApiKey::Subscription => {
-                command.env_remove("ANTHROPIC_BASE_URL");
-            }
-            ApiKey::Missing | ApiKey::Unreadable | ApiKey::Unresolved => {}
+        if let ApiKey::Present(secret) = key {
+            command.env("ANTHROPIC_API_KEY", secret.expose());
         }
         Some(command)
     }
@@ -605,7 +617,7 @@ async fn run_turn(
         return false;
     }
     if let Some(refusal) = key.refusal() {
-        runner.finish("failed", Some(refusal.to_owned()));
+        runner.finish("failed", Some(refusal));
         return false;
     }
     let mut session = launch.session.clone();
@@ -793,7 +805,7 @@ mod tests {
     fn recording(world: &World, rest: &str) -> String {
         let records = world.records().display();
         format!(
-            "n=$(ls \"{records}\" | grep -c '^args' || true)\nfor a in \"$@\"; do echo \"$a\"; done > \"{records}/args.$n\"\ncat > \"{records}/stdin.$n\"\nprintf '%s' \"$ANTHROPIC_API_KEY\" > \"{records}/key.$n\"\nprintf '%s' \"$ANTHROPIC_AUTH_TOKEN\" > \"{records}/token.$n\"\nprintf '%s' \"$ANTHROPIC_BASE_URL\" > \"{records}/base.$n\"\nprintf '%s' \"$SHIKIGAMI_KEPT\" > \"{records}/kept.$n\"\n{rest}"
+            "n=$(ls \"{records}\" | grep -c '^args' || true)\nfor a in \"$@\"; do echo \"$a\"; done > \"{records}/args.$n\"\ncat > \"{records}/stdin.$n\"\nprintf '%s' \"$ANTHROPIC_API_KEY\" > \"{records}/key.$n\"\nprintf '%s' \"$ANTHROPIC_AUTH_TOKEN\" > \"{records}/token.$n\"\nprintf '%s' \"$ANTHROPIC_BASE_URL\" > \"{records}/base.$n\"\nprintf '%s' \"$LC_KEPT\" > \"{records}/kept.$n\"\n{rest}"
         )
     }
 
@@ -900,7 +912,7 @@ mod tests {
         world.set_environment("ANTHROPIC_API_KEY", "sk-ant-from-the-parent");
         world.set_environment("ANTHROPIC_AUTH_TOKEN", "token-from-the-parent");
         world.set_environment("ANTHROPIC_BASE_URL", "https://proxy.example");
-        world.set_environment("SHIKIGAMI_KEPT", "kept");
+        world.set_environment("LC_KEPT", "kept");
         world
             .send(
                 "one",
@@ -918,6 +930,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_child_environment_holds_only_allowlisted_variables() {
+        let world = World::new();
+        let fixture = world.fixture("basic.jsonl", BASIC);
+        world.install(&recording(
+            &world,
+            &format!(
+                "env > \"{}/env.txt\"\ncat \"{}\"",
+                world.records().display(),
+                fixture.display()
+            ),
+        ));
+        let allowed = [
+            "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "TERM", "LC_ALL", "LC_CTYPE",
+        ];
+        let dropped = [
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDECODE",
+            "CLAUDE_CONFIG_DIR",
+            "GITHUB_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+            "ANTHROPIC_MODEL",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_BASE_URL",
+            "LCX",
+            "XLC_ALL",
+            "SHIKIGAMI_OTHER",
+        ];
+        for name in allowed.iter().chain(dropped.iter()) {
+            world.set_environment(name, "value");
+        }
+        world.send("hi", ApiKey::Subscription).await;
+        let text = read(&world, "env.txt");
+        let mut names: Vec<&str> = text
+            .lines()
+            .filter_map(|line| line.split_once('=').map(|(name, _)| name))
+            .filter(|name| !["PWD", "OLDPWD", "SHLVL", "_"].contains(name))
+            .collect();
+        names.sort_unstable();
+        let mut expected: Vec<&str> = allowed.to_vec();
+        expected.push("PATH");
+        expected.sort_unstable();
+        assert_eq!(names, expected);
+    }
+
+    #[tokio::test]
+    async fn the_saved_key_is_the_only_anthropic_variable_in_api_key_mode() {
+        let world = World::new();
+        let fixture = world.fixture("basic.jsonl", BASIC);
+        world.install(&recording(
+            &world,
+            &format!(
+                "env > \"{}/env.txt\"\ncat \"{}\"",
+                world.records().display(),
+                fixture.display()
+            ),
+        ));
+        world.set_environment("ANTHROPIC_BASE_URL", "https://proxy.example");
+        world.set_environment("ANTHROPIC_AUTH_TOKEN", "token");
+        world
+            .send(
+                "one",
+                ApiKey::Present(SecretString::new("sk-ant-saved-0000")),
+            )
+            .await;
+        let text = read(&world, "env.txt");
+        let anthropic: Vec<&str> = text
+            .lines()
+            .filter(|line| line.starts_with("ANTHROPIC_"))
+            .collect();
+        assert_eq!(anthropic, ["ANTHROPIC_API_KEY=sk-ant-saved-0000"]);
+    }
+
+    #[tokio::test]
     async fn an_unreadable_key_fails_the_turn_and_starts_no_process() {
         let world = World::new();
         let fixture = world.fixture("basic.jsonl", BASIC);
@@ -925,7 +1010,7 @@ mod tests {
             &world,
             &format!("cat \"{}\"", fixture.display()),
         ));
-        world.send("hi", ApiKey::Unreadable).await;
+        world.send("hi", ApiKey::Unreadable(None)).await;
         let turn = only_turn(&world);
         assert_eq!(turn.status, "failed");
         assert_eq!(
@@ -934,6 +1019,26 @@ mod tests {
         );
         assert!(!has_record(&world, "args.0"));
         assert_eq!(world.sink.kinds(), ["started", "ended"]);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_key_with_a_keychain_status_shows_the_code_in_the_turn_error() {
+        let world = World::new();
+        let fixture = world.fixture("basic.jsonl", BASIC);
+        world.install(&recording(
+            &world,
+            &format!("cat \"{}\"", fixture.display()),
+        ));
+        let key = ApiKey::from_read(
+            AuthMode::ApiKey,
+            Err(ApiKeyError::from(SecretError::Read(Some(-25293)))),
+        );
+        world.send("hi", key).await;
+        assert_eq!(
+            only_turn(&world).error.as_deref(),
+            Some("Could not read the saved API key (Keychain error -25293).")
+        );
+        assert!(!has_record(&world, "args.0"));
     }
 
     #[tokio::test]
@@ -1147,6 +1252,32 @@ mod tests {
     }
 
     const MISSING: &str = "echo 'No conversation found with session ID: old-id' >&2\nexit 1";
+
+    const FRAGMENT_KEY: &str = "sk-ant-api03-FRAGMENT0123456789ABCDEFGHIJ";
+
+    fn stderr_cut_inside_the_key(tail: &str) -> Vec<u8> {
+        let head = format!("start {FRAGMENT_KEY}");
+        let cut_inside_key = "start sk-ant-api03-".len() + 8;
+        let filler = STDERR_KEEP + cut_inside_key - head.len() - tail.len();
+        format!("{head}{}{tail}", "x".repeat(filler)).into_bytes()
+    }
+
+    #[tokio::test]
+    async fn a_trimmed_stderr_shows_no_fragment_of_a_key_in_its_partial_first_line() {
+        let data = stderr_cut_inside_the_key("");
+        assert_eq!(data.len(), STDERR_KEEP + "start sk-ant-api03-".len() + 8);
+        let summary = read_stderr(&data[..]).await;
+        assert_eq!(summary.last_line, None);
+        let data = stderr_cut_inside_the_key("\nreal error\n");
+        let summary = read_stderr(&data[..]).await;
+        assert_eq!(summary.last_line.as_deref(), Some("real error"));
+    }
+
+    #[tokio::test]
+    async fn an_untrimmed_stderr_keeps_its_first_line() {
+        let summary = read_stderr(&b"only line\n"[..]).await;
+        assert_eq!(summary.last_line.as_deref(), Some("only line"));
+    }
 
     fn stored_session_probe(world: &World) -> String {
         format!(
@@ -1452,9 +1583,10 @@ mod tests {
     async fn a_stop_ends_the_turn_stopped_and_keeps_the_partial_reply_redacted() {
         let world = World::new();
         install_streaming_then(&world, "", "sleep 30");
-        let (advance, elapsed) = run_and_stop(&world, Duration::from_secs(2)).await;
+        let grace = Duration::from_secs(2);
+        let (advance, elapsed) = run_and_stop(&world, grace).await;
         assert!(advance);
-        assert!(elapsed < Duration::from_secs(3));
+        assert!(elapsed < grace + LOAD_SLACK);
         let turn = only_turn(&world);
         assert_eq!(turn.status, "stopped");
         assert_eq!(turn.error, None);
@@ -1481,7 +1613,7 @@ mod tests {
         install_streaming_then(&world, "", "trap '' TERM\nwhile true; do sleep 1; done");
         let (_, elapsed) = run_and_stop(&world, Duration::from_millis(300)).await;
         assert!(elapsed >= Duration::from_millis(300));
-        assert!(elapsed < Duration::from_secs(3));
+        assert!(elapsed < Duration::from_millis(300) + LOAD_SLACK);
         assert_eq!(only_turn(&world).status, "stopped");
     }
 
@@ -1521,7 +1653,7 @@ mod tests {
         .await
         .expect("a stopped turn must end");
         assert!(advance);
-        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(started.elapsed() < LOAD_SLACK);
         let turn = only_turn(&world);
         assert_eq!(turn.status, "stopped");
         assert_eq!(turn.error, None);
@@ -1629,7 +1761,7 @@ mod tests {
             &world.sink,
             &world.registry,
             unreadable,
-            ApiKey::Unreadable,
+            ApiKey::Unreadable(None),
         )
         .await;
         assert!(!advance);
@@ -1711,7 +1843,7 @@ mod tests {
             AuthMode::ApiKey,
             key_for_turn(&VanishedItem, AuthMode::ApiKey, "claude-code"),
         );
-        assert!(matches!(key, ApiKey::Unreadable));
+        assert!(matches!(key, ApiKey::Unreadable(None)));
         world.send("hi", key).await;
         let turn = only_turn(&world);
         assert_eq!(turn.status, "failed");
@@ -1725,6 +1857,9 @@ mod tests {
     const SHORT_STALL: Duration = Duration::from_millis(600);
     const SHORT_TOOL_STALL: Duration = Duration::from_millis(2500);
     const LONG_STALL: Duration = Duration::from_secs(60);
+    const STEADY_STALL: Duration = Duration::from_millis(1800);
+    const QUIET_TOOL_LIMIT: Duration = Duration::from_secs(5);
+    const LOAD_SLACK: Duration = Duration::from_secs(5);
 
     async fn run_with_stall(world: &World, idle: Duration, tool: Duration) -> bool {
         let mut launch = world.launch("go");
@@ -1851,7 +1986,7 @@ mod tests {
         let world = World::new();
         install_streaming_then(&world, "", "sleep 1.5\nexit 0");
         let started = Instant::now();
-        run_with_stall(&world, SHORT_STALL, SHORT_TOOL_STALL).await;
+        run_with_stall(&world, SHORT_STALL, QUIET_TOOL_LIMIT).await;
         assert!(started.elapsed() >= Duration::from_millis(1500));
         let turn = only_turn(&world);
         assert_eq!(turn.status, "failed");
@@ -1873,7 +2008,7 @@ mod tests {
         run_with_stall(&world, SHORT_STALL, LONG_STALL).await;
         let elapsed = started.elapsed();
         assert!(elapsed >= SHORT_STALL + EXIT_TERM_GRACE);
-        assert!(elapsed < SHORT_STALL + EXIT_TERM_GRACE + Duration::from_secs(1));
+        assert!(elapsed < SHORT_STALL + EXIT_TERM_GRACE + LOAD_SLACK);
         assert_eq!(only_turn(&world).status, "failed");
         assert_ne!(unsafe { libc::killpg(shell_pid(&world), 0) }, 0);
     }
@@ -1890,8 +2025,8 @@ mod tests {
             ),
         ));
         let started = Instant::now();
-        run_with_stall(&world, SHORT_STALL, LONG_STALL).await;
-        assert!(started.elapsed() > SHORT_STALL);
+        run_with_stall(&world, STEADY_STALL, LONG_STALL).await;
+        assert!(started.elapsed() > STEADY_STALL);
         let turn = only_turn(&world);
         assert_eq!(turn.status, "completed");
         assert_eq!(turn.error, None);
@@ -1904,11 +2039,13 @@ mod tests {
         world.install(&recording(
             &world,
             &format!(
-                "for i in 1 2 3 4 5 6; do echo 'not json at all'; sleep 0.3; done\ncat \"{}\"",
+                "for i in 1 2 3 4 5 6 7 8 9 10; do echo 'not json at all'; sleep 0.3; done\ncat \"{}\"",
                 fixture.display()
             ),
         ));
-        run_with_stall(&world, SHORT_STALL, LONG_STALL).await;
+        let started = Instant::now();
+        run_with_stall(&world, STEADY_STALL, LONG_STALL).await;
+        assert!(started.elapsed() > STEADY_STALL);
         assert_eq!(only_turn(&world).status, "completed");
     }
 

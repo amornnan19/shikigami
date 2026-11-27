@@ -24,7 +24,7 @@ import { MODEL_SUGGESTIONS, modelProblem } from "./models";
 const OTHER_MODEL = "__other__";
 export const DEFAULT_MODEL = "default";
 export const APP_DEFAULT_AUTH = "app-default";
-export const NAME_CODES = ["name-empty", "name-too-long", "name-taken"];
+export const NAME_CODES = ["name-empty", "name-too-long", "name-invalid", "name-taken"];
 
 export function FieldError({ id, message }: { id: string; message: string | null }) {
   if (!message) return null;
