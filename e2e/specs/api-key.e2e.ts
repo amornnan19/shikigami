@@ -13,7 +13,7 @@ describe("api key", () => {
     await expect($(claudeCard)).not.toHaveText(expect.stringContaining("API key saved"));
   });
 
-  it("opens the add form when API key is chosen with no key saved", async () => {
+  it("opens the add form when API key is chosen with no key saved, without saving the choice yet", async () => {
     await $("#auth-mode-api-key").click();
     await expect($("#auth-mode-api-key")).toHaveAttribute("aria-checked", "true");
     await expect($("#api-key-input")).toBeDisplayed();
@@ -27,12 +27,21 @@ describe("api key", () => {
     await expect($("#api-key-error")).toHaveText(expect.stringContaining("sk-ant-"));
     await expect($(apiKeyBlock)).not.toHaveText(expect.stringContaining("API key saved"));
     await browser.saveScreenshot(join(artifacts, "api-key-invalid.png"));
-    await $("button=Cancel").click();
-    await expect($(apiKeyBlock)).toHaveText(expect.stringContaining("Add API key"));
   });
 
-  it("saves a key and shows only the last four characters", async () => {
-    await $("button=Add API key").click();
+  it("leaves the choice unchanged when the form is cancelled", async () => {
+    await $("button=Cancel").click();
+    await expect($(apiKeyBlock)).toHaveText(expect.stringContaining("Add API key"));
+    await expect($("#auth-mode-subscription")).toHaveAttribute("aria-checked", "true");
+    await expect($("#auth-mode-api-key")).toHaveAttribute("aria-checked", "false");
+    await browser.refresh();
+    await $("#auth-mode-subscription").waitForExist();
+    await expect($("#auth-mode-subscription")).toHaveAttribute("aria-checked", "true");
+    await browser.saveScreenshot(join(artifacts, "api-key-cancelled.png"));
+  });
+
+  it("saves a key, chooses API key, and shows only the last four characters", async () => {
+    await $("#auth-mode-api-key").click();
     await $("#api-key-input").setValue(fakeKey);
     await $("button=Save").click();
     await expect($(apiKeyBlock)).toHaveText(expect.stringContaining("API key saved (…wxyz)"));

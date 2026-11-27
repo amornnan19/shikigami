@@ -115,6 +115,7 @@ function SubscriptionDetail({ subscription }: { subscription: ClaudeAuth["subscr
 function SignInChoice({ auth }: { auth: ClaudeAuth }) {
   const queryClient = useQueryClient();
   const [adding, setAdding] = useState(false);
+  const [pendingApiKey, setPendingApiKey] = useState(false);
   const choose = useMutation({
     mutationFn: setClaudeAuthMode,
     onSuccess: (_, mode) =>
@@ -129,8 +130,22 @@ function SignInChoice({ auth }: { auth: ClaudeAuth }) {
 
   function change(mode: string) {
     const next = mode as AuthMode;
-    if (next === "api-key" && !auth.apiKey.saved) setAdding(true);
+    if (next === "api-key" && !auth.apiKey.saved && !auth.apiKey.readFailed) {
+      setPendingApiKey(true);
+      setAdding(true);
+      return;
+    }
+    setPendingApiKey(false);
     choose.mutate(next);
+  }
+
+  function changeAdding(open: boolean) {
+    setAdding(open);
+    if (!open) setPendingApiKey(false);
+  }
+
+  function keySaved() {
+    if (pendingApiKey) choose.mutate("api-key");
   }
 
   return (
@@ -140,7 +155,7 @@ function SignInChoice({ auth }: { auth: ClaudeAuth }) {
       </span>
       <RadioGroup.Root
         aria-labelledby="claude-sign-in-label"
-        value={auth.appMode}
+        value={pendingApiKey ? "api-key" : auth.appMode}
         onValueChange={change}
         className="flex flex-col gap-3"
       >
@@ -171,7 +186,8 @@ function SignInChoice({ auth }: { auth: ClaudeAuth }) {
               provider={CLAUDE_CODE}
               status={auth.apiKey}
               adding={adding}
-              setAdding={setAdding}
+              setAdding={changeAdding}
+              onSaved={keySaved}
             />
           </div>
         </div>
