@@ -112,6 +112,13 @@ pub fn is_installed(id: &str, dirs: &[PathBuf]) -> bool {
         .is_some_and(|spec| search::find_executable(spec.executable, dirs).is_some())
 }
 
+pub fn executable_path(id: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+    [&claude_code::SPEC, &codex::SPEC]
+        .into_iter()
+        .find(|spec| spec.id == id)
+        .and_then(|spec| search::find_executable(spec.executable, dirs))
+}
+
 pub fn search_dirs() -> Vec<PathBuf> {
     search::search_dirs()
 }

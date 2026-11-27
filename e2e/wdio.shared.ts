@@ -14,6 +14,7 @@ export function createConfig(
   dataDir: string,
   databaseContent?: string,
   appEnv: Record<string, string> = {},
+  keepData = false,
 ): WebdriverIO.Config {
   return {
     runner: "local",
@@ -42,8 +43,10 @@ export function createConfig(
       await browser.switchToWindow(await browser.getWindowHandle());
     },
     onPrepare() {
-      rmSync(dataDir, { recursive: true, force: true });
-      rmSync(workspacesRoot, { recursive: true, force: true });
+      if (!keepData) {
+        rmSync(dataDir, { recursive: true, force: true });
+        rmSync(workspacesRoot, { recursive: true, force: true });
+      }
       mkdirSync(dataDir, { recursive: true });
       if (databaseContent !== undefined) {
         writeFileSync(join(dataDir, "shikigami.db"), databaseContent);

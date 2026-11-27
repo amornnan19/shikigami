@@ -1,0 +1,62 @@
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { ArrowUp } from "lucide-react";
+import { type KeyboardEvent, useState } from "react";
+import { Button } from "@/components/ui/button";
+import { asAgentError } from "@/features/agents/api";
+import { MESSAGE_MAX_CHARS, sendMessage } from "./api";
+
+export function Composer({ agentId, running }: { agentId: string; running: boolean }) {
+  const client = useQueryClient();
+  const [text, setText] = useState("");
+  const length = Array.from(text).length;
+  const tooLong = length > MESSAGE_MAX_CHARS;
+  const send = useMutation({
+    mutationFn: () => sendMessage(agentId, text),
+    onSuccess: () => {
+      setText("");
+      void client.invalidateQueries({ queryKey: ["conversation", agentId] });
+      void client.invalidateQueries({ queryKey: ["agents"] });
+    },
+  });
+  const canSend = text.trim().length > 0 && !tooLong && !running && !send.isPending;
+
+  function submit() {
+    if (canSend) send.mutate();
+  }
+
+  function onKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+      event.preventDefault();
+      submit();
+    }
+  }
+
+  return (
+    <div className="border-t border-border p-4">
+      {send.isError && (
+        <p role="alert" className="mb-2 text-sm text-red-600">
+          {asAgentError(send.error).message}
+        </p>
+      )}
+      <div className="flex items-end gap-2">
+        <textarea
+          aria-label="Message"
+          rows={2}
+          value={text}
+          placeholder={running ? "Waiting for the reply…" : "Message"}
+          onChange={(event) => setText(event.target.value)}
+          onKeyDown={onKeyDown}
+          className="max-h-48 min-h-14 flex-1 resize-y rounded-md border border-border bg-background px-3 py-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        />
+        <Button type="button" size="icon" aria-label="Send" disabled={!canSend} onClick={submit}>
+          <ArrowUp />
+        </Button>
+      </div>
+      {tooLong && (
+        <p role="alert" className="mt-1 text-right text-xs text-red-600">
+          {length.toLocaleString("en-US")} / {MESSAGE_MAX_CHARS.toLocaleString("en-US")} characters
+        </p>
+      )}
+    </div>
+  );
+}

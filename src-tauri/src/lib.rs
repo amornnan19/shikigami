@@ -5,6 +5,7 @@ pub mod db;
 mod providers;
 pub mod secrets;
 mod settings;
+mod turns;
 
 use std::path::{Path, PathBuf};
 
@@ -57,7 +58,10 @@ pub fn run() {
         .setup(|app| {
             let resolved = resolve_data_dir(app);
             let data_dir = resolved.clone().unwrap_or_default();
-            match resolved.and_then(|dir| open_database(&dir)) {
+            let opened = resolved
+                .and_then(|dir| open_database(&dir))
+                .and_then(|database| turns::sweep_interrupted(&database).map(|_| database));
+            match opened {
                 Ok(database) => {
                     app.manage(database);
                 }
@@ -67,6 +71,7 @@ pub fn run() {
             }
             app.manage(secrets::select_store());
             app.manage(api_key::StatusCache::default());
+            app.manage(turns::TurnRegistry::default());
             app.manage(agents::WorkspacesRoot(agents::resolve_workspaces_root(
                 app.path().home_dir().ok(),
             )));
@@ -81,7 +86,9 @@ pub fn run() {
             api_key::remove_api_key,
             api_key::set_api_key_enabled,
             agents::list_agents,
-            agents::create_agent
+            agents::create_agent,
+            turns::send_message,
+            turns::get_conversation
         ])
         .run(app_context())
         .expect("error while running tauri application");

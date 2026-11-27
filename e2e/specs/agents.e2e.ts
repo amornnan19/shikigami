@@ -54,5 +54,8 @@ describe("agents", () => {
     await expect(codex).toHaveAttribute("aria-disabled", "true");
     await expect($('[role="option"]*=Claude Code')).not.toHaveAttribute("aria-disabled", "true");
     await browser.saveScreenshot(join(artifacts, "agents-provider-select.png"));
+    await browser.keys("Escape");
+    await browser.keys("Escape");
+    await expect($('[role="dialog"]')).not.toBeDisplayed();
   });
 });
