@@ -1,0 +1,123 @@
+use std::fs;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+
+const FOLDER_MAX: usize = 40;
+const FALLBACK_FOLDER: &str = "agent";
+
+pub fn folder_name(name: &str) -> String {
+    let mut slug = String::new();
+    for ch in name.to_lowercase().chars() {
+        let ch = if ch.is_whitespace() || ch == '_' {
+            '-'
+        } else {
+            ch
+        };
+        if !(ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-') {
+            continue;
+        }
+        if ch == '-' && slug.ends_with('-') {
+            continue;
+        }
+        slug.push(ch);
+    }
+    let slug: String = slug.trim_matches('-').chars().take(FOLDER_MAX).collect();
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        FALLBACK_FOLDER.to_string()
+    } else {
+        slug.to_string()
+    }
+}
+
+pub fn instruction_file(provider: &str) -> &'static str {
+    match provider {
+        "codex" => "AGENTS.md",
+        _ => "CLAUDE.md",
+    }
+}
+
+pub fn instruction_text(name: &str) -> String {
+    format!("# {name}\n\nYou are {name}, a coding agent working in this folder.\n")
+}
+
+pub fn create_folder(root: &Path, name: &str) -> io::Result<PathBuf> {
+    fs::create_dir_all(root)?;
+    let base = folder_name(name);
+    let mut attempt = 1u32;
+    loop {
+        let candidate = if attempt == 1 {
+            base.clone()
+        } else {
+            format!("{base}-{attempt}")
+        };
+        let path = root.join(candidate);
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => attempt += 1,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+pub fn write_instruction_file(folder: &Path, provider: &str, name: &str) -> io::Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(folder.join(instruction_file(provider)))?;
+    file.write_all(instruction_text(name).as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folder_names_are_slugs() {
+        assert_eq!(folder_name("Test Agent"), "test-agent");
+        assert_eq!(folder_name("  Hello,   World!  "), "hello-world");
+        assert_eq!(folder_name("my_cool__agent"), "my-cool-agent");
+        assert_eq!(folder_name("--a--b--"), "a-b");
+        assert_eq!(folder_name("Agent 007"), "agent-007");
+        assert_eq!(folder_name("../../etc"), "etc");
+    }
+
+    #[test]
+    fn names_without_usable_characters_become_agent() {
+        assert_eq!(folder_name("สวัสดี"), "agent");
+        assert_eq!(folder_name("🤖🔥"), "agent");
+        assert_eq!(folder_name("!!!"), "agent");
+    }
+
+    #[test]
+    fn long_names_are_cut_without_a_trailing_dash() {
+        let cut = folder_name(&format!("{} tail", "a".repeat(39)));
+        assert_eq!(cut, "a".repeat(39));
+        assert_eq!(folder_name(&"b".repeat(60)).len(), 40);
+    }
+
+    #[test]
+    fn colliding_names_get_numbered_folders() {
+        let root = tempfile::tempdir().unwrap();
+        let first = create_folder(root.path(), "Test Agent").unwrap();
+        let second = create_folder(root.path(), "test agent").unwrap();
+        let third = create_folder(root.path(), "TEST-AGENT").unwrap();
+        assert_eq!(first.file_name().unwrap(), "test-agent");
+        assert_eq!(second.file_name().unwrap(), "test-agent-2");
+        assert_eq!(third.file_name().unwrap(), "test-agent-3");
+    }
+
+    #[test]
+    fn the_root_is_created_when_missing() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("deep").join("agents");
+        let folder = create_folder(&root, "a").unwrap();
+        assert!(folder.is_dir());
+    }
+
+    #[test]
+    fn instruction_files_follow_the_provider() {
+        assert_eq!(instruction_file("claude-code"), "CLAUDE.md");
+        assert_eq!(instruction_file("codex"), "AGENTS.md");
+    }
+}

@@ -3,6 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+export const workspacesRoot = join(root, "e2e", "artifacts", "workspaces");
 const appBinaryPath = join(root, "src-tauri", "target", "debug", "shikigami");
 
 mkdirSync(join(root, "e2e", "artifacts"), { recursive: true });
@@ -24,7 +25,11 @@ export function createConfig(
         {
           driverProvider: "embedded",
           appBinaryPath,
-          env: { ...appEnv, SHIKIGAMI_DATA_DIR: dataDir },
+          env: {
+            ...appEnv,
+            SHIKIGAMI_DATA_DIR: dataDir,
+            SHIKIGAMI_WORKSPACES_DIR: workspacesRoot,
+          },
         },
       ],
     ],
@@ -34,6 +39,7 @@ export function createConfig(
     mochaOpts: { timeout: 60000 },
     onPrepare() {
       rmSync(dataDir, { recursive: true, force: true });
+      rmSync(workspacesRoot, { recursive: true, force: true });
       mkdirSync(dataDir, { recursive: true });
       if (databaseContent !== undefined) {
         writeFileSync(join(dataDir, "shikigami.db"), databaseContent);
