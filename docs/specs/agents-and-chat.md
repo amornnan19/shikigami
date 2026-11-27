@@ -1,7 +1,7 @@
 # Spec: agents, workspaces and chat
 
 - Milestone: M1 MVP: agents and chat
-- Status: draft
+- Status: accepted (2026-11-28)
 
 ## Purpose
 
