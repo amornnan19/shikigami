@@ -8,19 +8,20 @@ const appBinaryPath = join(root, "src-tauri", "target", "debug", "shikigami");
 mkdirSync(join(root, "e2e", "artifacts"), { recursive: true });
 
 export function createConfig(
-  specName: string,
+  specNames: string[],
   dataDir: string,
   databaseContent?: string,
+  appEnv: Record<string, string> = {},
 ): WebdriverIO.Config {
   return {
     runner: "local",
-    specs: [join(root, "e2e", "specs", specName)],
+    specs: specNames.map((specName) => join(root, "e2e", "specs", specName)),
     maxInstances: 1,
     capabilities: [{ browserName: "tauri" }],
     services: [
       [
         "tauri",
-        { driverProvider: "embedded", appBinaryPath, env: { SHIKIGAMI_DATA_DIR: dataDir } },
+        { driverProvider: "embedded", appBinaryPath, env: { ...appEnv, SHIKIGAMI_DATA_DIR: dataDir } },
       ],
     ],
     framework: "mocha",

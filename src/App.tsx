@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useState } from "react";
+import { ProvidersSection } from "@/features/providers/ProvidersSection";
 
 type AppStatus = { status: "ok" } | { status: "error"; message: string; data_dir: string };
 
@@ -35,9 +36,12 @@ function App() {
   }
 
   return (
-    <main className="flex h-screen flex-col items-center justify-center gap-2 bg-background text-foreground">
-      <h1 className="text-4xl font-semibold">Shikigami</h1>
-      <p className="text-muted-foreground">Coding agents on your Mac.</p>
+    <main className="flex min-h-screen flex-col items-center justify-center gap-6 bg-background p-6 text-foreground">
+      <div className="flex flex-col items-center gap-2">
+        <h1 className="text-4xl font-semibold">Shikigami</h1>
+        <p className="text-muted-foreground">Coding agents on your Mac.</p>
+      </div>
+      <ProvidersSection />
     </main>
   );
 }
