@@ -4,6 +4,7 @@ mod store;
 mod validate;
 mod workspace;
 
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -20,8 +21,11 @@ pub const WORKSPACES_DIR_ENV: &str = "SHIKIGAMI_WORKSPACES_DIR";
 
 pub struct WorkspacesRoot(pub Result<PathBuf, String>);
 
-pub fn resolve_workspaces_root(home: Option<PathBuf>) -> Result<PathBuf, String> {
-    match std::env::var_os(WORKSPACES_DIR_ENV) {
+pub fn resolve_workspaces_root(
+    home: Option<PathBuf>,
+    override_dir: Option<OsString>,
+) -> Result<PathBuf, String> {
+    match override_dir {
         Some(dir) if !dir.is_empty() => {
             let path = PathBuf::from(dir);
             if path.is_absolute() {
@@ -255,11 +259,24 @@ fn persist(
     let saved = workspace::write_instruction_file(&folder, &agent.name)
         .map_err(AgentError::folder)
         .and_then(|()| db.with_connection(|connection| store::insert(connection, &agent)));
-    if let Err(error) = saved {
-        let _ = fs::remove_dir_all(&folder);
-        return Err(error);
+    match saved {
+        Ok(()) => Ok(agent),
+        Err(error) => Err(discard_folder(&folder, error)),
     }
-    Ok(agent)
+}
+
+fn discard_folder(folder: &Path, error: AgentError) -> AgentError {
+    match fs::remove_dir_all(folder) {
+        Err(failure) if failure.kind() != std::io::ErrorKind::NotFound => AgentError::new(
+            error.code,
+            format!(
+                "{} The folder {} could not be removed.",
+                error.message,
+                folder.display()
+            ),
+        ),
+        _ => error,
+    }
 }
 
 fn create(
@@ -704,6 +721,10 @@ mod tests {
             "name-too-long"
         );
         assert_eq!(
+            error_code(fx.create("Line\nbreak", "claude-code")),
+            "name-invalid"
+        );
+        assert_eq!(
             error_code(fx.create("A", "unknown")),
             "provider-unavailable"
         );
@@ -742,6 +763,106 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(folders, vec![std::ffi::OsString::from("taken")]);
+    }
+
+    fn sample_agent(id: &str, name: &str, provider: &str) -> Agent {
+        Agent {
+            id: id.to_string(),
+            name: name.to_string(),
+            color: "blue".to_string(),
+            provider: provider.to_string(),
+            model: "default".to_string(),
+            workspace_path: format!("/tmp/{id}"),
+            created_at: 1,
+            last_activity_at: 1,
+            state: AgentState::Idle,
+            attention: None,
+            auth_mode: None,
+            effective_auth_mode: AuthMode::Subscription,
+        }
+    }
+
+    #[test]
+    fn only_a_unique_violation_on_the_name_maps_to_name_taken() {
+        let fx = Fixture::new(&["claude"]);
+        let insert = |agent: Agent| fx.db.with_connection(|c| store::insert(c, &agent));
+        insert(sample_agent("a", "Ada", "claude-code")).unwrap();
+        let same_name = insert(sample_agent("b", "ADA", "claude-code")).unwrap_err();
+        assert_eq!(same_name.code, "name-taken");
+        let same_id = insert(sample_agent("a", "Other", "claude-code")).unwrap_err();
+        assert_eq!(same_id.code, "database-failed");
+        let bad_provider = insert(sample_agent("c", "Third", "unknown")).unwrap_err();
+        assert_eq!(bad_provider.code, "database-failed");
+        insert(sample_agent("d", "Fourth", "claude-code")).unwrap();
+        let rename = fx
+            .db
+            .with_connection(|c| store::update(c, "d", Some("ada"), None, None))
+            .unwrap_err();
+        assert_eq!(rename.code, "name-taken");
+        let bad_model = fx
+            .db
+            .with_connection(|c| store::update(c, "d", None, None, Some("ok")));
+        assert_eq!(bad_model.unwrap(), 1);
+    }
+
+    #[test]
+    fn a_unique_violation_on_another_column_and_a_null_name_are_not_name_taken() {
+        let fx = Fixture::new(&["claude"]);
+        fx.db.with_connection(|c| {
+            c.execute(
+                "CREATE UNIQUE INDEX test_path ON agents(workspace_path)",
+                [],
+            )
+            .unwrap()
+        });
+        let insert = |agent: Agent| fx.db.with_connection(|c| store::insert(c, &agent));
+        insert(sample_agent("a", "Ada", "claude-code")).unwrap();
+        let mut same_path = sample_agent("b", "Bob", "claude-code");
+        same_path.workspace_path = "/tmp/a".to_string();
+        assert_eq!(insert(same_path).unwrap_err().code, "database-failed");
+        let null_name = fx
+            .db
+            .with_connection(|c| {
+                c.execute(
+                    "INSERT INTO agents (id, name, color, provider, model, workspace_path, created_at, last_activity_at)
+                     VALUES ('n', NULL, 'blue', 'claude-code', 'default', '/tmp/n', 1, 1)",
+                    [],
+                )
+            })
+            .unwrap_err();
+        assert!(null_name.to_string().contains("agents.name"));
+        assert_eq!(store::save_error(null_name).code, "database-failed");
+    }
+
+    #[test]
+    fn a_rollback_that_cannot_remove_the_folder_says_so_and_keeps_the_error_code() {
+        let fx = Fixture::new(&["claude"]);
+        let folder = fx.workspaces.path().join("stuck");
+        fs::create_dir(&folder).unwrap();
+        fs::set_permissions(fx.workspaces.path(), fs::Permissions::from_mode(0o555)).unwrap();
+        let error = discard_folder(&folder, AgentError::name_taken());
+        fs::set_permissions(fx.workspaces.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(error.code, "name-taken");
+        assert_eq!(
+            error.message,
+            format!(
+                "An agent with this name already exists. The folder {} could not be removed.",
+                folder.display()
+            )
+        );
+        assert!(folder.exists());
+    }
+
+    #[test]
+    fn a_rollback_that_removes_the_folder_leaves_the_message_unchanged() {
+        let fx = Fixture::new(&["claude"]);
+        let folder = fx.workspaces.path().join("gone");
+        fs::create_dir(&folder).unwrap();
+        let error = discard_folder(&folder, AgentError::name_taken());
+        assert_eq!(error.message, "An agent with this name already exists.");
+        assert!(!folder.exists());
+        let missing = discard_folder(&folder, AgentError::name_taken());
+        assert_eq!(missing.message, "An agent with this name already exists.");
     }
 
     #[test]
@@ -1031,20 +1152,21 @@ mod tests {
 
     #[test]
     fn workspaces_root_defaults_to_home_and_rejects_relative_overrides() {
-        std::env::remove_var(WORKSPACES_DIR_ENV);
+        let home = || Some(PathBuf::from("/Users/me"));
         assert_eq!(
-            resolve_workspaces_root(Some(PathBuf::from("/Users/me"))).unwrap(),
+            resolve_workspaces_root(home(), None).unwrap(),
             PathBuf::from("/Users/me/Shikigami/agents")
         );
-        assert!(resolve_workspaces_root(None).is_err());
-        std::env::set_var(WORKSPACES_DIR_ENV, "relative/dir");
-        assert!(resolve_workspaces_root(Some(PathBuf::from("/Users/me"))).is_err());
-        std::env::set_var(WORKSPACES_DIR_ENV, "/tmp/elsewhere");
         assert_eq!(
-            resolve_workspaces_root(None).unwrap(),
+            resolve_workspaces_root(home(), Some(OsString::new())).unwrap(),
+            PathBuf::from("/Users/me/Shikigami/agents")
+        );
+        assert!(resolve_workspaces_root(None, None).is_err());
+        assert!(resolve_workspaces_root(home(), Some("relative/dir".into())).is_err());
+        assert_eq!(
+            resolve_workspaces_root(None, Some("/tmp/elsewhere".into())).unwrap(),
             PathBuf::from("/tmp/elsewhere")
         );
-        std::env::remove_var(WORKSPACES_DIR_ENV);
     }
 
     #[test]

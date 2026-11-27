@@ -15,6 +15,10 @@ pub fn name(raw: &str) -> Result<String, AgentError> {
             "name-too-long",
             format!("Use at most {NAME_MAX} characters."),
         )),
+        _ if name.chars().any(char::is_control) => Err(AgentError::new(
+            "name-invalid",
+            "The name cannot contain line breaks or control characters.",
+        )),
         _ => Ok(name.to_string()),
     }
 }
@@ -57,6 +61,15 @@ mod tests {
         assert_eq!(code(name("")), "name-empty");
         assert!(name(&"a".repeat(40)).is_ok());
         assert_eq!(code(name(&"a".repeat(41))), "name-too-long");
+    }
+
+    #[test]
+    fn names_with_a_control_character_are_refused() {
+        for bad in ["a\nb", "a\tb", "a\rb", "a\u{0}b", "a\u{7f}b", "a\u{85}b"] {
+            assert_eq!(code(name(bad)), "name-invalid", "{bad:?}");
+        }
+        assert_eq!(name("  padded \n").unwrap(), "padded");
+        assert!(name("ก ข").is_ok());
     }
 
     #[test]

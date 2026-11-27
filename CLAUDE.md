@@ -60,6 +60,8 @@ output is read. Start each agent CLI isolated from the user's own configuration 
 user-level settings, hooks, plugins, output styles or MCP servers. For Claude Code:
 `--setting-sources project --strict-mcp-config --permission-mode manual --permission-prompts none`.
 Keep the CLI's own sign-in working.
+Build an agent CLI's environment from an allowlist (HOME, USER, LOGNAME, SHELL, TMPDIR, LANG, LC_*,
+TERM, PATH); never pass the app's whole environment.
 Anything that starts a turn or spawns a provider process must refuse while the app is shutting down
 (`TurnRegistry` closing); `kill_all` runs on the main thread while runner tasks keep running.
 

@@ -105,7 +105,7 @@ impl Redactor {
             }
             Value::Object(map) => Value::Object(
                 map.iter()
-                    .map(|(name, item)| (name.clone(), self.redact_value(item)))
+                    .map(|(name, item)| (self.redact(name), self.redact_value(item)))
                     .collect(),
             ),
             other => other.clone(),
@@ -148,5 +148,16 @@ mod tests {
         let text = redactor().redact_value(&value).to_string();
         assert!(!text.contains("sk-ant"));
         assert!(text.contains(REDACTED));
+    }
+
+    #[test]
+    fn object_keys_inside_json_are_redacted() {
+        let value = serde_json::json!({KEY: "v", "plain": {"nested": 1, "sk-ant-other-token-0123456789": [KEY]}});
+        let redacted = redactor().redact_value(&value);
+        assert_eq!(
+            redacted,
+            serde_json::json!({REDACTED: "v", "plain": {"nested": 1, REDACTED: [REDACTED]}})
+        );
+        assert!(!redacted.to_string().contains("sk-ant"));
     }
 }

@@ -458,7 +458,9 @@ fn key_for_agent(db: &Database, store: &dyn SecretStore, agent_id: &str) -> runn
         Ok(mode) => {
             runner::ApiKey::from_read(mode, api_key::key_for_turn(store, mode, CLAUDE_CODE_ID))
         }
-        Err(error) if error.code == auth::AuthError::KEYCHAIN_FAILED => runner::ApiKey::Unreadable,
+        Err(error) if error.code == auth::AuthError::KEYCHAIN_FAILED => {
+            runner::ApiKey::Unreadable(error.status)
+        }
         Err(_) => runner::ApiKey::Unresolved,
     }
 }
@@ -551,7 +553,7 @@ async fn drive_one(app: &AppHandle, launch: Launch) -> bool {
         key_for_agent(&db, &**store, &key_agent)
     })
     .await
-    .unwrap_or(runner::ApiKey::Unreadable);
+    .unwrap_or(runner::ApiKey::Unreadable(None));
     let (Some(db), Some(registry)) = (app.try_state::<Database>(), app.try_state::<TurnRegistry>())
     else {
         return false;
@@ -1056,6 +1058,20 @@ mod tests {
     }
 
     #[test]
+    fn a_group_that_registers_after_the_exit_kill_is_killed_and_not_advanced() {
+        use std::os::unix::process::ExitStatusExt;
+        let registry = TurnRegistry::default();
+        registry.kill_all(Duration::from_millis(10));
+        assert!(!registry.begin("a", "t1"));
+        let mut late = spawn_group("sleep 30");
+        let group = group_of(&late);
+        let reaper = std::thread::spawn(move || late.wait().unwrap());
+        assert!(!registry.set_group("a", "t1", group));
+        let status = reaper.join().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+    }
+
+    #[test]
     fn a_stop_with_no_running_turn_is_a_no_op() {
         let registry = TurnRegistry::default();
         assert!(registry.request_stop("a", "t").is_none());
@@ -1412,13 +1428,44 @@ mod tests {
         }
     }
 
+    struct DeniedStore;
+
+    impl SecretStore for DeniedStore {
+        fn exists(&self, _: &str) -> Result<bool, SecretError> {
+            Err(SecretError::Read(Some(-25293)))
+        }
+        fn get(&self, _: &str) -> Result<Option<SecretString>, SecretError> {
+            Err(SecretError::Read(Some(-25293)))
+        }
+        fn set(&self, _: &str, _: &SecretString) -> Result<(), SecretError> {
+            Err(SecretError::Write)
+        }
+        fn delete(&self, _: &str) -> Result<(), SecretError> {
+            Err(SecretError::Delete)
+        }
+    }
+
+    #[test]
+    fn the_keychain_status_code_reaches_the_api_key_of_a_turn() {
+        let fx = Fixture::new("claude-code");
+        assert!(matches!(
+            key_for_agent(&fx.db, &DeniedStore, "a"),
+            runner::ApiKey::Unreadable(Some(-25293))
+        ));
+        choose(&fx, Some(AuthMode::ApiKey), None);
+        assert!(matches!(
+            key_for_agent(&fx.db, &DeniedStore, "a"),
+            runner::ApiKey::Unreadable(Some(-25293))
+        ));
+    }
+
     #[test]
     fn an_unreadable_keychain_with_nothing_chosen_fails_the_turn_instead_of_using_the_subscription()
     {
         let fx = Fixture::new("claude-code");
         assert!(matches!(
             key_for_agent(&fx.db, &BrokenStore, "a"),
-            runner::ApiKey::Unreadable
+            runner::ApiKey::Unreadable(None)
         ));
         choose(&fx, Some(AuthMode::Subscription), None);
         assert!(matches!(

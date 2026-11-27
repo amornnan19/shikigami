@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use super::{Agent, AgentError};
 use crate::auth::AuthMode;
@@ -16,6 +16,25 @@ pub struct AgentRow {
     pub newest_turn_status: Option<String>,
     pub newest_turn_error: Option<String>,
     pub auth_mode: Option<String>,
+}
+
+const NAME_COLUMN: &str = "agents.name";
+
+fn is_name_taken(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(failure, Some(message))
+            if failure.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                && message.contains(NAME_COLUMN)
+    )
+}
+
+pub(super) fn save_error(error: rusqlite::Error) -> AgentError {
+    if is_name_taken(&error) {
+        AgentError::name_taken()
+    } else {
+        AgentError::database(error)
+    }
 }
 
 pub fn name_exists(connection: &Connection, name: &str) -> rusqlite::Result<bool> {
@@ -44,13 +63,7 @@ pub fn insert(connection: &Connection, agent: &Agent) -> Result<(), AgentError> 
             ],
         )
         .map(|_| ())
-        .map_err(|error| {
-            if error.sqlite_error_code() == Some(ErrorCode::ConstraintViolation) {
-                AgentError::name_taken()
-            } else {
-                AgentError::database(error)
-            }
-        })
+        .map_err(save_error)
 }
 
 pub fn update(
@@ -66,13 +79,7 @@ pub fn update(
              WHERE id = ?4",
             params![name, color, model, agent_id],
         )
-        .map_err(|error| {
-            if error.sqlite_error_code() == Some(ErrorCode::ConstraintViolation) {
-                AgentError::name_taken()
-            } else {
-                AgentError::database(error)
-            }
-        })
+        .map_err(save_error)
 }
 
 pub fn set_auth_mode(

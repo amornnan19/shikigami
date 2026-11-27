@@ -54,7 +54,7 @@ function NewAgentForm({
   const clientNameProblem = nameProblem(name);
   const valid = clientNameProblem === null && modelState.problem === null && !create.isPending;
 
-  const nameError = errorFor(serverError, NAME_CODES);
+  const nameError = errorFor(serverError, NAME_CODES) ?? (name === "" ? null : clientNameProblem);
   const modelError =
     errorFor(serverError, ["model-invalid"]) ??
     (modelState.custom === "" ? null : modelState.problem);
