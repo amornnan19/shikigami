@@ -5,7 +5,8 @@ description: Break a Shikigami GitHub milestone (or a spec) into small GitHub is
 
 # Plan issues for a milestone
 
-The repository is public. Draft first, create only after the user approves.
+The repository is public. The user does not need to approve issues (decided 2026-11-27): create
+them directly, then report the list.
 
 ## Steps
 
@@ -38,11 +39,11 @@ The repository is public. Draft first, create only after the user approves.
    ```
 
    No OpenBot names, code, paths or interface text (clean-room rule in `CLAUDE.md`).
-5. Show the list to the user: title, type, one-line goal, dependencies. Wait for approval.
+5. Check the drafts against the clean-room rule. No approval step.
 6. Make sure the type labels exist (once per repo):
    `gh label create feature --color 1D76DB --description "Something that does not exist yet" 2>/dev/null`,
    the same for `bug` (`D73A4A`, "Something misbehaves") and `task` (`C5DEF5`, "Neither a bug nor a feature").
 7. Create each approved issue with its type label and milestone:
    `gh issue create --title "<title>" --label feature --milestone "<milestone title>" --body-file <file>`.
    Write bodies to files in the scratchpad, not inline.
-8. Report the issue numbers and links.
+8. Report to the user: issue numbers, titles, types, one-line goals and dependencies.
