@@ -1,0 +1,17 @@
+[package]
+name = "shikigami"
+version = "0.1.0"
+description = "Shikigami"
+edition = "2021"
+license-file = "../LICENSE"
+publish = false
+
+[lib]
+name = "shikigami_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "=2.7.6", features = [] }
+
+[dependencies]
+tauri = { version = "=2.12.7", features = [] }

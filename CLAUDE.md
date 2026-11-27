@@ -65,6 +65,8 @@ These come from the specs and hold for every feature:
   `Closes #12`) in the body.
 - **Ask the user before every commit and every push.** Show what is in it first.
 - Never force-push, never `--no-verify`, never rewrite pushed history.
+- `main` is protected on GitHub: no direct pushes, every change lands through a pull request. No
+  review approval is required, so a PR can be merged once its checks pass.
 - Write everything in the repository in English: code, comments, docs, commit messages, issues.
 
 ## Checks
