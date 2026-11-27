@@ -39,7 +39,9 @@ The plan is where every design decision is made. The implementer builds it and d
    > E2E opens real windows that take the user's focus: while developing, run only the spec you work on
    > (`tauri build --debug --no-bundle --features e2e`, then `bunx wdio run e2e/wdio.conf.ts --spec <file>`)
    > and prefer Rust tests for logic; run the full `bun run e2e` 3 times only once, at the end. Background
-   > commands must be bounded (`timeout <s> ...`) and stopped before you finish.
+   > commands must be bounded (`timeout <s> ...`) and stopped before you finish. Do not use Monitor or
+   > `sleep; echo` loops to wait: run checks in the foreground with `timeout`, or wait on a background
+   > command's own completion notice. End with no background task running.
    > Verify with real output: `bun run check`; `bun run e2e` 3/3 with screenshot paths; the plan's manual
    > check; stop every process you start by PID and leave port 1420 free; `git status` shows only
    > intended changes.
