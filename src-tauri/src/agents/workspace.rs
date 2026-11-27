@@ -30,11 +30,8 @@ pub fn folder_name(name: &str) -> String {
     }
 }
 
-pub fn instruction_file(provider: &str) -> &'static str {
-    match provider {
-        "codex" => "AGENTS.md",
-        _ => "CLAUDE.md",
-    }
+pub fn instruction_file() -> &'static str {
+    "CLAUDE.md"
 }
 
 pub fn instruction_text(name: &str) -> String {
@@ -60,11 +57,11 @@ pub fn create_folder(root: &Path, name: &str) -> io::Result<PathBuf> {
     }
 }
 
-pub fn write_instruction_file(folder: &Path, provider: &str, name: &str) -> io::Result<()> {
+pub fn write_instruction_file(folder: &Path, name: &str) -> io::Result<()> {
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(folder.join(instruction_file(provider)))?;
+        .open(folder.join(instruction_file()))?;
     file.write_all(instruction_text(name).as_bytes())
 }
 
@@ -116,8 +113,7 @@ mod tests {
     }
 
     #[test]
-    fn instruction_files_follow_the_provider() {
-        assert_eq!(instruction_file("claude-code"), "CLAUDE.md");
-        assert_eq!(instruction_file("codex"), "AGENTS.md");
+    fn the_instruction_file_is_claude_md() {
+        assert_eq!(instruction_file(), "CLAUDE.md");
     }
 }

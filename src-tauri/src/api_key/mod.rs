@@ -590,7 +590,7 @@ mod tests {
     fn another_provider_gets_no_key_and_no_error() {
         let fx = fixture();
         fx.save();
-        assert_eq!(key_for_turn(&fx.db, &NeverTouched, "codex").unwrap(), None);
+        assert_eq!(key_for_turn(&fx.db, &NeverTouched, "other").unwrap(), None);
     }
 
     #[test]
@@ -714,16 +714,16 @@ mod tests {
     fn other_providers_are_unsupported_by_every_command() {
         let fx = fixture();
         let codes = [
-            status(&fx.db, &fx.store, &fx.cache, "codex")
+            status(&fx.db, &fx.store, &fx.cache, "other")
                 .unwrap_err()
                 .code,
-            save(&fx.db, &fx.store, &fx.cache, "codex", KEY)
+            save(&fx.db, &fx.store, &fx.cache, "other", KEY)
                 .unwrap_err()
                 .code,
-            remove(&fx.db, &fx.store, &fx.cache, "codex")
+            remove(&fx.db, &fx.store, &fx.cache, "other")
                 .unwrap_err()
                 .code,
-            set_enabled(&fx.db, &fx.store, &fx.cache, "codex", true)
+            set_enabled(&fx.db, &fx.store, &fx.cache, "other", true)
                 .unwrap_err()
                 .code,
         ];

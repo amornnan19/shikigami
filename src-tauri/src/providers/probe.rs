@@ -9,7 +9,6 @@ use tokio::time::timeout;
 const MAX_OUTPUT_BYTES: u64 = 64 * 1024;
 
 pub struct ProbeOutput {
-    pub code: Option<i32>,
     pub stdout: String,
 }
 
@@ -51,9 +50,8 @@ pub async fn run(
             .await
             .ok()?;
         drop(stdout);
-        let status = child.wait().await.ok()?;
+        child.wait().await.ok()?;
         Some(ProbeOutput {
-            code: status.code(),
             stdout: String::from_utf8_lossy(&bytes).into_owned(),
         })
     })

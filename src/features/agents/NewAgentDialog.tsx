@@ -1,6 +1,6 @@
 import * as RadioGroup from "@radix-ui/react-radio-group";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { type FormEvent, useEffect, useState } from "react";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { type FormEvent, useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -20,10 +20,9 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
-import { listProviders } from "../providers/api";
 import { type Agent, type AgentError, asAgentError, createAgent } from "./api";
 import { AGENT_COLORS } from "./colors";
-import { MODEL_SUGGESTIONS, modelProblem, nameProblem } from "./models";
+import { CLAUDE_CODE, MODEL_SUGGESTIONS, modelProblem, nameProblem } from "./models";
 
 const OTHER_MODEL = "__other__";
 const DEFAULT_MODEL = "default";
@@ -50,10 +49,8 @@ function NewAgentForm({
   onCreated: (agent: Agent) => void;
 }) {
   const queryClient = useQueryClient();
-  const providers = useQuery({ queryKey: ["providers"], queryFn: listProviders, retry: false });
   const [name, setName] = useState("");
   const [color, setColor] = useState<string>(AGENT_COLORS[0].name);
-  const [provider, setProvider] = useState("");
   const [modelChoice, setModelChoice] = useState(DEFAULT_MODEL);
   const [customModel, setCustomModel] = useState("");
   const [serverError, setServerError] = useState<AgentError | null>(null);
@@ -68,34 +65,18 @@ function NewAgentForm({
     onError: (error) => setServerError(asAgentError(error)),
   });
 
-  const { refetch } = providers;
-  useEffect(() => {
-    refetch();
-  }, [refetch]);
-
-  const installed = providers.data?.filter((entry) => entry.installed) ?? [];
-  const selectedProvider = provider || installed[0]?.id || "";
-  const suggestions = MODEL_SUGGESTIONS[selectedProvider] ?? [DEFAULT_MODEL];
   const model = modelChoice === OTHER_MODEL ? customModel.trim() : modelChoice;
 
   const clientNameProblem = nameProblem(name);
   const clientModelProblem = modelChoice === OTHER_MODEL ? modelProblem(customModel) : null;
-  const valid =
-    clientNameProblem === null &&
-    clientModelProblem === null &&
-    selectedProvider !== "" &&
-    !create.isPending;
+  const valid = clientNameProblem === null && clientModelProblem === null && !create.isPending;
 
   const nameError = errorFor(serverError, NAME_CODES);
   const modelError =
     errorFor(serverError, ["model-invalid"]) ?? (customModel === "" ? null : clientModelProblem);
-  const providerError = errorFor(serverError, ["provider-unavailable"]);
   const colorError = errorFor(serverError, ["color-invalid"]);
   const formError =
-    serverError &&
-    ![...NAME_CODES, "model-invalid", "provider-unavailable", "color-invalid"].includes(
-      serverError.code,
-    )
+    serverError && ![...NAME_CODES, "model-invalid", "color-invalid"].includes(serverError.code)
       ? serverError.message
       : null;
 
@@ -103,7 +84,7 @@ function NewAgentForm({
     event.preventDefault();
     if (!valid) return;
     setServerError(null);
-    create.mutate({ name, color, provider: selectedProvider, model });
+    create.mutate({ name, color, provider: CLAUDE_CODE, model });
   }
 
   return (
@@ -148,32 +129,6 @@ function NewAgentForm({
       </div>
 
       <div className="flex flex-col gap-2">
-        <Label htmlFor="agent-provider">Provider</Label>
-        <Select
-          value={selectedProvider}
-          onValueChange={(value) => {
-            setProvider(value);
-            setModelChoice(DEFAULT_MODEL);
-            setCustomModel("");
-            setServerError(null);
-          }}
-        >
-          <SelectTrigger id="agent-provider" aria-describedby="agent-provider-error">
-            <SelectValue placeholder="No provider is installed" />
-          </SelectTrigger>
-          <SelectContent>
-            {providers.data?.map((entry) => (
-              <SelectItem key={entry.id} value={entry.id} disabled={!entry.installed}>
-                {entry.name}
-                {!entry.installed && " (Not installed)"}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-        <FieldError id="agent-provider-error" message={providerError} />
-      </div>
-
-      <div className="flex flex-col gap-2">
         <Label htmlFor="agent-model">Model</Label>
         <Select
           value={modelChoice}
@@ -186,7 +141,7 @@ function NewAgentForm({
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
-            {suggestions.map((suggestion) => (
+            {MODEL_SUGGESTIONS.map((suggestion) => (
               <SelectItem key={suggestion} value={suggestion}>
                 {suggestion}
               </SelectItem>

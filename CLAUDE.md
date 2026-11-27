@@ -27,6 +27,7 @@ none of it may enter this repository.
   database.
 - UI: React with TypeScript (`src/`), built with Vite. Package manager: Bun.
 - Storage: SQLite on this Mac. The user's database is the source of truth.
+- Claude only: agents run on the Claude Code CLI.
 - macOS only. No cloud services of our own.
 
 Libraries and tools (reasons in `docs/decisions/0001-stack.md`):
