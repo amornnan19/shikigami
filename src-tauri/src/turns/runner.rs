@@ -26,7 +26,6 @@ const TEXT_WRITE_INTERVAL: Duration = Duration::from_millis(500);
 const EXIT_GRACE: Duration = Duration::from_secs(5);
 const STDERR_GRACE: Duration = Duration::from_secs(2);
 const SESSION_MISSING: &str = "No conversation found";
-const STALL_MESSAGE: &str = "No response from the provider for 5 minutes.";
 
 const RESUME_NOTICE: &str =
     "Started a new Claude Code session. The agent may have lost earlier context.";
@@ -463,12 +462,15 @@ impl Runner<'_> {
         let mut reader = BufReader::new(stdout);
         let mut buffer = Vec::new();
         loop {
-            let read = match timeout(launch.stall_timeout, read_line(&mut reader, &mut buffer))
-                .await
-            {
+            let limit = if self.step_inputs.is_empty() {
+                launch.stall_timeout
+            } else {
+                launch.tool_stall_timeout
+            };
+            let read = match timeout(limit, read_line(&mut reader, &mut buffer)).await {
                 Ok(read) => read,
                 Err(_) => {
-                    attempt.failure = Some(STALL_MESSAGE.to_owned());
+                    attempt.failure = Some(stall_message(limit));
                     if let Some(group) = self.registry.terminate(&self.agent_id, &self.turn_id) {
                         tokio::spawn(kill_group_after(group, EXIT_TERM_GRACE));
                     }
@@ -510,6 +512,12 @@ impl Runner<'_> {
         }
         attempt
     }
+}
+
+fn stall_message(limit: Duration) -> String {
+    let minutes = limit.as_secs().div_ceil(60).max(1);
+    let unit = if minutes == 1 { "minute" } else { "minutes" };
+    format!("No response from the provider for {minutes} {unit}.")
 }
 
 fn failure_of(attempt: &Attempt) -> String {
@@ -613,7 +621,7 @@ async fn run_turn(
 
 #[cfg(test)]
 mod tests {
-    use super::super::STALL_TIMEOUT;
+    use super::super::{STALL_TIMEOUT, TOOL_STALL_TIMEOUT};
     use super::*;
     use crate::api_key::key_for_turn;
     use crate::secrets::{SecretError, SecretStore};
@@ -735,6 +743,7 @@ mod tests {
                 started_at: now_millis(),
                 environment: self.environment.lock().unwrap().clone(),
                 stall_timeout: STALL_TIMEOUT,
+                tool_stall_timeout: TOOL_STALL_TIMEOUT,
             }
         }
 
@@ -1642,10 +1651,13 @@ mod tests {
     }
 
     const SHORT_STALL: Duration = Duration::from_millis(600);
+    const SHORT_TOOL_STALL: Duration = Duration::from_millis(2500);
+    const LONG_STALL: Duration = Duration::from_secs(60);
 
-    async fn run_with_stall(world: &World, stall: Duration) -> bool {
+    async fn run_with_stall(world: &World, idle: Duration, tool: Duration) -> bool {
         let mut launch = world.launch("go");
-        launch.stall_timeout = stall;
+        launch.stall_timeout = idle;
+        launch.tool_stall_timeout = tool;
         assert!(world.registry.begin("a", &launch.turn_id));
         timeout(
             Duration::from_secs(15),
@@ -1661,24 +1673,90 @@ mod tests {
         .expect("a stalled turn must end")
     }
 
+    fn install_quiet_then(world: &World, before: &str, rest: &str) {
+        world.install(&recording(
+            world,
+            &format!("{before}\necho 'hello'\n{rest}"),
+        ));
+    }
+
+    fn shell_pid(world: &World) -> i32 {
+        fs::read_to_string(world.records().join("shell.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    fn record_pid(world: &World) -> String {
+        format!("echo $$ > \"{}/shell.pid\"", world.records().display())
+    }
+
+    fn term_marker(world: &World) -> String {
+        format!(
+            "trap 'echo got-term > \"{}/term.marker\"; exit 143' TERM",
+            world.records().display()
+        )
+    }
+
+    #[test]
+    fn the_stall_message_names_the_limit_that_applied() {
+        assert_eq!(
+            stall_message(STALL_TIMEOUT),
+            "No response from the provider for 5 minutes."
+        );
+        assert_eq!(
+            stall_message(TOOL_STALL_TIMEOUT),
+            "No response from the provider for 15 minutes."
+        );
+        assert_eq!(
+            stall_message(Duration::from_secs(1)),
+            "No response from the provider for 1 minute."
+        );
+    }
+
     #[tokio::test]
-    async fn a_turn_with_no_output_for_the_stall_timeout_fails_and_its_group_is_killed() {
+    async fn a_turn_with_no_output_and_no_running_step_fails_after_the_idle_limit() {
         let world = World::new();
-        let pid_file = world.records().join("shell.pid");
-        install_streaming_then(
+        install_quiet_then(
             &world,
-            &format!("echo $$ > \"{}\"", pid_file.display()),
+            &format!("{}\n{}", record_pid(&world), term_marker(&world)),
             "sleep 60",
         );
         let started = Instant::now();
-        let advance = run_with_stall(&world, SHORT_STALL).await;
+        let advance = run_with_stall(&world, SHORT_STALL, LONG_STALL).await;
         assert!(started.elapsed() < Duration::from_secs(8));
         assert!(advance);
         let turn = only_turn(&world);
         assert_eq!(turn.status, "failed");
         assert_eq!(
             turn.error.as_deref(),
-            Some("No response from the provider for 5 minutes.")
+            Some("No response from the provider for 1 minute.")
+        );
+        assert!(has_record(&world, "term.marker"));
+        assert_ne!(unsafe { libc::killpg(shell_pid(&world), 0) }, 0);
+        assert!(world.registry.slots().is_empty());
+        assert_eq!(world.sink.kinds().last().map(String::as_str), Some("ended"));
+    }
+
+    #[tokio::test]
+    async fn a_turn_with_a_running_step_waits_for_the_tool_limit_and_stops_the_step() {
+        let world = World::new();
+        install_streaming_then(
+            &world,
+            &format!("{}\n{}", record_pid(&world), term_marker(&world)),
+            "sleep 60",
+        );
+        let started = Instant::now();
+        let advance = run_with_stall(&world, SHORT_STALL, SHORT_TOOL_STALL).await;
+        assert!(started.elapsed() >= SHORT_TOOL_STALL);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(advance);
+        let turn = only_turn(&world);
+        assert_eq!(turn.status, "failed");
+        assert_eq!(
+            turn.error.as_deref(),
+            Some("No response from the provider for 1 minute.")
         );
         let steps: Vec<_> = turn
             .items
@@ -1692,35 +1770,40 @@ mod tests {
         assert!(turn.items.iter().any(
             |item| matches!(item, ItemView::Text { text, .. } if text.starts_with("partial"))
         ));
-        let pid: i32 = fs::read_to_string(&pid_file)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        assert_ne!(unsafe { libc::killpg(pid, 0) }, 0);
-        assert!(world.registry.slots().is_empty());
-        assert_eq!(world.sink.kinds().last().map(String::as_str), Some("ended"));
+        assert!(has_record(&world, "term.marker"));
+        assert_ne!(unsafe { libc::killpg(shell_pid(&world), 0) }, 0);
+    }
+
+    #[tokio::test]
+    async fn a_quiet_tool_that_ends_within_the_tool_limit_is_not_stalled() {
+        let world = World::new();
+        install_streaming_then(&world, "", "sleep 1.5\nexit 0");
+        let started = Instant::now();
+        run_with_stall(&world, SHORT_STALL, SHORT_TOOL_STALL).await;
+        assert!(started.elapsed() >= Duration::from_millis(1500));
+        let turn = only_turn(&world);
+        assert_eq!(turn.status, "failed");
+        assert_eq!(
+            turn.error.as_deref(),
+            Some("Claude Code exited unexpectedly.")
+        );
     }
 
     #[tokio::test]
     async fn a_stalled_provider_that_ignores_the_term_signal_is_killed_after_the_grace() {
         let world = World::new();
-        let pid_file = world.records().join("shell.pid");
-        install_streaming_then(
+        install_quiet_then(
             &world,
-            &format!("trap '' TERM\necho $$ > \"{}\"", pid_file.display()),
+            &format!("trap '' TERM\n{}", record_pid(&world)),
             "while true; do sleep 1; done",
         );
         let started = Instant::now();
-        run_with_stall(&world, SHORT_STALL).await;
-        assert!(started.elapsed() >= SHORT_STALL + EXIT_TERM_GRACE);
+        run_with_stall(&world, SHORT_STALL, LONG_STALL).await;
+        let elapsed = started.elapsed();
+        assert!(elapsed >= SHORT_STALL + EXIT_TERM_GRACE);
+        assert!(elapsed < SHORT_STALL + EXIT_TERM_GRACE + Duration::from_secs(1));
         assert_eq!(only_turn(&world).status, "failed");
-        let pid: i32 = fs::read_to_string(&pid_file)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        assert_ne!(unsafe { libc::killpg(pid, 0) }, 0);
+        assert_ne!(unsafe { libc::killpg(shell_pid(&world), 0) }, 0);
     }
 
     #[tokio::test]
@@ -1735,7 +1818,7 @@ mod tests {
             ),
         ));
         let started = Instant::now();
-        run_with_stall(&world, SHORT_STALL).await;
+        run_with_stall(&world, SHORT_STALL, LONG_STALL).await;
         assert!(started.elapsed() > SHORT_STALL);
         let turn = only_turn(&world);
         assert_eq!(turn.status, "completed");
@@ -1753,7 +1836,7 @@ mod tests {
                 fixture.display()
             ),
         ));
-        run_with_stall(&world, SHORT_STALL).await;
+        run_with_stall(&world, SHORT_STALL, LONG_STALL).await;
         assert_eq!(only_turn(&world).status, "completed");
     }
 

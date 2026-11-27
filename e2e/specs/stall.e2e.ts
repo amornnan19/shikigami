@@ -15,7 +15,7 @@ describe("a provider that goes silent", () => {
     await browser.keys("Enter");
     const turn = $(`${agentView} article:nth-of-type(1)`);
     await expect(turn).toHaveText(
-      expect.stringContaining("No response from the provider for 5 minutes."),
+      expect.stringContaining("No response from the provider for 1 minute."),
       { wait: 30000 },
     );
     await expect($(messageBox)).toHaveAttribute("placeholder", "Message", { wait: 10000 });

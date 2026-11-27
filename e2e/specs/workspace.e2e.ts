@@ -9,7 +9,10 @@ const messageBox = 'textarea[aria-label="Message"]';
 const folder = join(workspacesRoot, "test-agent");
 
 async function refocus() {
-  await browser.execute(() => window.dispatchEvent(new Event("visibilitychange")));
+  await browser.execute(() => {
+    window.dispatchEvent(new Event("blur"));
+    window.dispatchEvent(new Event("focus"));
+  });
 }
 
 describe("a missing workspace folder", () => {

@@ -25,6 +25,7 @@ pub const MESSAGE_MAX_CHARS: usize = 100_000;
 const EXIT_TERM_GRACE: Duration = Duration::from_secs(2);
 const EXIT_POLL: Duration = Duration::from_millis(25);
 pub const STALL_TIMEOUT: Duration = Duration::from_secs(300);
+pub const TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(900);
 #[cfg(feature = "e2e")]
 const STALL_SECONDS_ENV: &str = "SHIKIGAMI_STALL_SECONDS";
 
@@ -314,6 +315,7 @@ pub struct Launch {
     pub started_at: i64,
     pub environment: Vec<(OsString, OsString)>,
     pub stall_timeout: Duration,
+    pub tool_stall_timeout: Duration,
 }
 
 fn stall_timeout() -> Duration {
@@ -326,6 +328,14 @@ fn stall_timeout() -> Duration {
         return Duration::from_secs(seconds);
     }
     STALL_TIMEOUT
+}
+
+fn begin_error(error: BeginError) -> TurnError {
+    match error {
+        BeginError::NotFound => TurnError::new("not-found", "This agent no longer exists."),
+        BeginError::Busy => TurnError::new("busy", "This agent is already working."),
+        BeginError::Database(error) => TurnError::database(error),
+    }
 }
 
 fn validate(text: &str) -> Result<(), TurnError> {
@@ -381,6 +391,7 @@ fn launch_of(
         started_at,
         environment: std::env::vars_os().collect(),
         stall_timeout: stall_timeout(),
+        tool_stall_timeout: TOOL_STALL_TIMEOUT,
     })
 }
 
@@ -407,11 +418,7 @@ fn prepare(
     let started_at = now_millis();
     let sent = db
         .with_connection(|connection| store::begin_or_queue(connection, agent_id, text, started_at))
-        .map_err(|error| match error {
-            BeginError::NotFound => TurnError::new("not-found", "This agent no longer exists."),
-            BeginError::Busy => TurnError::new("busy", "This agent is already working."),
-            BeginError::Database(error) => TurnError::database(error),
-        })?;
+        .map_err(begin_error)?;
     match sent {
         Sent::Started(begun) => launch_of(
             registry,
@@ -484,7 +491,34 @@ fn resume(
     if registry.is_closing() {
         return Err(TurnError::shutting_down());
     }
-    Ok(start_next(db, registry, dirs, agent_id))
+    let executable = executable_of(db, dirs, agent_id)?;
+    let started_at = now_millis();
+    let advanced = db
+        .with_connection(|connection| {
+            if registry.is_closing() {
+                Ok(None)
+            } else {
+                store::advance_queue(connection, agent_id, started_at)
+            }
+        })
+        .or_else(|error| match error {
+            BeginError::Busy => Ok(None),
+            other => Err(begin_error(other)),
+        })?;
+    advanced
+        .map(|advanced| {
+            launch_of(
+                registry,
+                dirs,
+                agent_id,
+                executable,
+                advanced.begun,
+                advanced.text,
+                started_at,
+            )
+            .ok_or_else(TurnError::shutting_down)
+        })
+        .transpose()
 }
 
 pub fn sweep_interrupted(db: &Database) -> Result<usize, String> {
@@ -1211,6 +1245,32 @@ mod tests {
         assert!(resume(&fx.db, &fx.registry, &fx.dirs(), "a")
             .unwrap()
             .is_none());
+        assert_eq!(fx.turns(), 1);
+    }
+
+    #[test]
+    fn resume_reports_a_missing_provider_and_a_failing_database() {
+        let fx = Fixture::new("claude-code");
+        let first = fx.send("a", "one").unwrap();
+        fx.queue("a", "two");
+        fx.db.with_connection(|c| {
+            store::finish_turn(c, &first.turn_id, "a", "failed", None, 9).unwrap()
+        });
+        let error = resume(&fx.db, &fx.registry, &[], "a")
+            .err()
+            .expect("no provider");
+        assert_eq!(error.code, "provider-unavailable");
+        let error = resume(&fx.db, &fx.registry, &fx.dirs(), "nope")
+            .err()
+            .expect("no agent");
+        assert_eq!(error.code, "not-found");
+        assert_eq!(fx.queued(), [("two".into(), 0)]);
+        fx.db
+            .with_connection(|c| c.execute("DROP TABLE queued_messages", []).unwrap());
+        let error = resume(&fx.db, &fx.registry, &fx.dirs(), "a")
+            .err()
+            .expect("database failure");
+        assert_eq!(error.code, "database-failed");
         assert_eq!(fx.turns(), 1);
     }
 
