@@ -10,7 +10,7 @@
     "tauri": "tauri",
     "app:dev": "tauri dev",
     "app:build": "tauri build",
-    "e2e": "tauri build --debug --no-bundle --features e2e --config e2e/tauri.e2e.conf.json && wdio run e2e/wdio.conf.ts && wdio run e2e/wdio.restart.conf.ts && wdio run e2e/wdio.stall.conf.ts && wdio run e2e/wdio.startup-error.conf.ts && wdio run e2e/wdio.auth-mode.conf.ts && wdio run e2e/wdio.edit-delete.conf.ts",
+    "e2e": "tauri build --debug --no-bundle --features e2e --config e2e/tauri.e2e.conf.json && wdio run e2e/wdio.conf.ts && wdio run e2e/wdio.restart.conf.ts && wdio run e2e/wdio.stall.conf.ts && wdio run e2e/wdio.startup-error.conf.ts && wdio run e2e/wdio.auth-mode.conf.ts && wdio run e2e/wdio.edit-delete.conf.ts && wdio run e2e/wdio.missing-cli.conf.ts",
     "lint": "biome check --error-on-warnings .",
     "format": "biome check --write .",
     "typecheck": "tsc --noEmit && tsc --noEmit -p e2e && tsc --noEmit -p scripts",

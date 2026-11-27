@@ -1,7 +1,7 @@
 # Spec: agents, workspaces and chat
 
 - Milestone: M1 MVP: agents and chat
-- Status: accepted (2026-11-28)
+- Status: shipped (M1)
 
 ## Purpose
 
@@ -69,6 +69,10 @@ conversation across app restarts. This is the core every later milestone builds 
   next queued message starts automatically.
 - The conversation is saved as it happens: user messages when sent, reply text and steps as they
   arrive.
+- While a turn runs the input stays usable. The queue shows how many messages wait, with a note
+  that they wait until the agent finishes.
+- After a restart with an interrupted turn, the queue shows a Resume button; nothing starts until
+  it is pressed.
 - Long conversations open at the newest messages; older ones load when the user scrolls up.
 - Markdown in replies is rendered (headings, lists, code blocks with copy, links). Links open in the
   default browser.
@@ -88,8 +92,19 @@ conversation across app restarts. This is the core every later milestone builds 
   page. If it is not signed in, the user sees the command to sign in, to run in their own terminal.
 - An agent whose provider becomes unavailable shows needs attention, and its input explains why
   instead of sending.
-- Shikigami uses the user's own CLI sign-in. It never asks for or stores the user's provider
-  password. API keys are out of scope for M1.
+- The Claude section on the start screen shows whether the CLI is installed, its version and the
+  sign-in state, with a Refresh button. When the CLI is missing it shows Not installed and an
+  Install button that opens the official install page.
+- The user chooses how Claude Code signs in: with their Claude subscription (the CLI's own sign-in)
+  or with their own API key. The choice is set for the whole app. An agent can follow the app
+  choice or pin its own, in the create dialog and in the agent settings. The agent header shows the
+  mode in use.
+- The API key is saved only in the macOS Keychain, shown only as its last four characters, and can
+  be removed after a confirmation. A turn in API key mode with no saved key fails at once with the
+  reason.
+- With no choice made, the app uses API key mode when a key is saved and the subscription
+  otherwise.
+- Shikigami never asks for or stores the user's Claude password or subscription credentials.
 
 ## Edge cases
 
@@ -111,9 +126,13 @@ conversation across app restarts. This is the core every later milestone builds 
 
 ## Safety
 
-- M1 has no sandbox yet; that is M2. Until M2 lands, agents run with the provider's own default
-  permission prompts left on. Shikigami must not pass any flag that skips the provider's own
-  approvals or widens its permissions.
+- M1 has no sandbox yet; that is M2. Shikigami must not pass any flag that skips the provider's
+  own approvals or widens its permissions. M1 has no approval prompt of its own, so an action that
+  needs approval is denied and shows as a failed step.
+- Every turn runs Claude Code isolated from the user's own Claude Code configuration: only the
+  project's settings, no user-level hooks, plugins or MCP servers, and manual permission mode with
+  no permission prompts (`--setting-sources project --strict-mcp-config --permission-mode manual
+  --permission-prompts none`).
 - Shikigami does not change the user's provider configuration files.
 
 ## Acceptance checks
@@ -142,6 +161,6 @@ conversation across app restarts. This is the core every later milestone builds 
 
 - Multiple threads per agent, branching, side questions.
 - Attachments, images, voice.
-- Changing provider, multiple accounts, API keys, backup models.
+- Changing provider, multiple accounts, backup models.
 - Memory, skills, MCP servers.
 - Sandbox and approvals (M2), routines (M3), agents messaging each other (M4).
