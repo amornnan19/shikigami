@@ -54,6 +54,12 @@ Finder-launched app only has /usr/bin:/bin:/usr/sbin:/sbin, and npm-installed CL
 PATH. Start each CLI in its own process group and kill the group on timeout or stop. Bound how much
 output is read.
 
+## Secrets
+
+Secrets live only in the macOS Keychain. Decrypt a secret only when it is about to be used (a turn),
+never on a status or list path. A failed read must never block turning the feature off or removing
+it. The value never reaches the UI, logs, errors, the database or Debug output.
+
 ## Planning
 
 - Milestones live on GitHub (M0 Foundation ... M9). MVP is M0-M5.

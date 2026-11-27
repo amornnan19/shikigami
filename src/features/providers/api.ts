@@ -6,6 +6,7 @@ export interface ApiKeyStatus {
   saved: boolean;
   lastFour: string | null;
   enabled: boolean;
+  readFailed: boolean;
 }
 
 export interface ApiKeyError {

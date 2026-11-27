@@ -4,10 +4,16 @@ use crate::secrets::SecretString;
 const PREFIX: &str = "sk-ant-";
 const LENGTH: std::ops::RangeInclusive<usize> = 20..=300;
 
+fn is_key_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-' || c == '_'
+}
+
 pub fn key(input: &str) -> Result<SecretString, ApiKeyError> {
     let trimmed = input.trim();
-    let has_bad_char = trimmed.chars().any(|c| c.is_whitespace() || c.is_control());
-    if trimmed.starts_with(PREFIX) && LENGTH.contains(&trimmed.chars().count()) && !has_bad_char {
+    let well_formed = trimmed
+        .strip_prefix(PREFIX)
+        .is_some_and(|rest| rest.chars().all(is_key_char));
+    if well_formed && LENGTH.contains(&trimmed.chars().count()) {
         Ok(SecretString::new(trimmed))
     } else {
         Err(ApiKeyError::key_invalid())
@@ -53,6 +59,17 @@ mod tests {
         assert!(!accepted("sk-ant-test-0000\n0000000000"));
         assert!(!accepted("sk-ant-test-0000\t0000000000"));
         assert!(!accepted("sk-ant-test-0000\u{7}0000000000"));
+    }
+
+    #[test]
+    fn refuses_invisible_and_punctuation_characters_after_the_prefix() {
+        assert!(!accepted("sk-ant-test-0000000000\u{200B}000000"));
+        assert!(!accepted("sk-ant-test-0000000000000000\u{200B}"));
+        assert!(!accepted("\u{FEFF}sk-ant-test-0000000000000000"));
+        assert!(!accepted("sk-ant-test-0000000000\u{FEFF}000000"));
+        assert!(!accepted("sk-ant-test-0000000000.000000"));
+        assert!(!accepted("sk-ant-test-0000000000é000000"));
+        assert!(accepted("sk-ant-api03-AbC_dEf-0123456789"));
     }
 
     #[test]

@@ -16,30 +16,41 @@ import {
   type ApiKeyError,
   type ApiKeyStatus,
   asApiKeyError,
+  type ProviderStatus,
   removeApiKey,
   saveApiKey,
   setApiKeyEnabled,
 } from "./api";
 
-function useRefreshProviders() {
+function useProviderCache(provider: string) {
   const queryClient = useQueryClient();
-  return () => queryClient.invalidateQueries({ queryKey: ["providers"] });
+  return {
+    show: (apiKey: ApiKeyStatus) =>
+      queryClient.setQueryData<ProviderStatus[]>(["providers"], (old) =>
+        old?.map((entry) => (entry.id === provider ? { ...entry, apiKey } : entry)),
+      ),
+    refresh: () => queryClient.invalidateQueries({ queryKey: ["providers"] }),
+  };
 }
 
 function AddApiKey({ provider }: { provider: string }) {
-  const refresh = useRefreshProviders();
+  const providers = useProviderCache(provider);
   const [open, setOpen] = useState(false);
   const [key, setKey] = useState("");
   const [error, setError] = useState<ApiKeyError | null>(null);
 
   const save = useMutation({
     mutationFn: (value: string) => saveApiKey(provider, value),
-    onSuccess: async () => {
+    onSuccess: (status) => {
       setKey("");
       setOpen(false);
-      await refresh();
+      providers.show(status);
     },
     onError: (failure) => setError(asApiKeyError(failure)),
+    onSettled: async () => {
+      save.reset();
+      await providers.refresh();
+    },
   });
 
   function cancel() {
@@ -101,17 +112,18 @@ function AddApiKey({ provider }: { provider: string }) {
 }
 
 function RemoveApiKey({ provider }: { provider: string }) {
-  const refresh = useRefreshProviders();
+  const providers = useProviderCache(provider);
   const [open, setOpen] = useState(false);
   const [error, setError] = useState<ApiKeyError | null>(null);
 
   const remove = useMutation({
     mutationFn: () => removeApiKey(provider),
-    onSuccess: async () => {
+    onSuccess: (status) => {
       setOpen(false);
-      await refresh();
+      providers.show(status);
     },
     onError: (failure) => setError(asApiKeyError(failure)),
+    onSettled: () => providers.refresh(),
   });
 
   function changeOpen(next: boolean) {
@@ -151,22 +163,28 @@ function RemoveApiKey({ provider }: { provider: string }) {
   );
 }
 
+function savedLabel(status: ApiKeyStatus) {
+  if (status.readFailed) return "Could not read the saved API key.";
+  return status.lastFour ? `API key saved (…${status.lastFour})` : "API key saved";
+}
+
 function SavedApiKey({ provider, status }: { provider: string; status: ApiKeyStatus }) {
-  const refresh = useRefreshProviders();
+  const providers = useProviderCache(provider);
   const [error, setError] = useState<ApiKeyError | null>(null);
 
   const toggle = useMutation({
     mutationFn: (enabled: boolean) => setApiKeyEnabled(provider, enabled),
-    onSuccess: async () => {
+    onSuccess: (status) => {
       setError(null);
-      await refresh();
+      providers.show(status);
     },
     onError: (failure) => setError(asApiKeyError(failure)),
+    onSettled: () => providers.refresh(),
   });
 
   return (
     <div className="flex flex-col gap-2">
-      <span>API key saved (…{status.lastFour})</span>
+      <span>{savedLabel(status)}</span>
       <div className="flex items-center gap-3">
         <div className="flex items-center gap-2">
           <Switch
@@ -200,8 +218,10 @@ export function ApiKeyBlock({
       {status === null && (
         <span className="text-muted-foreground">Could not read the API key status.</span>
       )}
-      {status?.saved === false && <AddApiKey provider={provider} />}
-      {status?.saved === true && <SavedApiKey provider={provider} status={status} />}
+      {status && !status.saved && !status.readFailed && <AddApiKey provider={provider} />}
+      {status && (status.saved || status.readFailed) && (
+        <SavedApiKey provider={provider} status={status} />
+      )}
     </section>
   );
 }
