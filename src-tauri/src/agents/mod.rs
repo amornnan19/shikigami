@@ -9,8 +9,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
+use crate::auth::{self, AppAuth, AuthMode};
 use crate::db::Database;
 use crate::providers;
+use crate::secrets::SharedStore;
 
 pub const WORKSPACES_DIR_ENV: &str = "SHIKIGAMI_WORKSPACES_DIR";
 
@@ -96,6 +98,8 @@ pub struct Agent {
     pub last_activity_at: i64,
     pub state: AgentState,
     pub attention: Option<Attention>,
+    pub auth_mode: Option<AuthMode>,
+    pub effective_auth_mode: AuthMode,
 }
 
 #[derive(Debug, Deserialize)]
@@ -105,6 +109,8 @@ pub struct CreateAgentInput {
     pub color: String,
     pub provider: String,
     pub model: String,
+    #[serde(default)]
+    pub auth_mode: Option<AuthMode>,
 }
 
 struct Validated {
@@ -112,6 +118,7 @@ struct Validated {
     color: String,
     provider: String,
     model: String,
+    auth_mode: Option<AuthMode>,
 }
 
 struct Facts<'a> {
@@ -199,10 +206,16 @@ fn validate(
         color,
         provider: input.provider,
         model,
+        auth_mode: input.auth_mode,
     })
 }
 
-fn persist(db: &Database, root: &Path, valid: Validated) -> Result<Agent, AgentError> {
+fn persist(
+    db: &Database,
+    root: &Path,
+    valid: Validated,
+    app: &AppAuth,
+) -> Result<Agent, AgentError> {
     let folder = workspace::create_folder(root, &valid.name).map_err(AgentError::folder)?;
     let now = now_millis();
     let agent = Agent {
@@ -216,6 +229,8 @@ fn persist(db: &Database, root: &Path, valid: Validated) -> Result<Agent, AgentE
         last_activity_at: now,
         state: AgentState::Idle,
         attention: None,
+        auth_mode: valid.auth_mode,
+        effective_auth_mode: app.effective(valid.auth_mode),
     };
     let saved = workspace::write_instruction_file(&folder, &agent.name)
         .map_err(AgentError::folder)
@@ -232,15 +247,16 @@ fn create(
     root: &Result<PathBuf, String>,
     input: CreateAgentInput,
     dirs: &[PathBuf],
+    app: &AppAuth,
 ) -> Result<Agent, AgentError> {
     let valid = validate(db, input, dirs)?;
     let root = root
         .as_ref()
         .map_err(|message| AgentError::new("folder-failed", message.clone()))?;
-    persist(db, root, valid)
+    persist(db, root, valid, app)
 }
 
-fn list(db: &Database, dirs: &[PathBuf]) -> Result<Vec<Agent>, AgentError> {
+fn list(db: &Database, dirs: &[PathBuf], app: &AppAuth) -> Result<Vec<Agent>, AgentError> {
     let rows = db
         .with_connection(store::list)
         .map_err(AgentError::database)?;
@@ -255,6 +271,7 @@ fn list(db: &Database, dirs: &[PathBuf]) -> Result<Vec<Agent>, AgentError> {
                 provider_installed: providers::is_installed(&row.provider, dirs),
                 provider_name: providers::name_of(&row.provider),
             });
+            let auth_mode = row.auth_mode.as_deref().and_then(AuthMode::parse);
             Agent {
                 id: row.id,
                 name: row.name,
@@ -266,12 +283,19 @@ fn list(db: &Database, dirs: &[PathBuf]) -> Result<Vec<Agent>, AgentError> {
                 last_activity_at: row.last_activity_at,
                 state,
                 attention,
+                auth_mode,
+                effective_auth_mode: app.effective(auth_mode),
             }
         })
         .collect())
 }
 
-fn recreate(db: &Database, dirs: &[PathBuf], agent_id: &str) -> Result<Agent, AgentError> {
+fn recreate(
+    db: &Database,
+    dirs: &[PathBuf],
+    app: &AppAuth,
+    agent_id: &str,
+) -> Result<Agent, AgentError> {
     let (name, path) = db
         .with_connection(|connection| store::workspace_of(connection, agent_id))
         .map_err(AgentError::database)?
@@ -284,21 +308,52 @@ fn recreate(db: &Database, dirs: &[PathBuf], agent_id: &str) -> Result<Agent, Ag
         }
         _ => {}
     }
-    list(db, dirs)?
+    find(db, dirs, app, agent_id)
+}
+
+fn find(
+    db: &Database,
+    dirs: &[PathBuf],
+    app: &AppAuth,
+    agent_id: &str,
+) -> Result<Agent, AgentError> {
+    list(db, dirs, app)?
         .into_iter()
         .find(|agent| agent.id == agent_id)
         .ok_or_else(|| AgentError::new("not-found", "This agent no longer exists."))
+}
+
+fn set_auth_mode(
+    db: &Database,
+    dirs: &[PathBuf],
+    app: &AppAuth,
+    agent_id: &str,
+    mode: Option<AuthMode>,
+) -> Result<Agent, AgentError> {
+    let changed = db
+        .with_connection(|connection| store::set_auth_mode(connection, agent_id, mode))
+        .map_err(AgentError::database)?;
+    if changed == 0 {
+        return Err(AgentError::new("not-found", "This agent no longer exists."));
+    }
+    find(db, dirs, app, agent_id)
 }
 
 fn unavailable() -> AgentError {
     AgentError::new("unavailable", "The app database is not available.")
 }
 
+fn app_auth(app: &AppHandle, db: &Database) -> Result<AppAuth, AgentError> {
+    let store = app.try_state::<SharedStore>().ok_or_else(unavailable)?;
+    auth::load_app_auth(db, &**store).map_err(|error| AgentError::new(error.code, error.message))
+}
+
 #[tauri::command]
 pub async fn list_agents(app: AppHandle) -> Result<Vec<Agent>, AgentError> {
     tauri::async_runtime::spawn_blocking(move || {
         let db = app.try_state::<Database>().ok_or_else(unavailable)?;
-        list(&db, &providers::search_dirs())
+        let app_auth = app_auth(&app, &db)?;
+        list(&db, &providers::search_dirs(), &app_auth)
     })
     .await
     .map_err(AgentError::database)?
@@ -309,7 +364,8 @@ pub async fn create_agent(app: AppHandle, input: CreateAgentInput) -> Result<Age
     tauri::async_runtime::spawn_blocking(move || {
         let db = app.try_state::<Database>().ok_or_else(unavailable)?;
         let root = app.try_state::<WorkspacesRoot>().ok_or_else(unavailable)?;
-        create(&db, &root.0, input, &providers::search_dirs())
+        let app_auth = app_auth(&app, &db)?;
+        create(&db, &root.0, input, &providers::search_dirs(), &app_auth)
     })
     .await
     .map_err(AgentError::database)?
@@ -319,7 +375,23 @@ pub async fn create_agent(app: AppHandle, input: CreateAgentInput) -> Result<Age
 pub async fn recreate_workspace(app: AppHandle, agent_id: String) -> Result<Agent, AgentError> {
     tauri::async_runtime::spawn_blocking(move || {
         let db = app.try_state::<Database>().ok_or_else(unavailable)?;
-        recreate(&db, &providers::search_dirs(), &agent_id)
+        let app_auth = app_auth(&app, &db)?;
+        recreate(&db, &providers::search_dirs(), &app_auth, &agent_id)
+    })
+    .await
+    .map_err(AgentError::database)?
+}
+
+#[tauri::command]
+pub async fn set_agent_auth_mode(
+    app: AppHandle,
+    agent_id: String,
+    mode: Option<AuthMode>,
+) -> Result<Agent, AgentError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let db = app.try_state::<Database>().ok_or_else(unavailable)?;
+        let app_auth = app_auth(&app, &db)?;
+        set_auth_mode(&db, &providers::search_dirs(), &app_auth, &agent_id, mode)
     })
     .await
     .map_err(AgentError::database)?
@@ -329,6 +401,11 @@ pub async fn recreate_workspace(app: AppHandle, agent_id: String) -> Result<Agen
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    const APP_AUTH: AppAuth = AppAuth {
+        setting: None,
+        key_exists: false,
+    };
 
     struct Fixture {
         _data: tempfile::TempDir,
@@ -364,11 +441,17 @@ mod tests {
         }
 
         fn create(&self, name: &str, provider: &str) -> Result<Agent, AgentError> {
-            create(&self.db, &self.root(), input(name, provider), &self.dirs())
+            create(
+                &self.db,
+                &self.root(),
+                input(name, provider),
+                &self.dirs(),
+                &APP_AUTH,
+            )
         }
 
         fn list(&self) -> Vec<Agent> {
-            list(&self.db, &self.dirs()).unwrap()
+            list(&self.db, &self.dirs(), &APP_AUTH).unwrap()
         }
 
         fn agent_count(&self) -> i64 {
@@ -389,6 +472,7 @@ mod tests {
             color: "blue".to_string(),
             provider: provider.to_string(),
             model: "default".to_string(),
+            auth_mode: None,
         }
     }
 
@@ -450,13 +534,13 @@ mod tests {
         let mut bad_color = input("A", "claude-code");
         bad_color.color = "purple".to_string();
         assert_eq!(
-            error_code(create(&fx.db, &fx.root(), bad_color, &fx.dirs())),
+            error_code(create(&fx.db, &fx.root(), bad_color, &fx.dirs(), &APP_AUTH)),
             "color-invalid"
         );
         let mut bad_model = input("A", "claude-code");
         bad_model.model = "two words".to_string();
         assert_eq!(
-            error_code(create(&fx.db, &fx.root(), bad_model, &fx.dirs())),
+            error_code(create(&fx.db, &fx.root(), bad_model, &fx.dirs(), &APP_AUTH)),
             "model-invalid"
         );
         assert_eq!(fx.agent_count(), 0);
@@ -472,8 +556,9 @@ mod tests {
             color: "blue".to_string(),
             provider: "claude-code".to_string(),
             model: "default".to_string(),
+            auth_mode: None,
         };
-        let error = persist(&fx.db, fx.workspaces.path(), valid).unwrap_err();
+        let error = persist(&fx.db, fx.workspaces.path(), valid, &APP_AUTH).unwrap_err();
         assert_eq!(error.code, "name-taken");
         assert_eq!(fx.agent_count(), 1);
         let folders: Vec<_> = fs::read_dir(fx.workspaces.path())
@@ -489,7 +574,14 @@ mod tests {
         let blocker = fx.workspaces.path().join("blocker");
         fs::write(&blocker, "a file, not a folder").unwrap();
         let root = Ok(blocker);
-        let error = create(&fx.db, &root, input("A", "claude-code"), &fx.dirs()).unwrap_err();
+        let error = create(
+            &fx.db,
+            &root,
+            input("A", "claude-code"),
+            &fx.dirs(),
+            &APP_AUTH,
+        )
+        .unwrap_err();
         assert_eq!(error.code, "folder-failed");
         assert_eq!(fx.agent_count(), 0);
     }
@@ -498,7 +590,14 @@ mod tests {
     fn an_unresolved_root_is_an_error_not_a_panic() {
         let fx = Fixture::new(&["claude"]);
         let root = Err("could not find your home folder".to_string());
-        let error = create(&fx.db, &root, input("A", "claude-code"), &fx.dirs()).unwrap_err();
+        let error = create(
+            &fx.db,
+            &root,
+            input("A", "claude-code"),
+            &fx.dirs(),
+            &APP_AUTH,
+        )
+        .unwrap_err();
         assert_eq!(error.code, "folder-failed");
         assert_eq!(fx.agent_count(), 0);
     }
@@ -667,7 +766,7 @@ mod tests {
         assert_eq!(states["Recovered"], AgentState::Idle);
         assert_eq!(states["Gone"], AgentState::NeedsAttention);
 
-        let without_cli = list(&fx.db, &[]).unwrap();
+        let without_cli = list(&fx.db, &[], &APP_AUTH).unwrap();
         let recovered = without_cli
             .iter()
             .find(|agent| agent.name == "Recovered")
@@ -721,10 +820,17 @@ mod tests {
         let dirs = vec![bin.path().to_path_buf()];
         let root = Ok(workspaces.path().to_path_buf());
         let db = Database::open(data.path()).unwrap();
-        create(&db, &root, input("Persisted", "claude-code"), &dirs).unwrap();
+        create(
+            &db,
+            &root,
+            input("Persisted", "claude-code"),
+            &dirs,
+            &APP_AUTH,
+        )
+        .unwrap();
         drop(db);
         let db = Database::open(data.path()).unwrap();
-        let agents = list(&db, &dirs).unwrap();
+        let agents = list(&db, &dirs, &APP_AUTH).unwrap();
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].name, "Persisted");
     }
@@ -798,7 +904,7 @@ mod tests {
         let agent = fx.create("Gone", "claude-code").unwrap();
         fs::remove_dir_all(&agent.workspace_path).unwrap();
         assert_eq!(fx.list()[0].state, AgentState::NeedsAttention);
-        let fixed = recreate(&fx.db, &fx.dirs(), &agent.id).unwrap();
+        let fixed = recreate(&fx.db, &fx.dirs(), &APP_AUTH, &agent.id).unwrap();
         assert_eq!(fixed.state, AgentState::Idle);
         assert_eq!(fixed.attention, None);
         assert_eq!(
@@ -819,7 +925,7 @@ mod tests {
             )
             .unwrap()
         });
-        recreate(&fx.db, &fx.dirs(), &agent.id).unwrap();
+        recreate(&fx.db, &fx.dirs(), &APP_AUTH, &agent.id).unwrap();
         assert!(deep.join("CLAUDE.md").is_file());
     }
 
@@ -830,7 +936,7 @@ mod tests {
         let folder = PathBuf::from(&agent.workspace_path);
         fs::write(folder.join("CLAUDE.md"), "my own words").unwrap();
         fs::write(folder.join("notes.txt"), "work").unwrap();
-        recreate(&fx.db, &fx.dirs(), &agent.id).unwrap();
+        recreate(&fx.db, &fx.dirs(), &APP_AUTH, &agent.id).unwrap();
         assert_eq!(
             fs::read_to_string(folder.join("CLAUDE.md")).unwrap(),
             "my own words"
@@ -840,7 +946,7 @@ mod tests {
             "work"
         );
         fs::remove_file(folder.join("CLAUDE.md")).unwrap();
-        recreate(&fx.db, &fx.dirs(), &agent.id).unwrap();
+        recreate(&fx.db, &fx.dirs(), &APP_AUTH, &agent.id).unwrap();
         assert_eq!(
             fs::read_to_string(folder.join("CLAUDE.md")).unwrap(),
             workspace::instruction_text("Keep")
@@ -854,7 +960,7 @@ mod tests {
     #[test]
     fn recreating_for_an_unknown_agent_is_refused() {
         let fx = Fixture::new(&["claude"]);
-        let error = recreate(&fx.db, &fx.dirs(), "nope").unwrap_err();
+        let error = recreate(&fx.db, &fx.dirs(), &APP_AUTH, "nope").unwrap_err();
         assert_eq!(error.code, "not-found");
     }
 
@@ -871,7 +977,84 @@ mod tests {
             )
             .unwrap()
         });
-        let error = recreate(&fx.db, &fx.dirs(), &agent.id).unwrap_err();
+        let error = recreate(&fx.db, &fx.dirs(), &APP_AUTH, &agent.id).unwrap_err();
         assert_eq!(error.code, "folder-failed");
+    }
+
+    #[test]
+    fn a_new_agent_without_a_choice_follows_the_app_default() {
+        let fx = Fixture::new(&["claude"]);
+        let agent = fx.create("Follower", "claude-code").unwrap();
+        assert_eq!(agent.auth_mode, None);
+        assert_eq!(agent.effective_auth_mode, AuthMode::Subscription);
+        let with_key = AppAuth {
+            setting: None,
+            key_exists: true,
+        };
+        let listed = list(&fx.db, &fx.dirs(), &with_key).unwrap();
+        assert_eq!(listed[0].auth_mode, None);
+        assert_eq!(listed[0].effective_auth_mode, AuthMode::ApiKey);
+    }
+
+    #[test]
+    fn a_new_agent_can_choose_its_own_sign_in_and_it_survives_a_listing() {
+        let fx = Fixture::new(&["claude"]);
+        let mut chosen = input("Chooser", "claude-code");
+        chosen.auth_mode = Some(AuthMode::ApiKey);
+        let agent = create(&fx.db, &fx.root(), chosen, &fx.dirs(), &APP_AUTH).unwrap();
+        assert_eq!(agent.auth_mode, Some(AuthMode::ApiKey));
+        assert_eq!(agent.effective_auth_mode, AuthMode::ApiKey);
+        assert_eq!(fx.list(), vec![agent]);
+    }
+
+    #[test]
+    fn the_create_input_reads_a_missing_null_or_named_auth_mode() {
+        let parse = |json: &str| {
+            serde_json::from_str::<CreateAgentInput>(json)
+                .unwrap()
+                .auth_mode
+        };
+        let base = r#""name":"a","color":"blue","provider":"claude-code","model":"default""#;
+        assert_eq!(parse(&format!("{{{base}}}")), None);
+        assert_eq!(parse(&format!("{{{base},\"authMode\":null}}")), None);
+        assert_eq!(
+            parse(&format!("{{{base},\"authMode\":\"api-key\"}}")),
+            Some(AuthMode::ApiKey)
+        );
+        assert_eq!(
+            parse(&format!("{{{base},\"authMode\":\"subscription\"}}")),
+            Some(AuthMode::Subscription)
+        );
+    }
+
+    #[test]
+    fn setting_an_agent_override_changes_only_that_agent_and_null_clears_it() {
+        let fx = Fixture::new(&["claude"]);
+        let one = fx.create("One", "claude-code").unwrap();
+        let two = fx.create("Two", "claude-code").unwrap();
+        let key_default = AppAuth {
+            setting: Some(AuthMode::ApiKey),
+            key_exists: true,
+        };
+        let set = |agent: &Agent, mode| {
+            set_auth_mode(&fx.db, &fx.dirs(), &key_default, &agent.id, mode).unwrap()
+        };
+        let overridden = set(&one, Some(AuthMode::Subscription));
+        assert_eq!(overridden.auth_mode, Some(AuthMode::Subscription));
+        assert_eq!(overridden.effective_auth_mode, AuthMode::Subscription);
+        let listed = list(&fx.db, &fx.dirs(), &key_default).unwrap();
+        let other = listed.iter().find(|agent| agent.id == two.id).unwrap();
+        assert_eq!(other.auth_mode, None);
+        assert_eq!(other.effective_auth_mode, AuthMode::ApiKey);
+        let cleared = set(&one, None);
+        assert_eq!(cleared.auth_mode, None);
+        assert_eq!(cleared.effective_auth_mode, AuthMode::ApiKey);
+    }
+
+    #[test]
+    fn setting_the_override_of_a_missing_agent_is_not_found() {
+        let fx = Fixture::new(&["claude"]);
+        let error = set_auth_mode(&fx.db, &fx.dirs(), &APP_AUTH, "nope", None).unwrap_err();
+        assert_eq!(error.code, "not-found");
     }
 }

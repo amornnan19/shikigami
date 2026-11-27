@@ -1,5 +1,5 @@
 import * as RadioGroup from "@radix-ui/react-radio-group";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { type FormEvent, useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
@@ -19,6 +19,12 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import {
+  AUTH_MODE_LABELS,
+  type AuthMode,
+  CLAUDE_AUTH_KEY,
+  getClaudeAuth,
+} from "@/features/providers/api";
 import { cn } from "@/lib/utils";
 import { type Agent, type AgentError, asAgentError, createAgent } from "./api";
 import { AGENT_COLORS } from "./colors";
@@ -26,6 +32,7 @@ import { CLAUDE_CODE, MODEL_SUGGESTIONS, modelProblem, nameProblem } from "./mod
 
 const OTHER_MODEL = "__other__";
 const DEFAULT_MODEL = "default";
+const APP_DEFAULT_AUTH = "app-default";
 const NAME_CODES = ["name-empty", "name-too-long", "name-taken"];
 
 function FieldError({ id, message }: { id: string; message: string | null }) {
@@ -53,7 +60,12 @@ function NewAgentForm({
   const [color, setColor] = useState<string>(AGENT_COLORS[0].name);
   const [modelChoice, setModelChoice] = useState(DEFAULT_MODEL);
   const [customModel, setCustomModel] = useState("");
+  const [authChoice, setAuthChoice] = useState<string>(APP_DEFAULT_AUTH);
   const [serverError, setServerError] = useState<AgentError | null>(null);
+  const claudeAuth = useQuery({ queryKey: CLAUDE_AUTH_KEY, queryFn: getClaudeAuth, retry: false });
+  const appDefaultLabel = claudeAuth.data
+    ? `Use app default (${AUTH_MODE_LABELS[claudeAuth.data.appMode]})`
+    : "Use app default";
 
   const create = useMutation({
     mutationFn: createAgent,
@@ -84,7 +96,13 @@ function NewAgentForm({
     event.preventDefault();
     if (!valid) return;
     setServerError(null);
-    create.mutate({ name, color, provider: CLAUDE_CODE, model });
+    create.mutate({
+      name,
+      color,
+      provider: CLAUDE_CODE,
+      model,
+      authMode: authChoice === APP_DEFAULT_AUTH ? null : (authChoice as AuthMode),
+    });
   }
 
   return (
@@ -163,6 +181,20 @@ function NewAgentForm({
           />
         )}
         <FieldError id="agent-model-error" message={modelError} />
+      </div>
+
+      <div className="flex flex-col gap-2">
+        <Label htmlFor="agent-sign-in">Sign-in</Label>
+        <Select value={authChoice} onValueChange={setAuthChoice}>
+          <SelectTrigger id="agent-sign-in">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value={APP_DEFAULT_AUTH}>{appDefaultLabel}</SelectItem>
+            <SelectItem value="subscription">Claude subscription</SelectItem>
+            <SelectItem value="api-key">API key</SelectItem>
+          </SelectContent>
+        </Select>
       </div>
 
       <FieldError id="agent-form-error" message={formError} />

@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { AuthMode } from "@/features/providers/api";
 
 export type AgentState = "idle" | "working" | "needs-attention";
 
@@ -18,6 +19,8 @@ export interface Agent {
   lastActivityAt: number;
   state: AgentState;
   attention: Attention | null;
+  authMode: AuthMode | null;
+  effectiveAuthMode: AuthMode;
 }
 
 export interface CreateAgentInput {
@@ -25,6 +28,7 @@ export interface CreateAgentInput {
   color: string;
   provider: string;
   model: string;
+  authMode: AuthMode | null;
 }
 
 export interface AgentError {

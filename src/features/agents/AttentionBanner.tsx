@@ -1,6 +1,7 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { TriangleAlert } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { CLAUDE_AUTH_KEY } from "@/features/providers/api";
 import { type Agent, asAgentError, recreateWorkspace } from "./api";
 
 export const BLOCKING_CODES = ["workspace-missing", "provider-unavailable"];
@@ -13,7 +14,7 @@ export function AttentionBanner({ agent }: { agent: Agent }) {
   const client = useQueryClient();
   const refresh = () => {
     void client.invalidateQueries({ queryKey: ["agents"] });
-    void client.invalidateQueries({ queryKey: ["providers"] });
+    void client.invalidateQueries({ queryKey: CLAUDE_AUTH_KEY });
   };
   const recreate = useMutation({
     mutationFn: () => recreateWorkspace(agent.id),

@@ -102,7 +102,8 @@ mod tests {
     fn seed_agent_tree(db: &Database) {
         db.with_connection(|c| {
             c.execute_batch(
-                "INSERT INTO agents VALUES ('a', 'Ada', 'red', 'codex', 'm', '/w', NULL, 1, 1);
+                "INSERT INTO agents (id, name, color, provider, model, workspace_path, created_at, last_activity_at)
+                 VALUES ('a', 'Ada', 'red', 'codex', 'm', '/w', 1, 1);
                  INSERT INTO turns VALUES ('t', 'a', 'running', NULL, 1, NULL);
                  INSERT INTO messages VALUES ('m', 'a', 't', 'user', 'hi', 1);
                  INSERT INTO steps VALUES ('s', 't', 0, 'tool', 'x', NULL, 'running', 1);
@@ -116,7 +117,7 @@ mod tests {
     fn fresh_database_migrates_to_the_latest_version_with_all_tables() {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(dir.path()).unwrap();
-        assert_eq!(schema_version(&db), 2);
+        assert_eq!(schema_version(&db), 3);
         for table in [
             "agents",
             "turns",
@@ -150,7 +151,7 @@ mod tests {
             .unwrap();
         drop(connection);
         let db = Database::open(dir.path()).unwrap();
-        assert_eq!(schema_version(&db), 2);
+        assert_eq!(schema_version(&db), 3);
         assert_eq!(count(&db, "agents"), 1);
         assert_eq!(count(&db, "turns"), 1);
         assert_eq!(count(&db, "settings"), 0);
@@ -161,8 +162,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         drop(Database::open(dir.path()).unwrap());
         let db = Database::open(dir.path()).unwrap();
-        assert_eq!(schema_version(&db), 2);
-        assert_eq!(count(&db, "refinery_schema_history"), 2);
+        assert_eq!(schema_version(&db), 3);
+        assert_eq!(count(&db, "refinery_schema_history"), 3);
     }
 
     #[test]
@@ -233,7 +234,12 @@ mod tests {
             )
             .unwrap(),
             refinery::Migration::unapplied(
-                "V3__broken",
+                "V3__auth_mode",
+                include_str!("../../migrations/V3__auth_mode.sql"),
+            )
+            .unwrap(),
+            refinery::Migration::unapplied(
+                "V4__broken",
                 "CREATE TABLE probe (x INTEGER); INSERT INTO missing_table VALUES (1);",
             )
             .unwrap(),
@@ -247,7 +253,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         let probe_tables: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE name = 'probe'",
@@ -302,7 +308,12 @@ mod tests {
             )
             .unwrap(),
             refinery::Migration::unapplied(
-                "V3__rebuild_agents",
+                "V3__auth_mode",
+                include_str!("../../migrations/V3__auth_mode.sql"),
+            )
+            .unwrap(),
+            refinery::Migration::unapplied(
+                "V4__rebuild_agents",
                 "CREATE TABLE agents_new (
                    id TEXT PRIMARY KEY,
                    name TEXT NOT NULL COLLATE NOCASE UNIQUE,
@@ -312,7 +323,8 @@ mod tests {
                    workspace_path TEXT NOT NULL,
                    provider_session_id TEXT,
                    created_at INTEGER NOT NULL,
-                   last_activity_at INTEGER NOT NULL
+                   last_activity_at INTEGER NOT NULL,
+                   auth_mode TEXT
                  );
                  INSERT INTO agents_new SELECT * FROM agents;
                  DROP TABLE agents;
@@ -324,7 +336,7 @@ mod tests {
         let db = Database {
             connection: Mutex::new(connection),
         };
-        assert_eq!(schema_version(&db), 3);
+        assert_eq!(schema_version(&db), 4);
         for table in ["agents", "turns", "messages", "steps", "queued_messages"] {
             assert_eq!(count(&db, table), 1, "{table}");
         }
@@ -333,5 +345,93 @@ mod tests {
                 .unwrap()
         });
         assert_eq!(foreign_keys, 1);
+    }
+
+    fn version_two_database(dir: &Path, old_switch: Option<&str>) {
+        let mut connection = Connection::open(dir.join(DATABASE_FILE)).unwrap();
+        configure(&connection).unwrap();
+        let v2 = [
+            refinery::Migration::unapplied(
+                "V1__initial",
+                include_str!("../../migrations/V1__initial.sql"),
+            )
+            .unwrap(),
+            refinery::Migration::unapplied(
+                "V2__settings",
+                include_str!("../../migrations/V2__settings.sql"),
+            )
+            .unwrap(),
+        ];
+        migrate(&mut connection, Runner::new(&v2)).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO agents VALUES ('a', 'Ada', 'red', 'claude-code', 'm', '/w', 's', 1, 1);
+                 INSERT INTO turns VALUES ('t', 'a', 'completed', NULL, 1, 2);
+                 INSERT INTO settings VALUES ('other', 'kept');",
+            )
+            .unwrap();
+        if let Some(value) = old_switch {
+            connection
+                .execute(
+                    "INSERT INTO settings VALUES ('claude-code.use-api-key', ?1)",
+                    [value],
+                )
+                .unwrap();
+        }
+    }
+
+    fn setting(db: &Database, key: &str) -> Option<String> {
+        db.with_connection(|c| crate::settings::get(c, key).unwrap())
+    }
+
+    #[test]
+    fn the_auth_mode_migration_converts_the_old_switch_and_keeps_the_agents() {
+        for (old, expected) in [
+            (Some("true"), Some("api-key")),
+            (Some("false"), Some("subscription")),
+            (Some("maybe"), None),
+            (None, None),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            version_two_database(dir.path(), old);
+            let db = Database::open(dir.path()).unwrap();
+            assert_eq!(schema_version(&db), 3);
+            assert_eq!(
+                setting(&db, "claude.auth-mode").as_deref(),
+                expected,
+                "{old:?}"
+            );
+            assert_eq!(setting(&db, "claude-code.use-api-key"), None, "{old:?}");
+            assert_eq!(setting(&db, "other").as_deref(), Some("kept"));
+            assert_eq!(count(&db, "agents"), 1);
+            assert_eq!(count(&db, "turns"), 1);
+            let (session, mode): (String, Option<String>) = db.with_connection(|c| {
+                c.query_row(
+                    "SELECT provider_session_id, auth_mode FROM agents",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap()
+            });
+            assert_eq!((session.as_str(), mode), ("s", None));
+        }
+    }
+
+    #[test]
+    fn the_agent_auth_mode_column_refuses_an_unknown_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        let insert = |mode: &str| {
+            db.with_connection(|c| {
+                c.execute(
+                    "INSERT INTO agents (id, name, color, provider, model, workspace_path, created_at, last_activity_at, auth_mode)
+                     VALUES (?1, ?1, 'red', 'claude-code', 'm', '/w', 1, 1, ?2)",
+                    [mode, mode],
+                )
+            })
+        };
+        assert!(insert("api-key").is_ok());
+        assert!(insert("subscription").is_ok());
+        assert!(insert("oauth").is_err());
     }
 }

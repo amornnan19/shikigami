@@ -16,6 +16,7 @@ use super::{
 };
 use crate::agents::now_millis;
 use crate::api_key::ApiKeyError;
+use crate::auth::AuthMode;
 use crate::db::Database;
 use crate::secrets::SecretString;
 
@@ -30,25 +31,42 @@ const SESSION_MISSING: &str = "No conversation found";
 const RESUME_NOTICE: &str =
     "Started a new Claude Code session. The agent may have lost earlier context.";
 
+const NO_KEY_SAVED: &str =
+    "No API key is saved. Add one or switch this agent to your Claude subscription.";
+
 pub enum ApiKey {
     Present(SecretString),
-    Absent,
+    Subscription,
+    Missing,
     Unreadable,
+    Unresolved,
 }
 
 impl ApiKey {
-    pub fn from_read(read: Result<Option<SecretString>, ApiKeyError>) -> Self {
-        match read {
-            Ok(Some(key)) => Self::Present(key),
-            Ok(None) => Self::Absent,
-            Err(_) => Self::Unreadable,
+    pub fn from_read(mode: AuthMode, read: Result<Option<SecretString>, ApiKeyError>) -> Self {
+        match (mode, read) {
+            (_, Err(_)) => Self::Unreadable,
+            (_, Ok(Some(key))) => Self::Present(key),
+            (AuthMode::Subscription, Ok(None)) => Self::Subscription,
+            (AuthMode::ApiKey, Ok(None)) => Self::Missing,
         }
     }
 
     fn redactor(&self) -> Redactor {
         match self {
             Self::Present(key) => Redactor::for_key(Some(key)),
-            Self::Absent | Self::Unreadable => Redactor::none(),
+            Self::Subscription | Self::Missing | Self::Unreadable | Self::Unresolved => {
+                Redactor::none()
+            }
+        }
+    }
+
+    fn refusal(&self) -> Option<&'static str> {
+        match self {
+            Self::Present(_) | Self::Subscription => None,
+            Self::Missing => Some(NO_KEY_SAVED),
+            Self::Unreadable => Some("Could not read the saved API key."),
+            Self::Unresolved => Some("Could not read the sign-in setting."),
         }
     }
 }
@@ -411,10 +429,16 @@ impl Runner<'_> {
         command
             .env_remove("ANTHROPIC_API_KEY")
             .env_remove("ANTHROPIC_AUTH_TOKEN");
-        if let ApiKey::Present(secret) = key {
-            command
-                .env_remove("ANTHROPIC_BASE_URL")
-                .env("ANTHROPIC_API_KEY", secret.expose());
+        match key {
+            ApiKey::Present(secret) => {
+                command
+                    .env_remove("ANTHROPIC_BASE_URL")
+                    .env("ANTHROPIC_API_KEY", secret.expose());
+            }
+            ApiKey::Subscription => {
+                command.env_remove("ANTHROPIC_BASE_URL");
+            }
+            ApiKey::Missing | ApiKey::Unreadable | ApiKey::Unresolved => {}
         }
         Some(command)
     }
@@ -580,11 +604,8 @@ async fn run_turn(
         );
         return false;
     }
-    if matches!(key, ApiKey::Unreadable) {
-        runner.finish(
-            "failed",
-            Some("Could not read the saved API key.".to_owned()),
-        );
+    if let Some(refusal) = key.refusal() {
+        runner.finish("failed", Some(refusal.to_owned()));
         return false;
     }
     let mut session = launch.session.clone();
@@ -807,7 +828,9 @@ mod tests {
             &world,
             &format!("cat \"{}\"", fixture.display()),
         ));
-        world.send("Reply with the word pong", ApiKey::Absent).await;
+        world
+            .send("Reply with the word pong", ApiKey::Subscription)
+            .await;
         let args = args(&world, 0);
         assert_eq!(
             args[..5],
@@ -839,8 +862,8 @@ mod tests {
             &world,
             &format!("cat \"{}\"", fixture.display()),
         ));
-        world.send("one", ApiKey::Absent).await;
-        world.send("two", ApiKey::Absent).await;
+        world.send("one", ApiKey::Subscription).await;
+        world.send("two", ApiKey::Subscription).await;
         let second = args(&world, 1);
         assert_isolated(&second);
         assert_eq!(second[14..], ["--resume", FIXTURE_SESSION]);
@@ -860,7 +883,7 @@ mod tests {
             &world,
             &format!("cat \"{}\"", fixture.display()),
         ));
-        world.send("hi", ApiKey::Absent).await;
+        world.send("hi", ApiKey::Subscription).await;
         let args = args(&world, 0);
         assert!(!args.iter().any(|arg| arg == "--model"));
         assert_isolated(&args);
@@ -884,14 +907,14 @@ mod tests {
                 ApiKey::Present(SecretString::new("sk-ant-saved-0000")),
             )
             .await;
-        world.send("two", ApiKey::Absent).await;
+        world.send("two", ApiKey::Subscription).await;
         assert_eq!(read(&world, "key.0"), "sk-ant-saved-0000");
         assert_eq!(read(&world, "token.0"), "");
         assert_eq!(read(&world, "base.0"), "");
         assert_eq!(read(&world, "kept.0"), "kept");
         assert_eq!(read(&world, "key.1"), "");
         assert_eq!(read(&world, "token.1"), "");
-        assert_eq!(read(&world, "base.1"), "https://proxy.example");
+        assert_eq!(read(&world, "base.1"), "");
     }
 
     #[tokio::test]
@@ -914,6 +937,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn no_saved_key_in_api_key_mode_fails_the_turn_and_starts_no_process() {
+        let world = World::new();
+        let fixture = world.fixture("basic.jsonl", BASIC);
+        world.install(&recording(
+            &world,
+            &format!("cat \"{}\"", fixture.display()),
+        ));
+        let launch = world.launch("hi");
+        let advance = run(
+            &world.db,
+            &world.sink,
+            &world.registry,
+            launch,
+            ApiKey::from_read(AuthMode::ApiKey, Ok(None)),
+        )
+        .await;
+        assert!(!advance);
+        let turn = only_turn(&world);
+        assert_eq!(turn.status, "failed");
+        assert_eq!(
+            turn.error.as_deref(),
+            Some("No API key is saved. Add one or switch this agent to your Claude subscription.")
+        );
+        assert!(!has_record(&world, "args.0"));
+        assert_eq!(world.sink.kinds(), ["started", "ended"]);
+    }
+
+    #[tokio::test]
+    async fn an_unresolved_sign_in_setting_fails_the_turn_and_starts_no_process() {
+        let world = World::new();
+        let fixture = world.fixture("basic.jsonl", BASIC);
+        world.install(&recording(
+            &world,
+            &format!("cat \"{}\"", fixture.display()),
+        ));
+        world.send("hi", ApiKey::Unresolved).await;
+        assert_eq!(
+            only_turn(&world).error.as_deref(),
+            Some("Could not read the sign-in setting.")
+        );
+        assert!(!has_record(&world, "args.0"));
+    }
+
+    #[tokio::test]
     async fn a_missing_workspace_fails_at_once_without_starting_the_process() {
         let world = World::new();
         let fixture = world.fixture("basic.jsonl", BASIC);
@@ -928,7 +995,7 @@ mod tests {
             &world.sink,
             &world.registry,
             launch,
-            ApiKey::Absent,
+            ApiKey::Subscription,
         )
         .await;
         let turn = only_turn(&world);
@@ -948,7 +1015,9 @@ mod tests {
             &world,
             &format!("cat \"{}\"", fixture.display()),
         ));
-        world.send("Reply with the word pong", ApiKey::Absent).await;
+        world
+            .send("Reply with the word pong", ApiKey::Subscription)
+            .await;
         let turn = only_turn(&world);
         assert_eq!(turn.status, "completed");
         assert_eq!(turn.error, None);
@@ -967,7 +1036,7 @@ mod tests {
             &format!("cat \"{}\"", fixture.display()),
         ));
         world
-            .send("List the files in your folder", ApiKey::Absent)
+            .send("List the files in your folder", ApiKey::Subscription)
             .await;
         let turn = only_turn(&world);
         assert_eq!(turn.status, "completed");
@@ -1001,7 +1070,7 @@ mod tests {
             &world,
             &format!("cat \"{}\"", fixture.display()),
         ));
-        world.send("List the files", ApiKey::Absent).await;
+        world.send("List the files", ApiKey::Subscription).await;
         let turn = only_turn(&world);
         assert!(matches!(
             &turn.items[..],
@@ -1019,7 +1088,7 @@ mod tests {
             &world,
             &format!("cat \"{}\"", fixture.display()),
         ));
-        world.send("hi", ApiKey::Absent).await;
+        world.send("hi", ApiKey::Subscription).await;
         let turn = only_turn(&world);
         assert_eq!(turn.status, "failed");
         assert_eq!(turn.error.as_deref(), Some("pong"));
@@ -1032,7 +1101,7 @@ mod tests {
             &world,
             "echo 'first' >&2\necho 'boom: bad thing' >&2\nexit 3",
         ));
-        world.send("hi", ApiKey::Absent).await;
+        world.send("hi", ApiKey::Subscription).await;
         let turn = only_turn(&world);
         assert_eq!(turn.status, "failed");
         assert_eq!(turn.error.as_deref(), Some("boom: bad thing"));
@@ -1043,7 +1112,7 @@ mod tests {
     async fn exiting_silently_gives_the_generic_message_and_the_key_is_never_echoed() {
         let world = World::new();
         world.install(&recording(&world, "exit 1"));
-        world.send("hi", ApiKey::Absent).await;
+        world.send("hi", ApiKey::Subscription).await;
         assert_eq!(
             only_turn(&world).error.as_deref(),
             Some("Claude Code exited unexpectedly.")
@@ -1070,7 +1139,7 @@ mod tests {
             &world,
             "head -c 1200000 /dev/zero | tr '\\0' a\necho",
         ));
-        world.send("hi", ApiKey::Absent).await;
+        world.send("hi", ApiKey::Subscription).await;
         let turn = only_turn(&world);
         assert_eq!(turn.status, "failed");
         assert!(turn.error.unwrap().contains("too long"));
@@ -1108,7 +1177,7 @@ mod tests {
             ),
         );
         world.install(&body);
-        world.send("hello again", ApiKey::Absent).await;
+        world.send("hello again", ApiKey::Subscription).await;
         let first = args(&world, 0);
         let second = args(&world, 1);
         assert_isolated(&second);
@@ -1141,7 +1210,7 @@ mod tests {
                 fixture.display()
             ),
         ));
-        world.send("hello again", ApiKey::Absent).await;
+        world.send("hello again", ApiKey::Subscription).await;
         assert!(has_record(&world, "args.1"));
         assert_eq!(only_turn(&world).status, "completed");
     }
@@ -1151,7 +1220,7 @@ mod tests {
         let world = World::new();
         with_old_session(&world);
         world.install(&recording(&world, MISSING));
-        world.send("hi", ApiKey::Absent).await;
+        world.send("hi", ApiKey::Subscription).await;
         assert!(has_record(&world, "args.1"));
         assert!(!has_record(&world, "args.2"));
         let turn = only_turn(&world);
@@ -1168,7 +1237,7 @@ mod tests {
         let world = World::new();
         with_old_session(&world);
         world.install(&recording(&world, "echo 'nope' >&2\nexit 1"));
-        world.send("hi", ApiKey::Absent).await;
+        world.send("hi", ApiKey::Subscription).await;
         assert!(!has_record(&world, "args.1"));
         let turn = only_turn(&world);
         assert_eq!(turn.status, "failed");
@@ -1181,7 +1250,7 @@ mod tests {
     async fn a_new_session_that_never_starts_is_not_kept() {
         let world = World::new();
         world.install(&recording(&world, "echo 'nope' >&2\nexit 1"));
-        world.send("hi", ApiKey::Absent).await;
+        world.send("hi", ApiKey::Subscription).await;
         assert_eq!(only_turn(&world).status, "failed");
         assert_eq!(world.session(), None);
         let args = args(&world, 0);
@@ -1200,7 +1269,7 @@ mod tests {
             &world,
             &format!("echo '{init}'\necho 'died' >&2\nexit 1"),
         ));
-        world.send("hi", ApiKey::Absent).await;
+        world.send("hi", ApiKey::Subscription).await;
         assert!(!has_record(&world, "args.1"));
         let turn = only_turn(&world);
         assert_eq!(turn.status, "failed");
@@ -1305,7 +1374,7 @@ mod tests {
             &world,
             &format!("cat \"{}\"", fixture.display()),
         ));
-        world.send("hi", ApiKey::Absent).await;
+        world.send("hi", ApiKey::Subscription).await;
         assert!(!everything_emitted(&world).contains("sk-ant"));
         let turn = only_turn(&world);
         assert!(
@@ -1446,7 +1515,7 @@ mod tests {
                 &world.sink,
                 &world.registry,
                 launch,
-                ApiKey::Absent,
+                ApiKey::Subscription,
             ),
         )
         .await
@@ -1474,7 +1543,7 @@ mod tests {
             &world.sink,
             &world.registry,
             launch,
-            ApiKey::Absent,
+            ApiKey::Subscription,
         )
         .await;
         assert!(advance);
@@ -1492,7 +1561,7 @@ mod tests {
             &world.sink,
             &world.registry,
             launch,
-            ApiKey::Absent,
+            ApiKey::Subscription,
         )
         .await;
         assert!(!advance);
@@ -1522,7 +1591,7 @@ mod tests {
                     &world.sink,
                     &world.registry,
                     launch,
-                    ApiKey::Absent,
+                    ApiKey::Subscription,
                 ),
                 closer
             )
@@ -1549,7 +1618,7 @@ mod tests {
             &world.sink,
             &world.registry,
             missing_folder,
-            ApiKey::Absent,
+            ApiKey::Subscription,
         )
         .await;
         assert!(!advance);
@@ -1571,7 +1640,7 @@ mod tests {
             &world.sink,
             &world.registry,
             no_provider,
-            ApiKey::Absent,
+            ApiKey::Subscription,
         )
         .await;
         assert!(!advance);
@@ -1594,7 +1663,7 @@ mod tests {
             &world.sink,
             &world.registry,
             launch,
-            ApiKey::Absent,
+            ApiKey::Subscription,
         )
         .await;
         assert!(advance);
@@ -1605,7 +1674,7 @@ mod tests {
             &world.sink,
             &world.registry,
             launch,
-            ApiKey::Absent,
+            ApiKey::Subscription,
         )
         .await;
         assert!(advance);
@@ -1638,7 +1707,10 @@ mod tests {
             &world,
             &format!("cat \"{}\"", fixture.display()),
         ));
-        let key = ApiKey::from_read(key_for_turn(&world.db, &VanishedItem, "claude-code"));
+        let key = ApiKey::from_read(
+            AuthMode::ApiKey,
+            key_for_turn(&VanishedItem, AuthMode::ApiKey, "claude-code"),
+        );
         assert!(matches!(key, ApiKey::Unreadable));
         world.send("hi", key).await;
         let turn = only_turn(&world);
@@ -1666,7 +1738,7 @@ mod tests {
                 &world.sink,
                 &world.registry,
                 launch,
-                ApiKey::Absent,
+                ApiKey::Subscription,
             ),
         )
         .await
@@ -1851,7 +1923,7 @@ mod tests {
                 fixture.display()
             ),
         ));
-        world.send("first", ApiKey::Absent).await;
+        world.send("first", ApiKey::Subscription).await;
         let crashed = only_turn(&world);
         assert_eq!(crashed.status, "failed");
         assert_eq!(
@@ -1863,7 +1935,7 @@ mod tests {
             &world,
             &format!("cat \"{}\"", fixture.display()),
         ));
-        world.send("second", ApiKey::Absent).await;
+        world.send("second", ApiKey::Subscription).await;
         let statuses: Vec<_> = world.turns().into_iter().map(|turn| turn.status).collect();
         assert_eq!(statuses, ["failed", "completed"]);
     }

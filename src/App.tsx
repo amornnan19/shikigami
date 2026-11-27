@@ -6,7 +6,7 @@ import { AgentView } from "@/features/agents/AgentView";
 import { listAgents } from "@/features/agents/api";
 import { NewAgentDialog } from "@/features/agents/NewAgentDialog";
 import { useTurnEvents } from "@/features/chat/useConversation";
-import { ProvidersSection } from "@/features/providers/ProvidersSection";
+import { ClaudeSection } from "@/features/providers/ClaudeSection";
 
 type AppStatus = { status: "ok" } | { status: "error"; message: string; data_dir: string };
 
@@ -54,7 +54,7 @@ function Workspace() {
             <p className="text-muted-foreground">Coding agents on your Mac.</p>
           </div>
           {agents.isError && <p role="alert">Could not load agents.</p>}
-          <ProvidersSection />
+          <ClaudeSection />
         </main>
       )}
       <NewAgentDialog
