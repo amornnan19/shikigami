@@ -31,8 +31,6 @@ jobs:
         with:
           bun-version: 1.4.5
 
-      - run: bun install --frozen-lockfile
-
       - id: bump
         run: bun scripts/bump-version.ts --write
 
