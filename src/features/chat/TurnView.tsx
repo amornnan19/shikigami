@@ -83,6 +83,7 @@ export function TurnView({ turn }: { turn: Turn }) {
         </p>
       )}
       {turn.error && <p className="text-sm text-red-600/80">{turn.error}</p>}
+      {turn.status === "stopped" && <p className="text-sm text-muted-foreground">Stopped</p>}
       {turn.status === "interrupted" && (
         <p className="text-sm text-muted-foreground">This reply was interrupted.</p>
       )}

@@ -95,7 +95,11 @@ pub fn run() {
             agents::list_agents,
             agents::create_agent,
             turns::send_message,
-            turns::get_conversation
+            turns::get_conversation,
+            turns::stop_turn,
+            turns::list_queue,
+            turns::edit_queued,
+            turns::remove_queued
         ])
         .build(app_context())
         .expect("error while building tauri application")

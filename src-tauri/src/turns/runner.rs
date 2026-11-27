@@ -366,7 +366,7 @@ impl Runner<'_> {
         }
     }
 
-    fn finish(&mut self, status: &str, error: Option<String>) {
+    fn finish(&mut self, status: &str, error: Option<String>) -> String {
         self.flush_texts();
         let error = error.map(|message| self.redactor.redact(&message));
         let (status, error) = if status == "completed" && self.save_failed {
@@ -390,6 +390,7 @@ impl Runner<'_> {
             status: status.to_owned(),
             error,
         });
+        status.to_owned()
     }
 
     fn command(&self, launch: &Launch, session: &Session, key: &ApiKey) -> Option<Command> {
@@ -437,7 +438,7 @@ impl Runner<'_> {
             attempt.failure = Some("Could not start Claude Code.".to_owned());
             self.registry.kill(&self.agent_id);
             let _ = child.wait().await;
-            self.registry.clear(&self.agent_id);
+            self.registry.clear_group(&self.agent_id);
             return attempt;
         };
         let message = launch.text.clone();
@@ -479,7 +480,7 @@ impl Runner<'_> {
             self.registry.kill(&self.agent_id);
             let _ = child.wait().await;
         }
-        self.registry.clear(&self.agent_id);
+        self.registry.clear_group(&self.agent_id);
         match timeout(STDERR_GRACE, &mut stderr_task).await {
             Ok(Ok(summary)) => attempt.stderr = summary,
             _ => stderr_task.abort(),
@@ -509,7 +510,20 @@ pub async fn run(
     registry: &TurnRegistry,
     launch: Launch,
     key: ApiKey,
-) {
+) -> String {
+    let agent_id = launch.agent_id.clone();
+    let status = run_turn(db, sink, registry, launch, key).await;
+    registry.clear(&agent_id);
+    status
+}
+
+async fn run_turn(
+    db: &Database,
+    sink: &dyn EventSink,
+    registry: &TurnRegistry,
+    launch: Launch,
+    key: ApiKey,
+) -> String {
     let stored_session = match &launch.session {
         Session::New(id) | Session::Resume(id) => id.clone(),
     };
@@ -529,18 +543,16 @@ pub async fn run(
     };
     runner.emit(TurnEvent::Started);
     if !launch.workspace.is_dir() {
-        runner.finish(
+        return runner.finish(
             "failed",
             Some("The workspace folder is missing.".to_owned()),
         );
-        return;
     }
     if matches!(key, ApiKey::Unreadable) {
-        runner.finish(
+        return runner.finish(
             "failed",
             Some("Could not read the saved API key.".to_owned()),
         );
-        return;
     }
     let mut session = launch.session.clone();
     let mut attempt = runner.attempt(&launch, &session, &key).await;
@@ -548,6 +560,7 @@ pub async fn run(
         && !attempt.saw_init
         && !attempt.succeeded()
         && attempt.session_missing()
+        && !registry.stop_requested(&launch.agent_id)
     {
         session = Session::New(uuid::Uuid::new_v4().to_string());
         runner.add_notice(RESUME_NOTICE);
@@ -558,9 +571,11 @@ pub async fn run(
         runner.save(|connection| store::set_session(connection, &agent_id, None));
     }
     if attempt.succeeded() {
-        runner.finish("completed", None);
+        runner.finish("completed", None)
+    } else if registry.stop_requested(&launch.agent_id) {
+        runner.finish("stopped", None)
     } else {
-        runner.finish("failed", Some(failure_of(&attempt)));
+        runner.finish("failed", Some(failure_of(&attempt)))
     }
 }
 
@@ -570,6 +585,7 @@ mod tests {
     use crate::api_key::key_for_turn;
     use crate::secrets::{SecretError, SecretStore};
     use crate::turns::claude_code::assert_isolated;
+    use crate::turns::escalate_stop;
     use crate::turns::store::{self as turn_store, ItemView};
     use std::ffi::OsString;
     use std::fs;
@@ -769,7 +785,7 @@ mod tests {
         assert!(!args.iter().any(|arg| arg.contains("pong")));
         assert_eq!(read(&world, "stdin.0"), "Reply with the word pong");
         assert_eq!(world.session().as_deref(), Some(FIXTURE_SESSION));
-        assert!(world.registry.groups().is_empty());
+        assert!(world.registry.slots().is_empty());
     }
 
     #[tokio::test]
@@ -1015,7 +1031,7 @@ mod tests {
         let turn = only_turn(&world);
         assert_eq!(turn.status, "failed");
         assert!(turn.error.unwrap().contains("too long"));
-        assert!(world.registry.groups().is_empty());
+        assert!(world.registry.slots().is_empty());
     }
 
     const MISSING: &str = "echo 'No conversation found with session ID: old-id' >&2\nexit 1";
@@ -1274,6 +1290,128 @@ mod tests {
             matches!(&turn.items[..], [ItemView::Text { text, .. }] if text == "see [redacted]")
         );
         assert!(!everything_emitted(&world).contains("SAVEDSAVED"));
+    }
+
+    fn partial_stream() -> String {
+        stream_lines(&[
+            delta(0, &format!("partial {SAVED_KEY}")),
+            serde_json::json!({"type":"assistant","message":{"id":"m2","content":[{"type":"tool_use","id":"tu1","name":"Bash","input":{"command":"sleep 99"}}]}}),
+        ])
+    }
+
+    async fn run_and_stop(world: &World, grace: Duration) -> (String, Duration) {
+        let launch = world.launch("go");
+        world.registry.begin("a");
+        let started = Instant::now();
+        let stopper = async {
+            while !world.sink.kinds().iter().any(|kind| kind == "step-started") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(world.registry.request_stop("a"));
+            escalate_stop(&world.registry, "a", grace).await;
+        };
+        let (status, ()) = timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                run(
+                    &world.db,
+                    &world.sink,
+                    &world.registry,
+                    launch,
+                    ApiKey::Present(SecretString::new(SAVED_KEY)),
+                ),
+                stopper
+            )
+        })
+        .await
+        .expect("a stopped turn must end");
+        (status, started.elapsed())
+    }
+
+    fn install_streaming_then(world: &World, rest: &str) {
+        let fixture = world.fixture("partial.jsonl", &partial_stream());
+        world.install(&recording(
+            world,
+            &format!("cat \"{}\"\n{rest}", fixture.display()),
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_stop_ends_the_turn_stopped_and_keeps_the_partial_reply_redacted() {
+        let world = World::new();
+        install_streaming_then(&world, "sleep 30");
+        let (status, elapsed) = run_and_stop(&world, Duration::from_secs(2)).await;
+        assert_eq!(status, "stopped");
+        assert!(elapsed < Duration::from_secs(3));
+        let turn = only_turn(&world);
+        assert_eq!(turn.status, "stopped");
+        assert_eq!(turn.error, None);
+        assert!(turn.ended_at.is_some());
+        assert!(matches!(
+            &turn.items[..],
+            [ItemView::Text { text, .. }, ItemView::Step(step)]
+                if text == "partial [redacted]" && step.status == "stopped"
+        ));
+        assert!(!everything_emitted(&world).contains("SAVEDSAVED"));
+        let events = world.sink.0.lock().unwrap();
+        assert!(matches!(
+            events.last().map(|envelope| &envelope.event),
+            Some(TurnEvent::Ended { status, error: None }) if status == "stopped"
+        ));
+        drop(events);
+        assert!(!has_record(&world, "args.1"));
+        assert!(world.registry.slots().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_child_that_ignores_the_term_signal_is_killed_after_the_grace() {
+        let world = World::new();
+        install_streaming_then(&world, "trap '' TERM\nwhile true; do sleep 1; done");
+        let (status, elapsed) = run_and_stop(&world, Duration::from_millis(300)).await;
+        assert_eq!(status, "stopped");
+        assert!(elapsed >= Duration::from_millis(300));
+        assert!(elapsed < Duration::from_secs(3));
+        assert_eq!(only_turn(&world).status, "stopped");
+    }
+
+    #[tokio::test]
+    async fn a_stop_is_never_retried_as_a_missing_session() {
+        let world = World::new();
+        with_old_session(&world);
+        install_streaming_then(&world, "echo 'No conversation found' >&2\nsleep 30");
+        let (status, _) = run_and_stop(&world, Duration::from_secs(2)).await;
+        assert_eq!(status, "stopped");
+        assert!(has_record(&world, "args.0"));
+        assert!(!has_record(&world, "args.1"));
+        let turn = only_turn(&world);
+        assert!(!turn
+            .items
+            .iter()
+            .any(|item| matches!(item, ItemView::Notice { .. })));
+    }
+
+    #[tokio::test]
+    async fn a_stop_requested_before_the_process_registers_still_stops_it() {
+        let world = World::new();
+        world.install(&recording(&world, "sleep 30"));
+        let launch = world.launch("go");
+        world.registry.begin("a");
+        assert!(world.registry.request_stop("a"));
+        let started = Instant::now();
+        let status = timeout(
+            Duration::from_secs(10),
+            run(
+                &world.db,
+                &world.sink,
+                &world.registry,
+                launch,
+                ApiKey::Absent,
+            ),
+        )
+        .await
+        .expect("a stopped turn must end");
+        assert_eq!(status, "stopped");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(only_turn(&world).status, "stopped");
     }
 
     struct VanishedItem;
