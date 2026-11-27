@@ -135,7 +135,7 @@ conversation across app restarts. This is the core every later milestone builds 
    reflects the edit.
 10. Create a second agent with the name "Test Agent": refused.
 11. Delete the agent without the checkbox: it disappears from the app and the folder remains.
-12. With the Claude Code CLI not found on PATH, the Providers section shows install guidance and
+12. With the Claude Code CLI not found on PATH, the Claude section shows install guidance and
     creating an agent is refused.
 
 ## Out of scope

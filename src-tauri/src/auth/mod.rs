@@ -5,7 +5,7 @@ use tauri::{AppHandle, Manager};
 use crate::api_key::{self, ApiKeyError, ApiKeyStatus, StatusCache};
 use crate::db::Database;
 use crate::providers::{self, ProviderStatus, SignedIn, CLAUDE_CODE_ID};
-use crate::secrets::{SecretStore, SharedStore};
+use crate::secrets::{SecretError, SecretStore, SharedStore};
 use crate::settings;
 
 const AUTH_MODE_SETTING: &str = "claude.auth-mode";
@@ -72,6 +72,15 @@ impl AuthError {
         }
     }
 
+    pub const KEYCHAIN_FAILED: &'static str = "keychain-failed";
+
+    fn keychain(error: SecretError) -> Self {
+        Self {
+            code: Self::KEYCHAIN_FAILED,
+            message: error.to_string(),
+        }
+    }
+
     fn unavailable() -> Self {
         Self {
             code: "unavailable",
@@ -127,7 +136,16 @@ pub fn mode_for_agent(
         .and_then(AuthMode::parse);
     match agent_override {
         Some(mode) => Ok(mode),
-        None => Ok(load_app_auth(db, store)?.effective(None)),
+        None => {
+            let setting = db
+                .with_connection(stored_setting)
+                .map_err(AuthError::database)?;
+            let key_exists = match setting {
+                Some(_) => false,
+                None => api_key::key_exists(store).map_err(AuthError::keychain)?,
+            };
+            Ok(effective_mode(None, setting, key_exists))
+        }
     }
 }
 
@@ -289,6 +307,23 @@ mod tests {
         }
     }
 
+    struct Broken;
+
+    impl SecretStore for Broken {
+        fn exists(&self, _: &str) -> Result<bool, SecretError> {
+            Err(SecretError::Read(None))
+        }
+        fn get(&self, _: &str) -> Result<Option<SecretString>, SecretError> {
+            Err(SecretError::Read(None))
+        }
+        fn set(&self, _: &str, _: &SecretString) -> Result<(), SecretError> {
+            Err(SecretError::Write)
+        }
+        fn delete(&self, _: &str) -> Result<(), SecretError> {
+            Err(SecretError::Delete)
+        }
+    }
+
     fn add_agent(db: &Database, id: &str, mode: Option<&str>) {
         db.with_connection(|c| {
             c.execute(
@@ -402,25 +437,29 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_existence_check_falls_back_to_the_subscription() {
-        struct Broken;
-        impl SecretStore for Broken {
-            fn exists(&self, _: &str) -> Result<bool, SecretError> {
-                Err(SecretError::Read(None))
-            }
-            fn get(&self, _: &str) -> Result<Option<SecretString>, SecretError> {
-                Err(SecretError::Read(None))
-            }
-            fn set(&self, _: &str, _: &SecretString) -> Result<(), SecretError> {
-                Err(SecretError::Write)
-            }
-            fn delete(&self, _: &str) -> Result<(), SecretError> {
-                Err(SecretError::Delete)
-            }
-        }
+    fn a_failed_existence_check_fails_the_turn_path_but_not_the_status_path() {
         let fx = fixture();
         add_agent(&fx.db, "a", None);
+        let error = mode_for_agent(&fx.db, &Broken, "a").unwrap_err();
+        assert_eq!(error.code, AuthError::KEYCHAIN_FAILED);
+        let listed = load_app_auth(&fx.db, &Broken).unwrap();
+        assert_eq!(listed.effective(None), Subscription);
+        let shown = claude_auth(&provider(), &fx.db, &Broken, &fx.cache).unwrap();
+        assert!(shown.api_key.read_failed);
+        assert_eq!(shown.app_mode, Subscription);
+    }
+
+    #[test]
+    fn choosing_the_subscription_works_with_a_broken_store() {
+        let fx = fixture();
+        add_agent(&fx.db, "a", None);
+        add_agent(&fx.db, "pinned", Some("api-key"));
+        set_app_mode(&fx.db, Subscription).unwrap();
         assert_eq!(mode_for_agent(&fx.db, &Broken, "a").unwrap(), Subscription);
+        assert_eq!(mode_for_agent(&fx.db, &Broken, "pinned").unwrap(), ApiKey);
+        let shown = claude_auth(&provider(), &fx.db, &Broken, &fx.cache).unwrap();
+        assert!(shown.api_key.read_failed);
+        assert!(shown.app_mode_explicit);
     }
 
     #[test]

@@ -458,6 +458,7 @@ fn key_for_agent(db: &Database, store: &dyn SecretStore, agent_id: &str) -> runn
         Ok(mode) => {
             runner::ApiKey::from_read(mode, api_key::key_for_turn(store, mode, CLAUDE_CODE_ID))
         }
+        Err(error) if error.code == auth::AuthError::KEYCHAIN_FAILED => runner::ApiKey::Unreadable,
         Err(_) => runner::ApiKey::Unresolved,
     }
 }
@@ -1390,6 +1391,38 @@ mod tests {
         choose(&fx, Some(AuthMode::ApiKey), Some(AuthMode::Subscription));
         assert!(matches!(
             key_for_agent(&fx.db, &store_with_key(), "a"),
+            runner::ApiKey::Subscription
+        ));
+    }
+
+    struct BrokenStore;
+
+    impl SecretStore for BrokenStore {
+        fn exists(&self, _: &str) -> Result<bool, SecretError> {
+            Err(SecretError::Read(None))
+        }
+        fn get(&self, _: &str) -> Result<Option<SecretString>, SecretError> {
+            Err(SecretError::Read(None))
+        }
+        fn set(&self, _: &str, _: &SecretString) -> Result<(), SecretError> {
+            Err(SecretError::Write)
+        }
+        fn delete(&self, _: &str) -> Result<(), SecretError> {
+            Err(SecretError::Delete)
+        }
+    }
+
+    #[test]
+    fn an_unreadable_keychain_with_nothing_chosen_fails_the_turn_instead_of_using_the_subscription()
+    {
+        let fx = Fixture::new("claude-code");
+        assert!(matches!(
+            key_for_agent(&fx.db, &BrokenStore, "a"),
+            runner::ApiKey::Unreadable
+        ));
+        choose(&fx, Some(AuthMode::Subscription), None);
+        assert!(matches!(
+            key_for_agent(&fx.db, &BrokenStore, "a"),
             runner::ApiKey::Subscription
         ));
     }

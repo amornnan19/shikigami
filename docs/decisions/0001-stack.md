@@ -120,7 +120,6 @@ The desktop shell (Tauri 2), the UI framework (React with TypeScript, Vite) and 
 | `keyring` 3.6.3 with its macOS native backend (saves the API key in the macOS Keychain) | MIT or Apache-2.0 |
 | `security-framework` 3.7.0 (checks that the Keychain item exists without reading the secret) | MIT or Apache-2.0 |
 | `zeroize` 1.9.2 (wipes the key from memory on drop) | Apache-2.0 or MIT |
-| `@radix-ui/react-switch` (shadcn/ui switch for the "Use API key" setting) | MIT |
 | `react-markdown` 10.1.0 and `remark-gfm` 4.0.1 (render agent replies as Markdown) | MIT |
 | `uuid` feature `v4` (random session ids for Claude Code; same crate as before) | MIT or Apache-2.0 |
 

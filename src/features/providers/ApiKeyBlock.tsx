@@ -28,7 +28,10 @@ function useAuthCache() {
       queryClient.setQueryData<ClaudeAuth>(CLAUDE_AUTH_KEY, (old) =>
         old ? { ...old, apiKey } : old,
       ),
-    refresh: () => queryClient.invalidateQueries({ queryKey: CLAUDE_AUTH_KEY }),
+    refresh: async () => {
+      await queryClient.invalidateQueries({ queryKey: CLAUDE_AUTH_KEY });
+      await queryClient.invalidateQueries({ queryKey: ["agents"] });
+    },
   };
 }
 
@@ -36,10 +39,12 @@ function AddApiKey({
   provider,
   open,
   setOpen,
+  onSaved,
 }: {
   provider: string;
   open: boolean;
   setOpen: (open: boolean) => void;
+  onSaved: () => void;
 }) {
   const providers = useAuthCache();
   const [key, setKey] = useState("");
@@ -49,6 +54,7 @@ function AddApiKey({
     mutationFn: (value: string) => saveApiKey(provider, value),
     onSuccess: (status) => {
       setKey("");
+      onSaved();
       setOpen(false);
       providers.show(status);
     },
@@ -189,16 +195,18 @@ export function ApiKeyBlock({
   status,
   adding,
   setAdding,
+  onSaved,
 }: {
   provider: string;
   status: ApiKeyStatus;
   adding: boolean;
   setAdding: (adding: boolean) => void;
+  onSaved: () => void;
 }) {
   return (
     <section aria-label="API key" className="flex flex-col gap-2 text-sm">
       {!status.saved && !status.readFailed && (
-        <AddApiKey provider={provider} open={adding} setOpen={setAdding} />
+        <AddApiKey provider={provider} open={adding} setOpen={setAdding} onSaved={onSaved} />
       )}
       {(status.saved || status.readFailed) && <SavedApiKey provider={provider} status={status} />}
     </section>
