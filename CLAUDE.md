@@ -59,6 +59,21 @@ Keep the CLI's own sign-in working.
 Anything that starts a turn or spawns a provider process must refuse while the app is shutting down
 (`TurnRegistry` closing); `kill_all` runs on the main thread while runner tasks keep running.
 
+## Provider sign-in
+
+Shikigami wraps each provider's official CLI; it never offers its own sign-in to a provider.
+
+- Run the provider's CLI exactly as published. Never modify it, and never remove or disable any of
+  its sign-in methods.
+- Sign-in to a Claude account always completes through Anthropic's own flow (for example the user
+  running `claude auth login`). Shikigami never reads, copies, stores or forwards Claude.ai OAuth
+  credentials or session tokens, including when it gives agents their own config directory.
+- Each user authenticates with their own subscription or their own API key, billed to them.
+  Shikigami never pays for, resells or pools usage.
+- Subscription limits assume ordinary individual use. Heavy unattended automation (routines,
+  agents messaging each other) should offer and prefer the user's API key.
+- Policy source: https://code.claude.com/docs/en/legal-and-compliance (re-check before a release).
+
 ## Secrets
 
 Secrets live only in the macOS Keychain. Decrypt a secret only when it is about to be used (a turn),
