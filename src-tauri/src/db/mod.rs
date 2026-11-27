@@ -113,13 +113,47 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_migrates_to_version_one_with_all_tables() {
+    fn fresh_database_migrates_to_the_latest_version_with_all_tables() {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(dir.path()).unwrap();
-        assert_eq!(schema_version(&db), 1);
-        for table in ["agents", "turns", "messages", "steps", "queued_messages"] {
+        assert_eq!(schema_version(&db), 2);
+        for table in [
+            "agents",
+            "turns",
+            "messages",
+            "steps",
+            "queued_messages",
+            "settings",
+        ] {
             assert_eq!(count(&db, table), 0, "{table}");
         }
+    }
+
+    #[test]
+    fn the_settings_migration_keeps_the_agents_of_a_version_one_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut connection = Connection::open(dir.path().join(DATABASE_FILE)).unwrap();
+        configure(&connection).unwrap();
+        let v1 = [refinery::Migration::unapplied(
+            "V1__initial",
+            include_str!("../../migrations/V1__initial.sql"),
+        )
+        .unwrap()];
+        migrate(&mut connection, Runner::new(&v1)).unwrap();
+        drop(connection);
+        let connection = Connection::open(dir.path().join(DATABASE_FILE)).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO agents VALUES ('a', 'Ada', 'red', 'codex', 'm', '/w', NULL, 1, 1);
+                 INSERT INTO turns VALUES ('t', 'a', 'running', NULL, 1, NULL);",
+            )
+            .unwrap();
+        drop(connection);
+        let db = Database::open(dir.path()).unwrap();
+        assert_eq!(schema_version(&db), 2);
+        assert_eq!(count(&db, "agents"), 1);
+        assert_eq!(count(&db, "turns"), 1);
+        assert_eq!(count(&db, "settings"), 0);
     }
 
     #[test]
@@ -127,8 +161,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         drop(Database::open(dir.path()).unwrap());
         let db = Database::open(dir.path()).unwrap();
-        assert_eq!(schema_version(&db), 1);
-        assert_eq!(count(&db, "refinery_schema_history"), 1);
+        assert_eq!(schema_version(&db), 2);
+        assert_eq!(count(&db, "refinery_schema_history"), 2);
     }
 
     #[test]
@@ -194,7 +228,12 @@ mod tests {
             )
             .unwrap(),
             refinery::Migration::unapplied(
-                "V2__broken",
+                "V2__settings",
+                include_str!("../../migrations/V2__settings.sql"),
+            )
+            .unwrap(),
+            refinery::Migration::unapplied(
+                "V3__broken",
                 "CREATE TABLE probe (x INTEGER); INSERT INTO missing_table VALUES (1);",
             )
             .unwrap(),
@@ -208,7 +247,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
         let probe_tables: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE name = 'probe'",
@@ -258,7 +297,12 @@ mod tests {
             )
             .unwrap(),
             refinery::Migration::unapplied(
-                "V2__rebuild_agents",
+                "V2__settings",
+                include_str!("../../migrations/V2__settings.sql"),
+            )
+            .unwrap(),
+            refinery::Migration::unapplied(
+                "V3__rebuild_agents",
                 "CREATE TABLE agents_new (
                    id TEXT PRIMARY KEY,
                    name TEXT NOT NULL COLLATE NOCASE UNIQUE,
@@ -280,7 +324,7 @@ mod tests {
         let db = Database {
             connection: Mutex::new(connection),
         };
-        assert_eq!(schema_version(&db), 2);
+        assert_eq!(schema_version(&db), 3);
         for table in ["agents", "turns", "messages", "steps", "queued_messages"] {
             assert_eq!(count(&db, table), 1, "{table}");
         }

@@ -1,7 +1,10 @@
 mod agents;
+pub mod api_key;
 mod commands;
 pub mod db;
 mod providers;
+pub mod secrets;
+mod settings;
 
 use std::path::{Path, PathBuf};
 
@@ -62,6 +65,7 @@ pub fn run() {
                     app.manage(AppStartupError(message));
                 }
             }
+            app.manage(secrets::select_store());
             app.manage(agents::WorkspacesRoot(agents::resolve_workspaces_root(
                 app.path().home_dir().ok(),
             )));
@@ -71,6 +75,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::app_status,
             providers::list_providers,
+            api_key::api_key_status,
+            api_key::save_api_key,
+            api_key::remove_api_key,
+            api_key::set_api_key_enabled,
             agents::list_agents,
             agents::create_agent
         ])

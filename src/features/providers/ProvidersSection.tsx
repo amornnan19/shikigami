@@ -4,6 +4,7 @@ import { Check, CircleAlert, CircleHelp, Copy, ExternalLink, RefreshCw } from "l
 import { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { ApiKeyBlock } from "./ApiKeyBlock";
 import { listProviders, type ProviderStatus } from "./api";
 
 function VersionText({ version }: { version: string | null }) {
@@ -71,7 +72,16 @@ function InstallLink({ url }: { url: string }) {
   );
 }
 
+const CLAUDE_CODE = "claude-code";
+
+function signInLabel(signedIn: ProviderStatus["signedIn"]) {
+  if (signedIn === "yes") return "Signed in";
+  if (signedIn === "no") return "Not signed in";
+  return "Sign-in status unknown";
+}
+
 function ProviderRow({ provider }: { provider: ProviderStatus }) {
+  const usesApiKey = provider.installed && provider.apiKey?.saved && provider.apiKey.enabled;
   return (
     <li className="flex flex-col gap-2 border-t border-border pt-4 first:border-t-0 first:pt-0">
       <span className="font-medium">{provider.name}</span>
@@ -84,14 +94,26 @@ function ProviderRow({ provider }: { provider: ProviderStatus }) {
           <InstallLink url={provider.installHint} />
         </div>
       )}
-      {provider.installed && provider.signedIn === "yes" && (
+      {usesApiKey && (
+        <div className="flex flex-col gap-1 text-sm">
+          <div className="flex items-center gap-2">
+            <Check className="size-4" />
+            <span>Ready (API key)</span>
+            <VersionText version={provider.version} />
+          </div>
+          <span className="text-muted-foreground">
+            CLI sign-in: {signInLabel(provider.signedIn)}
+          </span>
+        </div>
+      )}
+      {provider.installed && !usesApiKey && provider.signedIn === "yes" && (
         <div className="flex items-center gap-2 text-sm">
           <Check className="size-4" />
           <span>Ready</span>
           <VersionText version={provider.version} />
         </div>
       )}
-      {provider.installed && provider.signedIn === "no" && (
+      {provider.installed && !usesApiKey && provider.signedIn === "no" && (
         <div className="flex flex-col gap-2 text-sm">
           <div className="flex items-center gap-2">
             <CircleAlert className="size-4" />
@@ -102,12 +124,15 @@ function ProviderRow({ provider }: { provider: ProviderStatus }) {
           <SignInCommand command={provider.signInHint} />
         </div>
       )}
-      {provider.installed && provider.signedIn === "unknown" && (
+      {provider.installed && !usesApiKey && provider.signedIn === "unknown" && (
         <div className="flex items-center gap-2 text-sm">
           <CircleHelp className="size-4" />
           <span>Sign-in status unknown</span>
           <VersionText version={provider.version} />
         </div>
+      )}
+      {provider.installed && provider.id === CLAUDE_CODE && (
+        <ApiKeyBlock provider={provider.id} status={provider.apiKey} />
       )}
     </li>
   );
