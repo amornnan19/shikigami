@@ -8,6 +8,8 @@ pub const SPEC: ProviderSpec = ProviderSpec {
     install_hint: "https://docs.anthropic.com/en/docs/claude-code/setup",
     sign_in_hint: "claude auth login",
     sign_in_args: &["auth", "status"],
+    version_prefix: "",
+    sign_in_floor: [2, 0, 0],
     interpret_sign_in,
 };
 

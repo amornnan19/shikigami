@@ -22,6 +22,7 @@ pub fn build_search_dirs(
     path: Option<OsString>,
     home: Option<PathBuf>,
 ) -> Vec<PathBuf> {
+    let home = home.filter(|home| home.is_absolute());
     if let Some(list) = override_list {
         return unique(env::split_paths(&list).collect());
     }
@@ -41,7 +42,7 @@ pub fn build_search_dirs(
 fn unique(dirs: Vec<PathBuf>) -> Vec<PathBuf> {
     let mut seen = HashSet::new();
     dirs.into_iter()
-        .filter(|dir| !dir.as_os_str().is_empty() && seen.insert(dir.clone()))
+        .filter(|dir| dir.is_absolute() && seen.insert(dir.clone()))
         .collect()
 }
 
@@ -77,6 +78,27 @@ mod tests {
             Some("/home/me".into()),
         );
         assert_eq!(dirs, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
+    }
+
+    #[test]
+    fn relative_and_tilde_entries_are_dropped() {
+        let dirs = build_search_dirs(
+            None,
+            Some("bin:~/bin:.::/usr/bin".into()),
+            Some("relative/home".into()),
+        );
+        assert!(dirs.iter().all(|dir| dir.is_absolute()));
+        assert!(dirs.contains(&PathBuf::from("/usr/bin")));
+        assert!(!dirs.iter().any(|dir| dir.to_string_lossy().contains('~')));
+        assert!(!dirs.iter().any(|dir| dir.ends_with(".local/bin")));
+        assert!(!dirs.iter().any(|dir| dir.ends_with(".volta/bin")));
+
+        let empty_home = build_search_dirs(None, None, Some("".into()));
+        assert!(empty_home.iter().all(|dir| dir.is_absolute()));
+        assert!(!empty_home.iter().any(|dir| dir.ends_with(".local/bin")));
+
+        let overridden = build_search_dirs(Some("/a:rel:~/x:".into()), None, None);
+        assert_eq!(overridden, vec![PathBuf::from("/a")]);
     }
 
     #[test]
