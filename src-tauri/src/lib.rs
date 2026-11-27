@@ -1,5 +1,6 @@
 mod commands;
 pub mod db;
+mod providers;
 
 use std::path::{Path, PathBuf};
 
@@ -48,6 +49,7 @@ pub fn run() {
     #[cfg(feature = "e2e")]
     let builder = builder.plugin(tauri_plugin_wdio_webdriver::init());
     builder
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let resolved = resolve_data_dir(app);
             let data_dir = resolved.clone().unwrap_or_default();
@@ -62,7 +64,10 @@ pub fn run() {
             app.manage(DataDir(data_dir));
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![commands::app_status])
+        .invoke_handler(tauri::generate_handler![
+            commands::app_status,
+            providers::list_providers
+        ])
         .run(app_context())
         .expect("error while running tauri application");
 }
