@@ -10,6 +10,7 @@
       "src/**",
       "*.json",
       "*.ts",
+      "scripts/**",
       "e2e/**",
       "!**/node_modules",
       "!**/dist",
