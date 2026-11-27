@@ -1,6 +1,6 @@
 [package]
 name = "shikigami"
-version = "0.6.0"
+version = "0.6.1"
 description = "Shikigami"
 edition = "2021"
 license-file = "../LICENSE"
