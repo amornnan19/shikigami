@@ -1,0 +1,64 @@
+# Shikigami
+
+A macOS app that runs coding agents on this computer. Each agent works in its own folder, under a
+sandbox, and can run on a schedule or hand work to another agent. Everything stays on this Mac.
+
+The repository is public on GitHub (`amornnan19/shikigami`). Anything committed is public.
+
+## Clean-room rule
+
+Shikigami is written from scratch. It is inspired by OpenBot, whose source is kept outside this
+repository at `../openbot-reference` for reference only. OpenBot is licensed PolyForm Noncommercial;
+none of it may enter this repository.
+
+- **Spec side** may study OpenBot (use the app, read its docs and source) and writes behaviour specs
+  in `docs/specs/` with the `spec` skill. A spec says what the user sees and can do, never how
+  OpenBot does it.
+- **Code side** builds only from the specs and the GitHub issues. It does not open
+  `../openbot-reference`, and copies nothing from it: no code, file or identifier names, styles,
+  interface text, prompts, icons, assets or schema.
+- How a feature is built is our own design, decided with the user.
+- Third-party libraries are used under their own licenses. Check a new dependency's license before
+  adding it.
+
+## Stack
+
+- Desktop shell: Tauri 2. Backend in Rust (`src-tauri/`): agent CLI processes, sandbox, scheduling,
+  database.
+- UI: React with TypeScript (`src/`), built with Vite. Package manager: Bun.
+- Storage: SQLite on this Mac. The user's database is the source of truth.
+- macOS only. No cloud services of our own.
+
+Exact crates, UI libraries and test tools are chosen in M0 and recorded here.
+
+## Planning
+
+- Milestones live on GitHub (M0 Foundation ... M9). MVP is M0-M5.
+- Work is tracked as GitHub issues in a milestone. Use the `issue` skill to break a milestone down.
+- One issue per branch: `<issue-number>-<short-slug>`, from `main`.
+- Finish an issue with the `ship-issue` skill.
+
+## Safety defaults (product rules)
+
+These come from the specs and hold for every feature:
+
+- A new agent writes and reads only inside its workspace, cannot read secrets, and asks before
+  risky actions.
+- No answer to an approval means deny. A broken setting means the strictest mode.
+- Work that one agent or a routine causes another agent to do runs at the lower of the two access
+  levels.
+- Nothing connects to the network except agent providers and the sites agents use.
+
+## Git
+
+- Conventional Commits: `feat:`, `fix:`, `refactor:`, `test:`, `docs:`, `chore:`, `perf:`, `style:`.
+  Lower case after the colon, imperative, no trailing period. Reference the issue (`Refs #12`,
+  `Closes #12`) in the body.
+- **Ask the user before every commit and every push.** Show what is in it first.
+- Never force-push, never `--no-verify`, never rewrite pushed history.
+- Write everything in the repository in English: code, comments, docs, commit messages, issues.
+
+## Checks
+
+Run the narrowest check for what changed, one at a time. Commands are added here in M0 once the
+project exists.
