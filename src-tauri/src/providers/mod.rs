@@ -1,5 +1,4 @@
 mod claude_code;
-mod codex;
 mod probe;
 mod search;
 
@@ -94,36 +93,29 @@ fn parse_version(line: &str, prefix: &str) -> Option<[u32; 3]> {
 }
 
 async fn detect_all(dirs: &[PathBuf], limit: Duration) -> Vec<ProviderStatus> {
-    let (claude, codex) = tokio::join!(
-        detect(&claude_code::SPEC, dirs, limit),
-        detect(&codex::SPEC, dirs, limit),
-    );
-    vec![claude, codex]
+    vec![detect(&claude_code::SPEC, dirs, limit).await]
 }
 
 pub fn is_known(id: &str) -> bool {
-    [claude_code::SPEC.id, codex::SPEC.id].contains(&id)
+    id == CLAUDE_CODE_ID
 }
 
 pub fn name_of(id: &str) -> &'static str {
-    [&claude_code::SPEC, &codex::SPEC]
-        .into_iter()
-        .find(|spec| spec.id == id)
-        .map_or("The provider", |spec| spec.name)
+    if is_known(id) {
+        claude_code::SPEC.name
+    } else {
+        "The provider"
+    }
 }
 
 pub fn is_installed(id: &str, dirs: &[PathBuf]) -> bool {
-    [&claude_code::SPEC, &codex::SPEC]
-        .into_iter()
-        .find(|spec| spec.id == id)
-        .is_some_and(|spec| search::find_executable(spec.executable, dirs).is_some())
+    executable_path(id, dirs).is_some()
 }
 
 pub fn executable_path(id: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
-    [&claude_code::SPEC, &codex::SPEC]
-        .into_iter()
-        .find(|spec| spec.id == id)
-        .and_then(|spec| search::find_executable(spec.executable, dirs))
+    is_known(id)
+        .then(|| search::find_executable(claude_code::SPEC.executable, dirs))
+        .flatten()
 }
 
 pub fn search_dirs() -> Vec<PathBuf> {
@@ -179,7 +171,7 @@ esac"#;
     async fn missing_executable_is_not_installed() {
         let dir = tempfile::tempdir().unwrap();
         let all = detect_all(&dirs(&dir), LIMIT).await;
-        assert_eq!(all.len(), 2);
+        assert_eq!(all.len(), 1);
         for status in all {
             assert!(!status.installed);
             assert_eq!(status.path, None);
@@ -217,35 +209,6 @@ esac"#,
         let status = detect(&claude_code::SPEC, &dirs(&dir), LIMIT).await;
         assert!(status.installed);
         assert_eq!(status.signed_in, SignedIn::No);
-    }
-
-    #[tokio::test]
-    async fn codex_exit_code_decides_sign_in() {
-        let out = tempfile::tempdir().unwrap();
-        fake(
-            out.path(),
-            "codex",
-            r#"case "$1" in
-  --version) echo "codex-cli 0.46.0" ;;
-  login) exit 1 ;;
-esac"#,
-        );
-        let status = detect(&codex::SPEC, &dirs(&out), LIMIT).await;
-        assert!(status.installed);
-        assert_eq!(status.version.as_deref(), Some("codex-cli 0.46.0"));
-        assert_eq!(status.signed_in, SignedIn::No);
-
-        let signed_in = tempfile::tempdir().unwrap();
-        fake(
-            signed_in.path(),
-            "codex",
-            r#"case "$1" in
-  --version) echo "codex-cli 0.46.0" ;;
-  login) echo "Logged in" ;;
-esac"#,
-        );
-        let status = detect(&codex::SPEC, &dirs(&signed_in), LIMIT).await;
-        assert_eq!(status.signed_in, SignedIn::Yes);
     }
 
     #[tokio::test]
@@ -329,11 +292,7 @@ esac"#,
 
     #[tokio::test]
     async fn old_versions_do_not_get_the_sign_in_probe() {
-        let cases = [
-            ("claude", "1.0.100 (Claude Code)", &claude_code::SPEC),
-            ("codex", "codex-cli 0.1.0", &codex::SPEC),
-            ("codex", "0.46.0", &codex::SPEC),
-        ];
+        let cases = [("claude", "1.0.100 (Claude Code)", &claude_code::SPEC)];
         for (name, version, spec) in cases {
             let dir = tempfile::tempdir().unwrap();
             let marker = dir.path().join("sign-in-probed");
@@ -353,22 +312,6 @@ esac"#,
         }
     }
 
-    #[tokio::test]
-    async fn codex_unexpected_exit_codes_are_unknown() {
-        for code in [2, 126, 127] {
-            let dir = tempfile::tempdir().unwrap();
-            fake(
-                dir.path(),
-                "codex",
-                &format!(
-                    "case \"$1\" in\n  --version) echo 'codex-cli 0.46.0' ;;\n  login) exit {code} ;;\nesac"
-                ),
-            );
-            let status = detect(&codex::SPEC, &dirs(&dir), LIMIT).await;
-            assert_eq!(status.signed_in, SignedIn::Unknown, "exit {code}");
-        }
-    }
-
     #[test]
     fn parses_versions() {
         assert_eq!(
@@ -376,10 +319,10 @@ esac"#,
             Some([2, 1, 332])
         );
         assert_eq!(
-            parse_version("codex-cli 0.20.0-alpha.1", "codex-cli "),
-            Some([0, 20, 0])
+            parse_version("v2.1.0-alpha.1 (Claude Code)", "v"),
+            Some([2, 1, 0])
         );
-        assert_eq!(parse_version("codex-cli 0.20", "codex-cli "), None);
+        assert_eq!(parse_version("v2.1", "v"), None);
         assert_eq!(parse_version("hello", ""), None);
     }
 

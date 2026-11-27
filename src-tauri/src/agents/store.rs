@@ -53,12 +53,12 @@ pub fn insert(connection: &Connection, agent: &Agent) -> Result<(), AgentError> 
 pub fn workspace_of(
     connection: &Connection,
     agent_id: &str,
-) -> rusqlite::Result<Option<(String, String, String)>> {
+) -> rusqlite::Result<Option<(String, String)>> {
     connection
         .query_row(
-            "SELECT name, provider, workspace_path FROM agents WHERE id = ?1",
+            "SELECT name, workspace_path FROM agents WHERE id = ?1",
             [agent_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
 }

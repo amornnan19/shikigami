@@ -78,7 +78,7 @@ mod tests {
     #[test]
     fn models_have_no_inner_whitespace() {
         assert_eq!(model(" default ").unwrap(), "default");
-        assert!(model("gpt-5-codex").is_ok());
+        assert!(model("claude-sonnet-4-5").is_ok());
         assert_eq!(code(model("")), "model-invalid");
         assert_eq!(code(model("two words")), "model-invalid");
         assert!(model(&"m".repeat(100)).is_ok());

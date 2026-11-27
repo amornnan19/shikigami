@@ -1,7 +1,6 @@
-export const MODEL_SUGGESTIONS: Record<string, string[]> = {
-  "claude-code": ["default", "opus", "sonnet", "haiku"],
-  codex: ["default", "gpt-5-codex", "gpt-5"],
-};
+export const CLAUDE_CODE = "claude-code";
+
+export const MODEL_SUGGESTIONS = ["default", "opus", "sonnet", "haiku"];
 
 export const NAME_MAX = 40;
 export const MODEL_MAX = 100;

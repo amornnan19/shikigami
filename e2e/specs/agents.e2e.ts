@@ -46,16 +46,13 @@ describe("agents", () => {
     await expect($$('aside[aria-label="Agents"] li')).toBeElementsArrayOfSize(1);
   });
 
-  it("shows Codex as unavailable in the provider select", async () => {
+  it("has no provider choice in the create dialog", async () => {
     await openDialog();
-    await $("#agent-provider").click();
-    const codex = $('[role="option"]*=Codex');
-    await expect(codex).toHaveText(expect.stringContaining("Not installed"));
-    await expect(codex).toHaveAttribute("aria-disabled", "true");
-    await expect($('[role="option"]*=Claude Code')).not.toHaveAttribute("aria-disabled", "true");
-    await browser.saveScreenshot(join(artifacts, "agents-provider-select.png"));
-    await browser.keys("Escape");
-    await browser.keys("Escape");
+    await expect($("#agent-name")).toBeDisplayed();
+    await expect($("#agent-provider")).not.toExist();
+    await expect($("label=Provider")).not.toExist();
+    await browser.saveScreenshot(join(artifacts, "agents-no-provider-choice.png"));
+    await $("button=Cancel").click();
     await expect($('[role="dialog"]')).not.toBeDisplayed();
   });
 });

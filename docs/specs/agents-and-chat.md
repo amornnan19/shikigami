@@ -6,12 +6,12 @@
 ## Purpose
 
 The user creates agents and talks to them. Each agent is a coding assistant that runs through an
-agent CLI the user already has (Claude Code or Codex), works in its own folder, and keeps its
+Claude Code CLI the user already has, works in its own folder, and keeps its
 conversation across app restarts. This is the core every later milestone builds on.
 
 ## User stories
 
-1. As a user, I can create an agent with a name, a picture, a provider and a model.
+1. As a user, I can create an agent with a name, a picture and a model.
 2. As a user, I can see all my agents in a list and open one to chat with it.
 3. As a user, I can send a message and watch the reply appear as it is written.
 4. As a user, I can see what the agent is doing (tool steps) without it cluttering the answer.
@@ -31,9 +31,9 @@ conversation across app restarts. This is the core every later milestone builds 
   and a workspace folder. It also has a creation time.
 - Picture: an initial-letter avatar on a colour the user picks from a fixed palette. Image upload
   is out of scope.
-- Providers in M1: Claude Code and Codex. The create form lists only providers whose CLI is
-  installed; others show as unavailable with the reason.
-- Model: chosen from a short list per provider, with a provider default preselected. The user can
+- Every agent runs on Claude Code. The create form has no provider choice. If the Claude Code CLI
+  is not installed, creating an agent is refused with the reason.
+- Model: chosen from a short list, with the default preselected. The user can
   also type a model name.
 - The agent list shows each agent's picture, name and state: idle, working, or needs attention
   (last turn failed or was interrupted). The list is ordered by most recent activity.
@@ -49,8 +49,8 @@ conversation across app restarts. This is the core every later milestone builds 
   derived from the agent name (lower case, spaces to dashes, unsafe characters removed) and made
   unique with a number suffix if needed. The folder is created when the agent is created.
 - Renaming an agent does not rename or move its folder.
-- The agent's standing instructions live in an instruction file at the workspace root, in the file
-  name that agent's provider reads by itself (Claude Code and Codex each have their own convention).
+- The agent's standing instructions live in an instruction file at the workspace root, named
+  `CLAUDE.md`, the name Claude Code reads by itself.
   Shikigami creates the file with a short default text when the agent is created.
 - The agent settings show the instruction file's text with Edit and Show in Finder. Saving writes
   the file. If the file changed on disk since it was opened, Save warns and asks before
@@ -135,9 +135,8 @@ conversation across app restarts. This is the core every later milestone builds 
    reflects the edit.
 10. Create a second agent with the name "Test Agent": refused.
 11. Delete the agent without the checkbox: it disappears from the app and the folder remains.
-12. With a provider CLI not found on PATH, the create form marks it unavailable with install
-    guidance.
-13. Repeat checks 1-6 with Codex.
+12. With the Claude Code CLI not found on PATH, the Providers section shows install guidance and
+    creating an agent is refused.
 
 ## Out of scope
 

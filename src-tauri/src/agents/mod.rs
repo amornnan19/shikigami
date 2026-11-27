@@ -217,7 +217,7 @@ fn persist(db: &Database, root: &Path, valid: Validated) -> Result<Agent, AgentE
         state: AgentState::Idle,
         attention: None,
     };
-    let saved = workspace::write_instruction_file(&folder, &agent.provider, &agent.name)
+    let saved = workspace::write_instruction_file(&folder, &agent.name)
         .map_err(AgentError::folder)
         .and_then(|()| db.with_connection(|connection| store::insert(connection, &agent)));
     if let Err(error) = saved {
@@ -272,13 +272,13 @@ fn list(db: &Database, dirs: &[PathBuf]) -> Result<Vec<Agent>, AgentError> {
 }
 
 fn recreate(db: &Database, dirs: &[PathBuf], agent_id: &str) -> Result<Agent, AgentError> {
-    let (name, provider, path) = db
+    let (name, path) = db
         .with_connection(|connection| store::workspace_of(connection, agent_id))
         .map_err(AgentError::database)?
         .ok_or_else(|| AgentError::new("not-found", "This agent no longer exists."))?;
     let folder = PathBuf::from(path);
     fs::create_dir_all(&folder).map_err(AgentError::folder)?;
-    match workspace::write_instruction_file(&folder, &provider, &name) {
+    match workspace::write_instruction_file(&folder, &name) {
         Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => {
             return Err(AgentError::folder(error));
         }
@@ -412,15 +412,6 @@ mod tests {
     }
 
     #[test]
-    fn create_writes_agents_md_for_codex() {
-        let fx = Fixture::new(&["codex"]);
-        fx.create("Coder", "codex").unwrap();
-        let folder = fx.workspaces.path().join("coder");
-        assert!(folder.join("AGENTS.md").is_file());
-        assert!(!folder.join("CLAUDE.md").exists());
-    }
-
-    #[test]
     fn names_that_share_a_folder_name_get_numbered_folders() {
         let fx = Fixture::new(&["claude"]);
         fx.create("Test Agent", "claude-code").unwrap();
@@ -452,7 +443,6 @@ mod tests {
             error_code(fx.create(&"a".repeat(41), "claude-code")),
             "name-too-long"
         );
-        assert_eq!(error_code(fx.create("A", "codex")), "provider-unavailable");
         assert_eq!(
             error_code(fx.create("A", "unknown")),
             "provider-unavailable"
@@ -683,6 +673,22 @@ mod tests {
             .find(|agent| agent.name == "Recovered")
             .unwrap();
         assert_eq!(recovered.state, AgentState::NeedsAttention);
+    }
+
+    #[test]
+    fn an_agent_row_from_another_provider_needs_attention() {
+        let fx = Fixture::new(&["claude"]);
+        fx.db.with_connection(|c| {
+            c.execute(
+                "INSERT INTO agents (id, name, color, provider, model, workspace_path, created_at, last_activity_at)
+                 VALUES ('old', 'Old', 'red', 'codex', 'default', ?1, 1, 1)",
+                [fx.workspaces.path().to_string_lossy().as_ref()],
+            )
+            .unwrap()
+        });
+        let agent = fx.list().into_iter().next().unwrap();
+        assert_eq!(agent.state, AgentState::NeedsAttention);
+        assert_eq!(agent.attention.unwrap().code, "provider-unavailable");
     }
 
     #[test]
