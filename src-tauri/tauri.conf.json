@@ -22,7 +22,13 @@
     }
   },
   "bundle": {
-    "active": false,
-    "icon": ["icons/icon.png"]
+    "active": true,
+    "targets": ["app", "dmg"],
+    "icon": ["icons/icon.png"],
+    "category": "public.app-category.developer-tools",
+    "copyright": "Copyright 2026 アモンナン",
+    "macOS": {
+      "minimumSystemVersion": "13.0"
+    }
   }
 }
