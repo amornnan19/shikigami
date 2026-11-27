@@ -64,6 +64,11 @@ The desktop shell (Tauri 2), the UI framework (React with TypeScript, Vite) and 
   - On macOS we use WebdriverIO's Tauri service with its embedded provider, which runs a WebDriver
     server inside a debug build of the app through a plugin. The plugin is included in test builds
     only, never in the shipped app.
+  - `@wdio/tauri-service` 1.5.1 supports WebdriverIO 9 only (peer `^9.0.0`). WebdriverIO 10 removed
+    `browser.executeAsync`, which the service calls at start, so every worker failed in `before()`
+    and retried (#25). We pin `@wdio/*` to 9.33.1. The service also looks for a companion plugin
+    that this app does not include; the e2e config pins the session to its window so that lookup is
+    skipped.
   - Its license is MIT, checked when it was added (#8). It works on macOS. If it stops working, the
     fallback is to test the UI in a browser with mocked backend calls, plus Rust integration tests.
 

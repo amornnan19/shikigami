@@ -10,9 +10,7 @@ async function openDialog() {
   await expect($('[role="dialog"]')).toBeDisplayed();
 }
 
-describe("agents", function () {
-  this.timeout(300000);
-
+describe("agents", () => {
   it("creates an agent with Claude Code and selects it", async () => {
     await openDialog();
     await $("#agent-name").setValue("Test Agent");

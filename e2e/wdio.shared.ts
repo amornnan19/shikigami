@@ -1,6 +1,7 @@
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { browser } from "@wdio/globals";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 export const workspacesRoot = join(root, "e2e", "artifacts", "workspaces");
@@ -37,6 +38,9 @@ export function createConfig(
     reporters: ["spec"],
     logLevel: "warn",
     mochaOpts: { timeout: 60000 },
+    async before() {
+      await browser.switchToWindow(await browser.getWindowHandle());
+    },
     onPrepare() {
       rmSync(dataDir, { recursive: true, force: true });
       rmSync(workspacesRoot, { recursive: true, force: true });
