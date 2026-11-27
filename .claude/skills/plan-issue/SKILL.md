@@ -36,6 +36,10 @@ The plan is where every design decision is made. The implementer builds it and d
    > business rules in Rust, the UI never runs SQL or spawns processes, test-only code behind the `e2e`
    > feature. Read library docs instead of guessing APIs. If the plan cannot work as written, stop and
    > report. Small mechanical choices are yours; list them.
+   > E2E opens real windows that take the user's focus: while developing, run only the spec you work on
+   > (`tauri build --debug --no-bundle --features e2e`, then `bunx wdio run e2e/wdio.conf.ts --spec <file>`)
+   > and prefer Rust tests for logic; run the full `bun run e2e` 3 times only once, at the end. Background
+   > commands must be bounded (`timeout <s> ...`) and stopped before you finish.
    > Verify with real output: `bun run check`; `bun run e2e` 3/3 with screenshot paths; the plan's manual
    > check; stop every process you start by PID and leave port 1420 free; `git status` shows only
    > intended changes.
