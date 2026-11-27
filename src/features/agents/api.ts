@@ -59,3 +59,52 @@ export function createAgent(input: CreateAgentInput) {
 export function recreateWorkspace(agentId: string) {
   return invoke<Agent>("recreate_workspace", { agentId });
 }
+
+export interface UpdateAgentInput {
+  name?: string;
+  color?: string;
+  model?: string;
+}
+
+export interface Instructions {
+  text: string;
+  modifiedAt: number | null;
+}
+
+export interface Written {
+  modifiedAt: number | null;
+}
+
+export interface Deleted {
+  folderKept: boolean;
+  reason: string | null;
+}
+
+export function updateAgent(agentId: string, input: UpdateAgentInput) {
+  return invoke<Agent>("update_agent", { agentId, input });
+}
+
+export function setAgentAuthMode(agentId: string, mode: AuthMode | null) {
+  return invoke<Agent>("set_agent_auth_mode", { agentId, mode });
+}
+
+export function readInstructions(agentId: string) {
+  return invoke<Instructions>("read_instructions", { agentId });
+}
+
+export function writeInstructions(
+  agentId: string,
+  text: string,
+  expectedModifiedAt: number | null,
+  force: boolean,
+) {
+  return invoke<Written>("write_instructions", { agentId, text, expectedModifiedAt, force });
+}
+
+export function revealWorkspace(agentId: string) {
+  return invoke<void>("reveal_workspace", { agentId });
+}
+
+export function deleteAgent(agentId: string, moveFolderToTrash: boolean) {
+  return invoke<Deleted>("delete_agent", { agentId, moveFolderToTrash });
+}

@@ -1,3 +1,5 @@
+mod instructions;
+mod remove;
 mod store;
 mod validate;
 mod workspace;
@@ -111,6 +113,17 @@ pub struct CreateAgentInput {
     pub model: String,
     #[serde(default)]
     pub auth_mode: Option<AuthMode>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateAgentInput {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub color: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 struct Validated {
@@ -339,6 +352,73 @@ fn set_auth_mode(
     find(db, dirs, app, agent_id)
 }
 
+fn update(
+    db: &Database,
+    dirs: &[PathBuf],
+    app: &AppAuth,
+    agent_id: &str,
+    input: UpdateAgentInput,
+) -> Result<Agent, AgentError> {
+    let name = input.name.as_deref().map(validate::name).transpose()?;
+    let color = input.color.as_deref().map(validate::color).transpose()?;
+    let model = input.model.as_deref().map(validate::model).transpose()?;
+    let changed = db.with_connection(|connection| {
+        store::update(
+            connection,
+            agent_id,
+            name.as_deref(),
+            color.as_deref(),
+            model.as_deref(),
+        )
+    })?;
+    if changed == 0 {
+        return Err(AgentError::new("not-found", "This agent no longer exists."));
+    }
+    find(db, dirs, app, agent_id)
+}
+
+fn folder_of(db: &Database, agent_id: &str) -> Result<PathBuf, AgentError> {
+    db.with_connection(|connection| store::workspace_of(connection, agent_id))
+        .map_err(AgentError::database)?
+        .map(|(_, path)| PathBuf::from(path))
+        .ok_or_else(|| AgentError::new("not-found", "This agent no longer exists."))
+}
+
+#[cfg(not(feature = "e2e"))]
+fn reveal_folder(folder: &Path) -> Result<(), AgentError> {
+    tauri_plugin_opener::reveal_item_in_dir(folder).map_err(|error| {
+        AgentError::new(
+            "folder-failed",
+            format!("Could not show the folder in Finder: {error}"),
+        )
+    })
+}
+
+#[cfg(feature = "e2e")]
+fn reveal_folder(folder: &Path) -> Result<(), AgentError> {
+    use std::io::Write;
+    if let Some(log) = std::env::var_os("SHIKIGAMI_E2E_REVEAL_LOG").filter(|log| !log.is_empty()) {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log)
+            .map_err(AgentError::folder)?;
+        writeln!(file, "{}", folder.display()).map_err(AgentError::folder)?;
+    }
+    Ok(())
+}
+
+fn reveal(db: &Database, agent_id: &str) -> Result<(), AgentError> {
+    let folder = folder_of(db, agent_id)?;
+    if !folder.is_dir() {
+        return Err(AgentError::new(
+            "folder-failed",
+            "The workspace folder is missing.",
+        ));
+    }
+    reveal_folder(&folder)
+}
+
 fn unavailable() -> AgentError {
     AgentError::new("unavailable", "The app database is not available.")
 }
@@ -392,6 +472,86 @@ pub async fn set_agent_auth_mode(
         let db = app.try_state::<Database>().ok_or_else(unavailable)?;
         let app_auth = app_auth(&app, &db)?;
         set_auth_mode(&db, &providers::search_dirs(), &app_auth, &agent_id, mode)
+    })
+    .await
+    .map_err(AgentError::database)?
+}
+
+#[tauri::command]
+pub async fn update_agent(
+    app: AppHandle,
+    agent_id: String,
+    input: UpdateAgentInput,
+) -> Result<Agent, AgentError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let db = app.try_state::<Database>().ok_or_else(unavailable)?;
+        let app_auth = app_auth(&app, &db)?;
+        update(&db, &providers::search_dirs(), &app_auth, &agent_id, input)
+    })
+    .await
+    .map_err(AgentError::database)?
+}
+
+#[tauri::command]
+pub async fn read_instructions(
+    app: AppHandle,
+    agent_id: String,
+) -> Result<instructions::Instructions, AgentError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let db = app.try_state::<Database>().ok_or_else(unavailable)?;
+        instructions::read(&folder_of(&db, &agent_id)?)
+    })
+    .await
+    .map_err(AgentError::database)?
+}
+
+#[tauri::command]
+pub async fn write_instructions(
+    app: AppHandle,
+    agent_id: String,
+    text: String,
+    expected_modified_at: Option<i64>,
+    force: bool,
+) -> Result<instructions::Written, AgentError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let db = app.try_state::<Database>().ok_or_else(unavailable)?;
+        instructions::write(
+            &folder_of(&db, &agent_id)?,
+            &text,
+            expected_modified_at,
+            force,
+        )
+    })
+    .await
+    .map_err(AgentError::database)?
+}
+
+#[tauri::command]
+pub async fn reveal_workspace(app: AppHandle, agent_id: String) -> Result<(), AgentError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let db = app.try_state::<Database>().ok_or_else(unavailable)?;
+        reveal(&db, &agent_id)
+    })
+    .await
+    .map_err(AgentError::database)?
+}
+
+#[tauri::command]
+pub async fn delete_agent(
+    app: AppHandle,
+    agent_id: String,
+    move_folder_to_trash: bool,
+) -> Result<remove::Deleted, AgentError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let db = app.try_state::<Database>().ok_or_else(unavailable)?;
+        let root = app.try_state::<WorkspacesRoot>().ok_or_else(unavailable)?;
+        remove::delete(
+            &db,
+            &root.0,
+            &agent_id,
+            move_folder_to_trash,
+            &remove::system_trash,
+        )
     })
     .await
     .map_err(AgentError::database)?
@@ -1056,5 +1216,353 @@ mod tests {
         let fx = Fixture::new(&["claude"]);
         let error = set_auth_mode(&fx.db, &fx.dirs(), &APP_AUTH, "nope", None).unwrap_err();
         assert_eq!(error.code, "not-found");
+    }
+
+    fn update_input(
+        name: Option<&str>,
+        color: Option<&str>,
+        model: Option<&str>,
+    ) -> UpdateAgentInput {
+        UpdateAgentInput {
+            name: name.map(str::to_string),
+            color: color.map(str::to_string),
+            model: model.map(str::to_string),
+        }
+    }
+
+    fn update_agent_of(
+        fx: &Fixture,
+        agent: &Agent,
+        input: UpdateAgentInput,
+    ) -> Result<Agent, AgentError> {
+        update(&fx.db, &fx.dirs(), &APP_AUTH, &agent.id, input)
+    }
+
+    fn count_rows(fx: &Fixture, table: &str) -> i64 {
+        fx.db.with_connection(|c| {
+            c.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+        })
+    }
+
+    fn fill_history(fx: &Fixture, agent: &Agent, status: &str) {
+        insert_turn(fx, "turn-1", &agent.id, status, 10);
+        fx.db.with_connection(|c| {
+            c.execute(
+                "INSERT INTO messages (id, agent_id, turn_id, role, content, created_at)
+                 VALUES ('message-1', ?1, 'turn-1', 'user', 'hello', 10)",
+                [&agent.id],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO steps (id, turn_id, position, kind, title, status, created_at)
+                 VALUES ('step-1', 'turn-1', 0, 'tool', 'Bash', 'done', 10)",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO queued_messages (id, agent_id, content, position, created_at)
+                 VALUES ('queued-1', ?1, 'later', 0, 10)",
+                [&agent.id],
+            )
+            .unwrap();
+        });
+    }
+
+    #[test]
+    fn an_update_changes_name_colour_and_model_and_nothing_else() {
+        let fx = Fixture::new(&["claude"]);
+        let agent = fx.create("Test Agent", "claude-code").unwrap();
+        let updated = update_agent_of(
+            &fx,
+            &agent,
+            update_input(Some("  Renamed "), Some("red"), Some("opus")),
+        )
+        .unwrap();
+        assert_eq!(updated.name, "Renamed");
+        assert_eq!(updated.color, "red");
+        assert_eq!(updated.model, "opus");
+        assert_eq!(updated.workspace_path, agent.workspace_path);
+        assert_eq!(updated.id, agent.id);
+        assert_eq!(updated.created_at, agent.created_at);
+        assert_eq!(updated.last_activity_at, agent.last_activity_at);
+        assert_eq!(fx.list(), vec![updated]);
+    }
+
+    #[test]
+    fn an_update_with_one_field_keeps_the_others() {
+        let fx = Fixture::new(&["claude"]);
+        let agent = fx.create("Test Agent", "claude-code").unwrap();
+        let updated = update_agent_of(&fx, &agent, update_input(None, Some("pink"), None)).unwrap();
+        assert_eq!(updated.name, "Test Agent");
+        assert_eq!(updated.model, "default");
+        assert_eq!(updated.color, "pink");
+        let untouched = update_agent_of(&fx, &agent, UpdateAgentInput::default()).unwrap();
+        assert_eq!(untouched, updated);
+    }
+
+    #[test]
+    fn the_update_input_reads_missing_and_named_fields() {
+        let none: UpdateAgentInput = serde_json::from_str("{}").unwrap();
+        assert_eq!(none.name, None);
+        let some: UpdateAgentInput =
+            serde_json::from_str(r#"{"name":"A","color":"red","model":"opus"}"#).unwrap();
+        assert_eq!(some.name.as_deref(), Some("A"));
+        assert_eq!(some.color.as_deref(), Some("red"));
+        assert_eq!(some.model.as_deref(), Some("opus"));
+    }
+
+    #[test]
+    fn an_update_never_renames_or_moves_the_folder() {
+        let fx = Fixture::new(&["claude"]);
+        let agent = fx.create("Test Agent", "claude-code").unwrap();
+        update_agent_of(&fx, &agent, update_input(Some("Other Name"), None, None)).unwrap();
+        let folder = fx.workspaces.path().join("test-agent");
+        assert!(folder.join("CLAUDE.md").is_file());
+        assert_eq!(fx.folder_count(), 1);
+        assert_eq!(fx.list()[0].workspace_path, folder.to_string_lossy());
+    }
+
+    #[test]
+    fn an_update_keeps_the_whole_conversation() {
+        let fx = Fixture::new(&["claude"]);
+        let agent = fx.create("Test Agent", "claude-code").unwrap();
+        fill_history(&fx, &agent, "completed");
+        update_agent_of(
+            &fx,
+            &agent,
+            update_input(Some("Renamed"), Some("teal"), Some("haiku")),
+        )
+        .unwrap();
+        assert_eq!(count_rows(&fx, "turns"), 1);
+        assert_eq!(count_rows(&fx, "messages"), 1);
+        assert_eq!(count_rows(&fx, "steps"), 1);
+        assert_eq!(count_rows(&fx, "queued_messages"), 1);
+    }
+
+    #[test]
+    fn a_name_used_by_another_agent_is_refused_ignoring_case() {
+        let fx = Fixture::new(&["claude"]);
+        fx.create("First", "claude-code").unwrap();
+        let second = fx.create("Second", "claude-code").unwrap();
+        for taken in ["First", "first", "  FIRST "] {
+            let error =
+                update_agent_of(&fx, &second, update_input(Some(taken), None, None)).unwrap_err();
+            assert_eq!(error.code, "name-taken");
+        }
+        assert_eq!(fx.list().iter().filter(|a| a.name == "Second").count(), 1);
+    }
+
+    #[test]
+    fn an_agent_may_keep_its_own_name_or_change_its_case() {
+        let fx = Fixture::new(&["claude"]);
+        let agent = fx.create("Test Agent", "claude-code").unwrap();
+        let same =
+            update_agent_of(&fx, &agent, update_input(Some("Test Agent"), None, None)).unwrap();
+        assert_eq!(same.name, "Test Agent");
+        let cased =
+            update_agent_of(&fx, &agent, update_input(Some("TEST AGENT"), None, None)).unwrap();
+        assert_eq!(cased.name, "TEST AGENT");
+    }
+
+    #[test]
+    fn an_update_validates_like_create_and_changes_nothing_on_error() {
+        let fx = Fixture::new(&["claude"]);
+        let agent = fx.create("Test Agent", "claude-code").unwrap();
+        let code_of_update = |input| update_agent_of(&fx, &agent, input).unwrap_err().code;
+        assert_eq!(
+            code_of_update(update_input(Some("  "), None, None)),
+            "name-empty"
+        );
+        assert_eq!(
+            code_of_update(update_input(Some(&"a".repeat(41)), None, None)),
+            "name-too-long"
+        );
+        assert_eq!(
+            code_of_update(update_input(None, Some("purple"), None)),
+            "color-invalid"
+        );
+        assert_eq!(
+            code_of_update(update_input(None, None, Some("two words"))),
+            "model-invalid"
+        );
+        assert_eq!(
+            code_of_update(update_input(Some("Fine"), Some("purple"), None)),
+            "color-invalid"
+        );
+        assert_eq!(fx.list(), vec![agent]);
+    }
+
+    #[test]
+    fn updating_a_missing_agent_is_not_found() {
+        let fx = Fixture::new(&["claude"]);
+        let error = update(
+            &fx.db,
+            &fx.dirs(),
+            &APP_AUTH,
+            "nope",
+            update_input(Some("A"), None, None),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "not-found");
+    }
+
+    fn never_trash(_: &Path) -> Result<(), String> {
+        panic!("the folder must not be moved to the Trash");
+    }
+
+    fn delete_agent_of(
+        fx: &Fixture,
+        agent: &Agent,
+        trash: bool,
+        trasher: &dyn Fn(&Path) -> Result<(), String>,
+    ) -> Result<remove::Deleted, AgentError> {
+        remove::delete(&fx.db, &fx.root(), &agent.id, trash, trasher)
+    }
+
+    #[test]
+    fn deleting_a_working_agent_is_refused_and_changes_nothing() {
+        let fx = Fixture::new(&["claude"]);
+        let agent = fx.create("Test Agent", "claude-code").unwrap();
+        fill_history(&fx, &agent, "running");
+        for trash in [false, true] {
+            let error = delete_agent_of(&fx, &agent, trash, &never_trash).unwrap_err();
+            assert_eq!(error.code, "busy");
+            assert_eq!(error.message, "Stop the agent before deleting it.");
+        }
+        assert_eq!(fx.agent_count(), 1);
+        assert_eq!(count_rows(&fx, "turns"), 1);
+        assert!(fx.workspaces.path().join("test-agent").is_dir());
+    }
+
+    #[test]
+    fn an_agent_whose_last_turn_ended_can_be_deleted() {
+        let fx = Fixture::new(&["claude"]);
+        let agent = fx.create("Test Agent", "claude-code").unwrap();
+        fill_history(&fx, &agent, "stopped");
+        delete_agent_of(&fx, &agent, false, &never_trash).unwrap();
+        assert_eq!(fx.agent_count(), 0);
+    }
+
+    #[test]
+    fn deleting_removes_the_row_and_the_whole_conversation() {
+        let fx = Fixture::new(&["claude"]);
+        let agent = fx.create("Test Agent", "claude-code").unwrap();
+        let other = fx.create("Other", "claude-code").unwrap();
+        fill_history(&fx, &agent, "completed");
+        delete_agent_of(&fx, &agent, false, &never_trash).unwrap();
+        assert_eq!(
+            fx.list().iter().map(|a| &a.id).collect::<Vec<_>>(),
+            vec![&other.id]
+        );
+        for table in ["turns", "messages", "steps", "queued_messages"] {
+            assert_eq!(count_rows(&fx, table), 0, "{table}");
+        }
+    }
+
+    #[test]
+    fn deleting_without_the_checkbox_keeps_the_folder_and_its_files() {
+        let fx = Fixture::new(&["claude"]);
+        let agent = fx.create("Test Agent", "claude-code").unwrap();
+        let folder = fx.workspaces.path().join("test-agent");
+        fs::write(folder.join("notes.txt"), "keep me").unwrap();
+        let outcome = delete_agent_of(&fx, &agent, false, &never_trash).unwrap();
+        assert!(outcome.folder_kept);
+        assert_eq!(outcome.reason, None);
+        assert_eq!(
+            fs::read_to_string(folder.join("notes.txt")).unwrap(),
+            "keep me"
+        );
+        assert!(folder.join("CLAUDE.md").is_file());
+    }
+
+    #[test]
+    fn deleting_with_the_checkbox_hands_the_recorded_folder_to_the_trash() {
+        let fx = Fixture::new(&["claude"]);
+        let agent = fx.create("Test Agent", "claude-code").unwrap();
+        let folder = fx.workspaces.path().join("test-agent");
+        let trashed = std::cell::RefCell::new(Vec::new());
+        let outcome = delete_agent_of(&fx, &agent, true, &|path: &Path| {
+            trashed.borrow_mut().push(path.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+        assert!(!outcome.folder_kept);
+        assert_eq!(outcome.reason, None);
+        assert_eq!(*trashed.borrow(), vec![fs::canonicalize(folder).unwrap()]);
+        assert_eq!(fx.agent_count(), 0);
+    }
+
+    #[test]
+    fn a_recorded_folder_outside_the_root_is_kept_but_the_agent_is_deleted() {
+        let fx = Fixture::new(&["claude"]);
+        let agent = fx.create("Test Agent", "claude-code").unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        fx.db.with_connection(|c| {
+            c.execute(
+                "UPDATE agents SET workspace_path = ?1 WHERE id = ?2",
+                rusqlite::params![elsewhere.path().to_str().unwrap(), agent.id],
+            )
+            .unwrap();
+        });
+        let outcome = delete_agent_of(&fx, &agent, true, &never_trash).unwrap();
+        assert!(outcome.folder_kept);
+        assert!(outcome.reason.unwrap().contains("outside"));
+        assert!(elsewhere.path().is_dir());
+        assert_eq!(fx.agent_count(), 0);
+    }
+
+    #[test]
+    fn a_recorded_symlink_is_kept_and_its_target_is_untouched() {
+        let fx = Fixture::new(&["claude"]);
+        let agent = fx.create("Test Agent", "claude-code").unwrap();
+        let target = fx.workspaces.path().join("test-agent");
+        let link = fx.workspaces.path().join("linked");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        fx.db.with_connection(|c| {
+            c.execute(
+                "UPDATE agents SET workspace_path = ?1 WHERE id = ?2",
+                rusqlite::params![link.to_str().unwrap(), agent.id],
+            )
+            .unwrap();
+        });
+        let outcome = delete_agent_of(&fx, &agent, true, &never_trash).unwrap();
+        assert!(outcome.folder_kept);
+        assert!(target.join("CLAUDE.md").is_file());
+        assert!(link.symlink_metadata().unwrap().is_symlink());
+    }
+
+    #[test]
+    fn a_trash_failure_keeps_the_deleted_row_deleted_and_is_reported() {
+        let fx = Fixture::new(&["claude"]);
+        let agent = fx.create("Test Agent", "claude-code").unwrap();
+        let outcome =
+            delete_agent_of(&fx, &agent, true, &|_: &Path| Err("no trash".to_string())).unwrap();
+        assert!(outcome.folder_kept);
+        assert!(outcome.reason.unwrap().contains("no trash"));
+        assert_eq!(fx.agent_count(), 0);
+        assert!(fx.workspaces.path().join("test-agent").is_dir());
+    }
+
+    #[test]
+    fn deleting_a_missing_agent_is_not_found() {
+        let fx = Fixture::new(&["claude"]);
+        let error = remove::delete(&fx.db, &fx.root(), "nope", true, &never_trash).unwrap_err();
+        assert_eq!(error.code, "not-found");
+    }
+
+    #[test]
+    fn the_deleted_outcome_serialises_in_camel_case() {
+        let value = serde_json::to_value(remove::Deleted {
+            folder_kept: true,
+            reason: Some("because".to_string()),
+        })
+        .unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({ "folderKept": true, "reason": "because" })
+        );
     }
 }

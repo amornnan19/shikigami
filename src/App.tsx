@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useState } from "react";
 import { AgentSidebar } from "@/features/agents/AgentSidebar";
 import { AgentView } from "@/features/agents/AgentView";
-import { listAgents } from "@/features/agents/api";
+import { type Deleted, listAgents } from "@/features/agents/api";
 import { NewAgentDialog } from "@/features/agents/NewAgentDialog";
 import { useTurnEvents } from "@/features/chat/useConversation";
 import { ClaudeSection } from "@/features/providers/ClaudeSection";
@@ -34,19 +34,34 @@ function Workspace() {
   });
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
   const list = agents.data ?? [];
   const selected = list.find((agent) => agent.id === selectedId) ?? null;
+
+  function select(id: string) {
+    setNotice(null);
+    setSelectedId(id);
+  }
+
+  function deleted(outcome: Deleted, askedForTrash: boolean) {
+    setSelectedId(null);
+    setNotice(
+      askedForTrash && outcome.folderKept
+        ? `The agent was deleted, but its folder was not moved to the Trash. ${outcome.reason ?? ""}`.trim()
+        : null,
+    );
+  }
 
   return (
     <div className="flex h-screen bg-background text-foreground">
       <AgentSidebar
         agents={list}
         selectedId={selected?.id ?? null}
-        onSelect={setSelectedId}
+        onSelect={select}
         onNew={() => setDialogOpen(true)}
       />
       {selected ? (
-        <AgentView key={selected.id} agent={selected} />
+        <AgentView key={selected.id} agent={selected} onDeleted={deleted} />
       ) : (
         <main className="flex flex-1 flex-col items-center justify-center gap-6 overflow-y-auto p-6">
           <div className="flex flex-col items-center gap-2">
@@ -54,13 +69,18 @@ function Workspace() {
             <p className="text-muted-foreground">Coding agents on your Mac.</p>
           </div>
           {agents.isError && <p role="alert">Could not load agents.</p>}
+          {notice && (
+            <p role="status" className="max-w-md text-center text-sm text-amber-800">
+              {notice}
+            </p>
+          )}
           <ClaudeSection />
         </main>
       )}
       <NewAgentDialog
         open={dialogOpen}
         onOpenChange={setDialogOpen}
-        onCreated={(agent) => setSelectedId(agent.id)}
+        onCreated={(agent) => select(agent.id)}
       />
     </div>
   );

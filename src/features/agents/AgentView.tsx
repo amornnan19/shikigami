@@ -1,3 +1,6 @@
+import { Settings } from "lucide-react";
+import { useState } from "react";
+import { Button } from "@/components/ui/button";
 import { Composer } from "@/features/chat/Composer";
 import { QueueList } from "@/features/chat/QueueList";
 import { ResumeBar } from "@/features/chat/ResumeBar";
@@ -5,10 +8,18 @@ import { Transcript } from "@/features/chat/Transcript";
 import { useConversation, useQueue } from "@/features/chat/useConversation";
 import { AUTH_MODE_LABELS } from "@/features/providers/api";
 import { AgentAvatar } from "./AgentAvatar";
+import { AgentSettingsDialog } from "./AgentSettingsDialog";
 import { AttentionBanner, isBlocked } from "./AttentionBanner";
-import type { Agent } from "./api";
+import type { Agent, Deleted } from "./api";
 
-export function AgentView({ agent }: { agent: Agent }) {
+export function AgentView({
+  agent,
+  onDeleted,
+}: {
+  agent: Agent;
+  onDeleted: (outcome: Deleted, askedForTrash: boolean) => void;
+}) {
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const { query, loadOlder, loadingOlder } = useConversation(agent.id);
   const queue = useQueue(agent.id);
   const turns = query.data?.turns ?? [];
@@ -27,6 +38,16 @@ export function AgentView({ agent }: { agent: Agent }) {
         <span className="rounded-md bg-muted px-2 py-0.5 text-xs text-muted-foreground">
           {AUTH_MODE_LABELS[agent.effectiveAuthMode]}
         </span>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          aria-label="Agent settings"
+          className="ml-auto"
+          onClick={() => setSettingsOpen(true)}
+        >
+          <Settings />
+        </Button>
       </header>
       <AttentionBanner agent={agent} />
       {query.isError && (
@@ -54,6 +75,13 @@ export function AgentView({ agent }: { agent: Agent }) {
         running={running}
         runningTurnId={runningTurnId}
         blockedReason={blockedReason}
+      />
+      <AgentSettingsDialog
+        agent={agent}
+        running={running}
+        open={settingsOpen}
+        onOpenChange={setSettingsOpen}
+        onDeleted={onDeleted}
       />
     </section>
   );
