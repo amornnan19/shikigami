@@ -29,7 +29,16 @@ none of it may enter this repository.
 - Storage: SQLite on this Mac. The user's database is the source of truth.
 - macOS only. No cloud services of our own.
 
-Exact crates, UI libraries and test tools are chosen in M0 and recorded here.
+Libraries and tools (reasons in `docs/decisions/0001-stack.md`):
+
+- UI: shadcn/ui on Radix, Tailwind CSS, TanStack Query for data from Rust, Zustand for screen state.
+- Rust: Tokio (async and child processes), rusqlite with refinery migrations, serde.
+- Lint and format: Biome (TypeScript), rustfmt and clippy (Rust).
+- Tests: Vitest (UI), `cargo test` (Rust), WebdriverIO with the Tauri embedded provider for end to
+  end on macOS (test builds only).
+- Business rules and the sandbox live in Rust. The UI never runs SQL or spawns processes.
+- Check a dependency's license before adding it. Permissive licenses (MIT, Apache-2.0, BSD, ISC)
+  are fine.
 
 ## Planning
 
