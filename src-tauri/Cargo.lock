@@ -3645,6 +3645,7 @@ dependencies = [
 name = "shikigami"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "refinery",
  "rusqlite",
  "serde",

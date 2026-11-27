@@ -2,10 +2,21 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Default capability for the main window",
-  "windows": ["main"],
+  "windows": [
+    "main"
+  ],
   "permissions": [
     "core:default",
-    "opener:allow-open-url",
-    "opener:allow-default-urls"
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        {
+          "url": "https://docs.anthropic.com/en/docs/claude-code/setup"
+        },
+        {
+          "url": "https://github.com/openai/codex"
+        }
+      ]
+    }
   ]
 }

@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Check, CircleAlert, CircleHelp, Copy, ExternalLink, RefreshCw } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { listProviders, type ProviderStatus } from "./api";
@@ -9,19 +10,64 @@ function VersionText({ version }: { version: string | null }) {
   return version ? <span className="text-muted-foreground">{version}</span> : null;
 }
 
+const FEEDBACK_MS = 2000;
+
+type CopyState = "idle" | "copied" | "failed";
+
 function SignInCommand({ command }: { command: string }) {
+  const [copyState, setCopyState] = useState<CopyState>("idle");
+  const timer = useRef<ReturnType<typeof setTimeout>>(undefined);
+
+  useEffect(() => () => clearTimeout(timer.current), []);
+
+  async function copy() {
+    let next: CopyState = "copied";
+    try {
+      await navigator.clipboard.writeText(command);
+    } catch {
+      next = "failed";
+    }
+    setCopyState(next);
+    clearTimeout(timer.current);
+    timer.current = setTimeout(() => setCopyState("idle"), FEEDBACK_MS);
+  }
+
   return (
     <div className="flex items-center gap-2">
       <code className="rounded-md bg-muted px-2 py-1 font-mono text-sm">{command}</code>
-      <Button
-        variant="ghost"
-        size="icon"
-        aria-label={`Copy ${command}`}
-        onClick={() => navigator.clipboard.writeText(command)}
-      >
+      <Button variant="ghost" size="sm" aria-label={`Copy ${command}`} onClick={copy}>
         <Copy />
+        {copyState === "copied" && "Copied"}
+        {copyState === "failed" && "Copy failed"}
       </Button>
     </div>
+  );
+}
+
+function InstallLink({ url }: { url: string }) {
+  const [failed, setFailed] = useState(false);
+
+  async function open() {
+    try {
+      await openUrl(url);
+      setFailed(false);
+    } catch {
+      setFailed(true);
+    }
+  }
+
+  return (
+    <>
+      <Button variant="outline" size="sm" onClick={open}>
+        <ExternalLink />
+        Install
+      </Button>
+      {failed && (
+        <span role="alert" className="text-muted-foreground">
+          Could not open the browser. Go to {url}
+        </span>
+      )}
+    </>
   );
 }
 
@@ -35,10 +81,7 @@ function ProviderRow({ provider }: { provider: ProviderStatus }) {
             <CircleAlert className="size-4" />
             Not installed
           </span>
-          <Button variant="outline" size="sm" onClick={() => openUrl(provider.installHint)}>
-            <ExternalLink />
-            Install
-          </Button>
+          <InstallLink url={provider.installHint} />
         </div>
       )}
       {provider.installed && provider.signedIn === "yes" && (
@@ -71,7 +114,7 @@ function ProviderRow({ provider }: { provider: ProviderStatus }) {
 }
 
 export function ProvidersSection() {
-  const providers = useQuery({ queryKey: ["providers"], queryFn: listProviders });
+  const providers = useQuery({ queryKey: ["providers"], queryFn: listProviders, retry: false });
   return (
     <section aria-label="Providers" className="w-full max-w-md">
       <Card>

@@ -19,7 +19,7 @@ export function prepareFakeProviders() {
     fakeClaude,
     `#!/bin/sh
 case "$1" in
-  --version) cat "$(dirname "$0")/claude-version" ;;
+  --version) read -r version < "\${0%/*}/claude-version"; echo "$version" ;;
   auth) echo '{"loggedIn": true}' ;;
 esac
 `,

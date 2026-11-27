@@ -21,7 +21,11 @@ export function createConfig(
     services: [
       [
         "tauri",
-        { driverProvider: "embedded", appBinaryPath, env: { ...appEnv, SHIKIGAMI_DATA_DIR: dataDir } },
+        {
+          driverProvider: "embedded",
+          appBinaryPath,
+          env: { ...appEnv, SHIKIGAMI_DATA_DIR: dataDir },
+        },
       ],
     ],
     framework: "mocha",

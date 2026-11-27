@@ -47,6 +47,13 @@ foreign keys on only after the run and a clean `PRAGMA foreign_key_check`. SQLit
 `foreign_keys` inside a transaction, so a table rebuild with foreign keys on would cascade-delete
 every child row. Never edit a migration that has been merged; add a new one.
 
+## Running agent CLIs
+
+A CLI that Shikigami starts gets an explicit PATH built from the provider search list; a
+Finder-launched app only has /usr/bin:/bin:/usr/sbin:/sbin, and npm-installed CLIs need node on
+PATH. Start each CLI in its own process group and kill the group on timeout or stop. Bound how much
+output is read.
+
 ## Planning
 
 - Milestones live on GitHub (M0 Foundation ... M9). MVP is M0-M5.
