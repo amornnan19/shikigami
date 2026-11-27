@@ -29,6 +29,7 @@ export function createConfig(
           appBinaryPath,
           env: {
             ...appEnv,
+            SHIKIGAMI_E2E_BACKGROUND: "1",
             SHIKIGAMI_DATA_DIR: dataDir,
             SHIKIGAMI_WORKSPACES_DIR: workspacesRoot,
           },

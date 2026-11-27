@@ -1,0 +1,12 @@
+{
+  "app": {
+    "windows": [
+      {
+        "title": "Shikigami",
+        "width": 960,
+        "height": 640,
+        "focus": false
+      }
+    ]
+  }
+}

@@ -13,6 +13,9 @@ use tauri::Manager;
 
 pub const DATA_DIR_ENV: &str = "SHIKIGAMI_DATA_DIR";
 
+#[cfg(feature = "e2e")]
+const E2E_BACKGROUND_ENV: &str = "SHIKIGAMI_E2E_BACKGROUND";
+
 pub struct DataDir(pub PathBuf);
 
 pub struct AppStartupError(pub String);
@@ -56,6 +59,10 @@ pub fn run() {
     builder
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
+            #[cfg(all(feature = "e2e", target_os = "macos"))]
+            if std::env::var_os(E2E_BACKGROUND_ENV).is_some_and(|value| value == "1") {
+                app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            }
             let resolved = resolve_data_dir(app);
             let data_dir = resolved.clone().unwrap_or_default();
             let opened = resolved
