@@ -38,7 +38,7 @@ describe("after a restart", () => {
     });
     await expect($('[aria-label="Queue waiting"]')).toHaveText(
       expect.stringContaining(
-        "The app closed while the agent was working. 1 queued message is waiting.",
+        "The app closed while the agent was working. 1 queued message is waiting. Send a message or press Resume to continue.",
       ),
     );
     await expect($('[aria-label="Queue waiting"]').$("button=Resume")).toBeEnabled();

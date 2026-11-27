@@ -30,7 +30,9 @@ export function ResumeBar({
       className="mx-auto flex w-full max-w-3xl items-center gap-3 border-t border-border px-6 py-3 text-sm"
     >
       <p className="min-w-0 flex-1">
-        {interrupted ? `The app closed while the agent was working. ${waiting}` : waiting}
+        {interrupted
+          ? `The app closed while the agent was working. ${waiting} Send a message or press Resume to continue.`
+          : waiting}
         {resume.isError && (
           <span className="ml-2 text-red-600">{asAgentError(resume.error).message}</span>
         )}
