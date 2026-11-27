@@ -65,7 +65,23 @@ it. The value never reaches the UI, logs, errors, the database or Debug output.
 - Milestones live on GitHub (M0 Foundation ... M9). MVP is M0-M5.
 - Work is tracked as GitHub issues in a milestone. Use the `issue` skill to break a milestone down.
 - One issue per branch: `<issue-number>-<short-slug>`, from `main`.
-- Finish an issue with the `ship-issue` skill.
+- Plan an issue with `plan-issue`, review it with `review-branch`, land it with `ship-issue`.
+
+## Skills
+
+A task that repeats and must be done the same way every time becomes a project skill in
+`.claude/skills/<name>/SKILL.md`. When a procedure comes up a second time, write or update its skill
+instead of repeating it from memory, and add it to this table. Use the skill whenever its task comes
+up.
+
+| Skill | Use it to |
+| --- | --- |
+| `spec` | write a behaviour spec in `docs/specs/` |
+| `issue` | break a milestone or spec into GitHub issues |
+| `plan-issue` | write an issue's plan in `.claude/plans/` and hand it to the implementer |
+| `review-branch` | have a pushed branch reviewed from git objects |
+| `check-app` | run the real app with temp data, screenshot it, stop it by PID |
+| `ship-issue` | verify, commit, push, open and merge the pull request |
 
 ## Safety defaults (product rules)
 
