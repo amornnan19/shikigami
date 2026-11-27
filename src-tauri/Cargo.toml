@@ -19,7 +19,7 @@ tauri-plugin-opener = "=2.7.3"
 tauri-plugin-wdio-webdriver = { version = "=1.5.1", optional = true }
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
 refinery = { version = "=0.10.0", features = ["rusqlite"] }
-uuid = { version = "=1.29.3", features = ["v7"] }
+uuid = { version = "=1.29.3", features = ["v4", "v7"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 thiserror = "=2.0.21"
 libc = "=0.2.191"

@@ -5,6 +5,7 @@ import { AgentSidebar } from "@/features/agents/AgentSidebar";
 import { AgentView } from "@/features/agents/AgentView";
 import { listAgents } from "@/features/agents/api";
 import { NewAgentDialog } from "@/features/agents/NewAgentDialog";
+import { useTurnEvents } from "@/features/chat/useConversation";
 import { ProvidersSection } from "@/features/providers/ProvidersSection";
 
 type AppStatus = { status: "ok" } | { status: "error"; message: string; data_dir: string };
@@ -24,6 +25,7 @@ function ErrorScreen({ message, dataDir }: { message: string; dataDir: string })
 }
 
 function Workspace() {
+  useTurnEvents();
   const agents = useQuery({ queryKey: ["agents"], queryFn: listAgents, retry: false });
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
@@ -39,7 +41,7 @@ function Workspace() {
         onNew={() => setDialogOpen(true)}
       />
       {selected ? (
-        <AgentView agent={selected} />
+        <AgentView key={selected.id} agent={selected} />
       ) : (
         <main className="flex flex-1 flex-col items-center justify-center gap-6 overflow-y-auto p-6">
           <div className="flex flex-col items-center gap-2">
