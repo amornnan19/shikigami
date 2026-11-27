@@ -11,31 +11,37 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Switch } from "@/components/ui/switch";
 import {
   type ApiKeyError,
   type ApiKeyStatus,
   asApiKeyError,
-  type ProviderStatus,
+  CLAUDE_AUTH_KEY,
+  type ClaudeAuth,
   removeApiKey,
   saveApiKey,
-  setApiKeyEnabled,
 } from "./api";
 
-function useProviderCache(provider: string) {
+function useAuthCache() {
   const queryClient = useQueryClient();
   return {
     show: (apiKey: ApiKeyStatus) =>
-      queryClient.setQueryData<ProviderStatus[]>(["providers"], (old) =>
-        old?.map((entry) => (entry.id === provider ? { ...entry, apiKey } : entry)),
+      queryClient.setQueryData<ClaudeAuth>(CLAUDE_AUTH_KEY, (old) =>
+        old ? { ...old, apiKey } : old,
       ),
-    refresh: () => queryClient.invalidateQueries({ queryKey: ["providers"] }),
+    refresh: () => queryClient.invalidateQueries({ queryKey: CLAUDE_AUTH_KEY }),
   };
 }
 
-function AddApiKey({ provider }: { provider: string }) {
-  const providers = useProviderCache(provider);
-  const [open, setOpen] = useState(false);
+function AddApiKey({
+  provider,
+  open,
+  setOpen,
+}: {
+  provider: string;
+  open: boolean;
+  setOpen: (open: boolean) => void;
+}) {
+  const providers = useAuthCache();
   const [key, setKey] = useState("");
   const [error, setError] = useState<ApiKeyError | null>(null);
 
@@ -112,7 +118,7 @@ function AddApiKey({ provider }: { provider: string }) {
 }
 
 function RemoveApiKey({ provider }: { provider: string }) {
-  const providers = useProviderCache(provider);
+  const providers = useAuthCache();
   const [open, setOpen] = useState(false);
   const [error, setError] = useState<ApiKeyError | null>(null);
 
@@ -141,7 +147,8 @@ function RemoveApiKey({ provider }: { provider: string }) {
           <DialogHeader>
             <DialogTitle>Remove API key</DialogTitle>
             <DialogDescription>
-              Remove the saved API key? Claude Code agents will use the CLI sign-in.
+              Remove the saved API key? Agents that sign in with an API key will fail until you add
+              one or switch them to your Claude subscription.
             </DialogDescription>
           </DialogHeader>
           {error && (
@@ -169,39 +176,10 @@ function savedLabel(status: ApiKeyStatus) {
 }
 
 function SavedApiKey({ provider, status }: { provider: string; status: ApiKeyStatus }) {
-  const providers = useProviderCache(provider);
-  const [error, setError] = useState<ApiKeyError | null>(null);
-
-  const toggle = useMutation({
-    mutationFn: (enabled: boolean) => setApiKeyEnabled(provider, enabled),
-    onSuccess: (status) => {
-      setError(null);
-      providers.show(status);
-    },
-    onError: (failure) => setError(asApiKeyError(failure)),
-    onSettled: () => providers.refresh(),
-  });
-
   return (
-    <div className="flex flex-col gap-2">
+    <div className="flex items-center gap-3">
       <span>{savedLabel(status)}</span>
-      <div className="flex items-center gap-3">
-        <div className="flex items-center gap-2">
-          <Switch
-            id="api-key-enabled"
-            checked={status.enabled}
-            disabled={toggle.isPending}
-            onCheckedChange={(enabled) => toggle.mutate(enabled)}
-          />
-          <Label htmlFor="api-key-enabled">Use API key</Label>
-        </div>
-        <RemoveApiKey provider={provider} />
-      </div>
-      {error && (
-        <p role="alert" className="text-sm text-red-600">
-          {error.message}
-        </p>
-      )}
+      <RemoveApiKey provider={provider} />
     </div>
   );
 }
@@ -209,19 +187,20 @@ function SavedApiKey({ provider, status }: { provider: string; status: ApiKeySta
 export function ApiKeyBlock({
   provider,
   status,
+  adding,
+  setAdding,
 }: {
   provider: string;
-  status: ApiKeyStatus | null;
+  status: ApiKeyStatus;
+  adding: boolean;
+  setAdding: (adding: boolean) => void;
 }) {
   return (
     <section aria-label="API key" className="flex flex-col gap-2 text-sm">
-      {status === null && (
-        <span className="text-muted-foreground">Could not read the API key status.</span>
+      {!status.saved && !status.readFailed && (
+        <AddApiKey provider={provider} open={adding} setOpen={setAdding} />
       )}
-      {status && !status.saved && !status.readFailed && <AddApiKey provider={provider} />}
-      {status && (status.saved || status.readFailed) && (
-        <SavedApiKey provider={provider} status={status} />
-      )}
+      {(status.saved || status.readFailed) && <SavedApiKey provider={provider} status={status} />}
     </section>
   );
 }

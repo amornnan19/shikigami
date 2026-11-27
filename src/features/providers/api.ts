@@ -2,10 +2,16 @@ import { invoke } from "@tauri-apps/api/core";
 
 export type SignedIn = "yes" | "no" | "unknown";
 
+export type AuthMode = "subscription" | "api-key";
+
+export const AUTH_MODE_LABELS: Record<AuthMode, string> = {
+  subscription: "Subscription",
+  "api-key": "API key",
+};
+
 export interface ApiKeyStatus {
   saved: boolean;
   lastFour: string | null;
-  enabled: boolean;
   readFailed: boolean;
 }
 
@@ -14,20 +20,27 @@ export interface ApiKeyError {
   message: string;
 }
 
-export interface ProviderStatus {
-  id: string;
-  name: string;
-  installed: boolean;
-  path: string | null;
-  version: string | null;
-  signedIn: SignedIn;
-  installHint: string;
-  signInHint: string;
-  apiKey: ApiKeyStatus | null;
+export interface ClaudeAuth {
+  appMode: AuthMode;
+  appModeExplicit: boolean;
+  subscription: {
+    installed: boolean;
+    version: string | null;
+    signedIn: SignedIn;
+    signInHint: string;
+    installHint: string;
+  };
+  apiKey: ApiKeyStatus;
 }
 
-export function listProviders() {
-  return invoke<ProviderStatus[]>("list_providers");
+export const CLAUDE_AUTH_KEY = ["claude-auth"];
+
+export function getClaudeAuth() {
+  return invoke<ClaudeAuth>("get_claude_auth");
+}
+
+export function setClaudeAuthMode(mode: AuthMode) {
+  return invoke<void>("set_claude_auth_mode", { mode });
 }
 
 export function asApiKeyError(error: unknown): ApiKeyError {
@@ -48,8 +61,4 @@ export function saveApiKey(provider: string, key: string) {
 
 export function removeApiKey(provider: string) {
   return invoke<ApiKeyStatus>("remove_api_key", { provider });
-}
-
-export function setApiKeyEnabled(provider: string, enabled: boolean) {
-  return invoke<ApiKeyStatus>("set_api_key_enabled", { provider, enabled });
 }

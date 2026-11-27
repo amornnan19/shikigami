@@ -1,5 +1,6 @@
 mod agents;
 pub mod api_key;
+mod auth;
 mod commands;
 pub mod db;
 mod providers;
@@ -87,14 +88,15 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::app_status,
-            providers::list_providers,
+            auth::get_claude_auth,
+            auth::set_claude_auth_mode,
             api_key::api_key_status,
             api_key::save_api_key,
             api_key::remove_api_key,
-            api_key::set_api_key_enabled,
             agents::list_agents,
             agents::create_agent,
             agents::recreate_workspace,
+            agents::set_agent_auth_mode,
             turns::send_message,
             turns::get_conversation,
             turns::stop_turn,

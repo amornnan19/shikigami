@@ -2,12 +2,10 @@ mod claude_code;
 mod probe;
 mod search;
 
-use crate::api_key::{self, ApiKeyStatus};
 use probe::ProbeOutput;
 use serde::Serialize;
 use std::path::PathBuf;
 use std::time::Duration;
-use tauri::AppHandle;
 
 pub const CLAUDE_CODE_ID: &str = claude_code::SPEC.id;
 
@@ -32,7 +30,6 @@ pub struct ProviderStatus {
     pub signed_in: SignedIn,
     pub install_hint: &'static str,
     pub sign_in_hint: &'static str,
-    pub api_key: Option<ApiKeyStatus>,
 }
 
 pub struct ProviderSpec {
@@ -57,7 +54,6 @@ async fn detect(spec: &ProviderSpec, dirs: &[PathBuf], limit: Duration) -> Provi
         signed_in: SignedIn::Unknown,
         install_hint: spec.install_hint,
         sign_in_hint: spec.sign_in_hint,
-        api_key: None,
     };
     let Some(path) = search::find_executable(spec.executable, dirs) else {
         return status;
@@ -92,8 +88,8 @@ fn parse_version(line: &str, prefix: &str) -> Option<[u32; 3]> {
     Some([next()?, next()?, next()?])
 }
 
-async fn detect_all(dirs: &[PathBuf], limit: Duration) -> Vec<ProviderStatus> {
-    vec![detect(&claude_code::SPEC, dirs, limit).await]
+pub async fn claude_status(dirs: &[PathBuf]) -> ProviderStatus {
+    detect(&claude_code::SPEC, dirs, PROBE_TIMEOUT).await
 }
 
 pub fn is_known(id: &str) -> bool {
@@ -120,22 +116,6 @@ pub fn executable_path(id: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
 
 pub fn search_dirs() -> Vec<PathBuf> {
     search::search_dirs()
-}
-
-#[tauri::command]
-pub async fn list_providers(app: AppHandle) -> Result<Vec<ProviderStatus>, String> {
-    let dirs = tauri::async_runtime::spawn_blocking(search::search_dirs)
-        .await
-        .map_err(|error| error.to_string())?;
-    let mut all = detect_all(&dirs, PROBE_TIMEOUT).await;
-    let claude_api_key =
-        tauri::async_runtime::spawn_blocking(move || api_key::claude_code_status(&app).ok())
-            .await
-            .map_err(|error| error.to_string())?;
-    for status in all.iter_mut().filter(|status| status.id == CLAUDE_CODE_ID) {
-        status.api_key = claude_api_key.clone();
-    }
-    Ok(all)
 }
 
 #[cfg(test)]
@@ -170,15 +150,12 @@ esac"#;
     #[tokio::test]
     async fn missing_executable_is_not_installed() {
         let dir = tempfile::tempdir().unwrap();
-        let all = detect_all(&dirs(&dir), LIMIT).await;
-        assert_eq!(all.len(), 1);
-        for status in all {
-            assert!(!status.installed);
-            assert_eq!(status.path, None);
-            assert_eq!(status.version, None);
-            assert_eq!(status.signed_in, SignedIn::Unknown);
-            assert!(status.install_hint.starts_with("https://"));
-        }
+        let status = detect(&claude_code::SPEC, &dirs(&dir), LIMIT).await;
+        assert!(!status.installed);
+        assert_eq!(status.path, None);
+        assert_eq!(status.version, None);
+        assert_eq!(status.signed_in, SignedIn::Unknown);
+        assert!(status.install_hint.starts_with("https://"));
     }
 
     #[tokio::test]

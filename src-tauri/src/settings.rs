@@ -16,8 +16,3 @@ pub fn set(connection: &Connection, key: &str, value: &str) -> rusqlite::Result<
     )?;
     Ok(())
 }
-
-pub fn delete(connection: &Connection, key: &str) -> rusqlite::Result<()> {
-    connection.execute("DELETE FROM settings WHERE key = ?1", [key])?;
-    Ok(())
-}

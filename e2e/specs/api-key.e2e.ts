@@ -2,20 +2,26 @@ import { join } from "node:path";
 import { $, browser, expect } from "@wdio/globals";
 
 const artifacts = join(import.meta.dirname, "..", "artifacts");
-const claudeRow = 'section[aria-label="Providers"] li:nth-child(1)';
-const apiKeyBlock = `${claudeRow} section[aria-label="API key"]`;
+const claudeCard = 'section[aria-label="Claude"]';
+const apiKeyBlock = `${claudeCard} section[aria-label="API key"]`;
 const fakeKey = "sk-ant-test-00000000wxyz";
 
 describe("api key", () => {
   it("starts with Add API key", async () => {
     await expect($(apiKeyBlock)).toBeExisting();
     await expect($(apiKeyBlock)).toHaveText(expect.stringContaining("Add API key"));
-    await expect($(claudeRow)).not.toHaveText(expect.stringContaining("API key saved"));
+    await expect($(claudeCard)).not.toHaveText(expect.stringContaining("API key saved"));
+  });
+
+  it("opens the add form when API key is chosen with no key saved", async () => {
+    await $("#auth-mode-api-key").click();
+    await expect($("#auth-mode-api-key")).toHaveAttribute("aria-checked", "true");
+    await expect($("#api-key-input")).toBeDisplayed();
+    await expect($("#api-key-input")).toHaveAttribute("type", "password");
+    await browser.saveScreenshot(join(artifacts, "api-key-form-opened.png"));
   });
 
   it("refuses a key with the wrong shape under the field", async () => {
-    await $("button=Add API key").click();
-    await expect($("#api-key-input")).toHaveAttribute("type", "password");
     await $("#api-key-input").setValue("not-an-anthropic-key");
     await $("button=Save").click();
     await expect($("#api-key-error")).toHaveText(expect.stringContaining("sk-ant-"));
@@ -30,38 +36,29 @@ describe("api key", () => {
     await $("#api-key-input").setValue(fakeKey);
     await $("button=Save").click();
     await expect($(apiKeyBlock)).toHaveText(expect.stringContaining("API key saved (…wxyz)"));
-    await expect($(claudeRow)).toHaveText(expect.stringContaining("Ready (API key)"));
-    await expect($("#api-key-enabled")).toHaveAttribute("aria-checked", "true");
     await expect($("#api-key-input")).not.toBeExisting();
+    await expect($("#auth-mode-api-key")).toHaveAttribute("aria-checked", "true");
     const page = await $("body").getText();
     expect(page).not.toContain(fakeKey);
     await browser.saveScreenshot(join(artifacts, "api-key-saved.png"));
   });
 
-  it("falls back to the CLI sign-in when the switch is off", async () => {
-    await $("#api-key-enabled").click();
-    await expect($("#api-key-enabled")).toHaveAttribute("aria-checked", "false");
-    await expect($(claudeRow)).not.toHaveText(expect.stringContaining("Ready (API key)"));
-    await expect($(claudeRow)).toHaveText(expect.stringContaining("Ready"));
+  it("keeps the saved key when the subscription is chosen", async () => {
+    await $("#auth-mode-subscription").click();
+    await expect($("#auth-mode-subscription")).toHaveAttribute("aria-checked", "true");
     await expect($(apiKeyBlock)).toHaveText(expect.stringContaining("API key saved (…wxyz)"));
-    await browser.saveScreenshot(join(artifacts, "api-key-off.png"));
-  });
-
-  it("uses the key again when the switch is on", async () => {
-    await $("#api-key-enabled").click();
-    await expect($(claudeRow)).toHaveText(expect.stringContaining("Ready (API key)"));
+    await browser.saveScreenshot(join(artifacts, "api-key-subscription-chosen.png"));
   });
 
   it("removes the key after a confirmation", async () => {
     await $(apiKeyBlock).$("button=Remove").click();
     await expect($('[role="dialog"]')).toHaveText(
-      expect.stringContaining("Claude Code agents will use the CLI sign-in."),
+      expect.stringContaining("switch them to your Claude subscription"),
     );
     await browser.saveScreenshot(join(artifacts, "api-key-remove-confirm.png"));
     await $('[role="dialog"]').$("button=Remove").click();
     await expect($(apiKeyBlock)).toHaveText(expect.stringContaining("Add API key"));
-    await expect($(claudeRow)).not.toHaveText(expect.stringContaining("Ready (API key)"));
-    await expect($(claudeRow)).toHaveText(expect.stringContaining("Ready"));
+    await expect($("#auth-mode-subscription")).toHaveAttribute("aria-checked", "true");
     await browser.saveScreenshot(join(artifacts, "api-key-removed.png"));
   });
 });

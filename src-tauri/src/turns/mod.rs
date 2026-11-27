@@ -15,8 +15,10 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::agents::now_millis;
 use crate::api_key;
+use crate::auth;
 use crate::db::Database;
 use crate::providers::{self, CLAUDE_CODE_ID};
+use crate::secrets::{SecretStore, SharedStore};
 use store::{BeginError, ConversationPage, QueuedMessage, Sent, StepView};
 
 pub const EVENT_NAME: &str = "turn-event";
@@ -451,6 +453,15 @@ fn prepare(
     }
 }
 
+fn key_for_agent(db: &Database, store: &dyn SecretStore, agent_id: &str) -> runner::ApiKey {
+    match auth::mode_for_agent(db, store, agent_id) {
+        Ok(mode) => {
+            runner::ApiKey::from_read(mode, api_key::key_for_turn(store, mode, CLAUDE_CODE_ID))
+        }
+        Err(_) => runner::ApiKey::Unresolved,
+    }
+}
+
 fn start_next(
     db: &Database,
     registry: &TurnRegistry,
@@ -528,14 +539,18 @@ pub fn sweep_interrupted(db: &Database) -> Result<usize, String> {
 
 async fn drive_one(app: &AppHandle, launch: Launch) -> bool {
     let key_app = app.clone();
+    let key_agent = launch.agent_id.clone();
     let key = tauri::async_runtime::spawn_blocking(move || {
-        api_key::api_key_for_turn(&key_app, CLAUDE_CODE_ID)
+        let (Some(db), Some(store)) = (
+            key_app.try_state::<Database>(),
+            key_app.try_state::<SharedStore>(),
+        ) else {
+            return runner::ApiKey::Unresolved;
+        };
+        key_for_agent(&db, &**store, &key_agent)
     })
-    .await;
-    let key = match key {
-        Ok(read) => runner::ApiKey::from_read(read),
-        Err(_) => runner::ApiKey::Unreadable,
-    };
+    .await
+    .unwrap_or(runner::ApiKey::Unreadable);
     let (Some(db), Some(registry)) = (app.try_state::<Database>(), app.try_state::<TurnRegistry>())
     else {
         return false;
@@ -725,6 +740,8 @@ pub async fn get_conversation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::AuthMode;
+    use crate::secrets::{MemoryStore, SecretError, SecretString};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
@@ -1289,5 +1306,104 @@ mod tests {
         assert_eq!(error.code, "shutting-down");
         assert_eq!(fx.queued(), [("two".into(), 0)]);
         assert_eq!(fx.turns(), 1);
+    }
+
+    struct NeverTouched;
+
+    impl SecretStore for NeverTouched {
+        fn exists(&self, _: &str) -> Result<bool, SecretError> {
+            panic!("the Keychain was touched");
+        }
+        fn get(&self, _: &str) -> Result<Option<SecretString>, SecretError> {
+            panic!("the Keychain was touched");
+        }
+        fn set(&self, _: &str, _: &SecretString) -> Result<(), SecretError> {
+            panic!("the Keychain was touched");
+        }
+        fn delete(&self, _: &str) -> Result<(), SecretError> {
+            panic!("the Keychain was touched");
+        }
+    }
+
+    fn store_with_key() -> MemoryStore {
+        let store = MemoryStore::default();
+        store
+            .set("anthropic-api-key", &SecretString::new("sk-ant-saved-0000"))
+            .unwrap();
+        store
+    }
+
+    fn choose(fx: &Fixture, app: Option<AuthMode>, agent: Option<AuthMode>) {
+        if let Some(mode) = app {
+            auth::set_app_mode(&fx.db, mode).unwrap();
+        }
+        fx.db.with_connection(|c| {
+            c.execute(
+                "UPDATE agents SET auth_mode = ?1 WHERE id = 'a'",
+                [agent.map(AuthMode::as_str)],
+            )
+            .unwrap()
+        });
+    }
+
+    #[test]
+    fn a_subscription_turn_never_touches_the_keychain() {
+        let fx = Fixture::new("claude-code");
+        choose(&fx, Some(AuthMode::Subscription), None);
+        assert!(matches!(
+            key_for_agent(&fx.db, &NeverTouched, "a"),
+            runner::ApiKey::Subscription
+        ));
+        choose(&fx, Some(AuthMode::ApiKey), Some(AuthMode::Subscription));
+        assert!(matches!(
+            key_for_agent(&fx.db, &NeverTouched, "a"),
+            runner::ApiKey::Subscription
+        ));
+    }
+
+    #[test]
+    fn an_api_key_turn_gets_the_saved_key_or_is_missing_one() {
+        let fx = Fixture::new("claude-code");
+        choose(&fx, Some(AuthMode::ApiKey), None);
+        match key_for_agent(&fx.db, &store_with_key(), "a") {
+            runner::ApiKey::Present(key) => assert_eq!(key.expose(), "sk-ant-saved-0000"),
+            _ => panic!("expected the saved key"),
+        }
+        assert!(matches!(
+            key_for_agent(&fx.db, &MemoryStore::default(), "a"),
+            runner::ApiKey::Missing
+        ));
+    }
+
+    #[test]
+    fn an_agent_override_beats_the_app_default_in_both_directions() {
+        let fx = Fixture::new("claude-code");
+        choose(&fx, Some(AuthMode::Subscription), Some(AuthMode::ApiKey));
+        assert!(matches!(
+            key_for_agent(&fx.db, &store_with_key(), "a"),
+            runner::ApiKey::Present(_)
+        ));
+        assert!(matches!(
+            key_for_agent(&fx.db, &MemoryStore::default(), "a"),
+            runner::ApiKey::Missing
+        ));
+        choose(&fx, Some(AuthMode::ApiKey), Some(AuthMode::Subscription));
+        assert!(matches!(
+            key_for_agent(&fx.db, &store_with_key(), "a"),
+            runner::ApiKey::Subscription
+        ));
+    }
+
+    #[test]
+    fn with_nothing_chosen_the_key_decides() {
+        let fx = Fixture::new("claude-code");
+        assert!(matches!(
+            key_for_agent(&fx.db, &MemoryStore::default(), "a"),
+            runner::ApiKey::Subscription
+        ));
+        assert!(matches!(
+            key_for_agent(&fx.db, &store_with_key(), "a"),
+            runner::ApiKey::Present(_)
+        ));
     }
 }

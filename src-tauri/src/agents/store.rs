@@ -1,6 +1,7 @@
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 
 use super::{Agent, AgentError};
+use crate::auth::AuthMode;
 
 pub struct AgentRow {
     pub id: String,
@@ -14,6 +15,7 @@ pub struct AgentRow {
     pub has_running_turn: bool,
     pub newest_turn_status: Option<String>,
     pub newest_turn_error: Option<String>,
+    pub auth_mode: Option<String>,
 }
 
 pub fn name_exists(connection: &Connection, name: &str) -> rusqlite::Result<bool> {
@@ -27,8 +29,8 @@ pub fn name_exists(connection: &Connection, name: &str) -> rusqlite::Result<bool
 pub fn insert(connection: &Connection, agent: &Agent) -> Result<(), AgentError> {
     connection
         .execute(
-            "INSERT INTO agents (id, name, color, provider, model, workspace_path, created_at, last_activity_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO agents (id, name, color, provider, model, workspace_path, created_at, last_activity_at, auth_mode)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 agent.id,
                 agent.name,
@@ -38,6 +40,7 @@ pub fn insert(connection: &Connection, agent: &Agent) -> Result<(), AgentError> 
                 agent.workspace_path,
                 agent.created_at,
                 agent.last_activity_at,
+                agent.auth_mode.map(AuthMode::as_str),
             ],
         )
         .map(|_| ())
@@ -48,6 +51,17 @@ pub fn insert(connection: &Connection, agent: &Agent) -> Result<(), AgentError> 
                 AgentError::database(error)
             }
         })
+}
+
+pub fn set_auth_mode(
+    connection: &Connection,
+    agent_id: &str,
+    mode: Option<AuthMode>,
+) -> rusqlite::Result<usize> {
+    connection.execute(
+        "UPDATE agents SET auth_mode = ?1 WHERE id = ?2",
+        params![mode.map(AuthMode::as_str), agent_id],
+    )
 }
 
 pub fn workspace_of(
@@ -70,7 +84,8 @@ pub fn list(connection: &Connection) -> rusqlite::Result<Vec<AgentRow>> {
                 (SELECT t.status FROM turns t WHERE t.agent_id = a.id
                    ORDER BY t.started_at DESC, t.rowid DESC LIMIT 1),
                 (SELECT t.error FROM turns t WHERE t.agent_id = a.id
-                   ORDER BY t.started_at DESC, t.rowid DESC LIMIT 1)
+                   ORDER BY t.started_at DESC, t.rowid DESC LIMIT 1),
+                a.auth_mode
          FROM agents a
          ORDER BY a.last_activity_at DESC, a.created_at DESC, a.rowid DESC",
     )?;
@@ -87,6 +102,7 @@ pub fn list(connection: &Connection) -> rusqlite::Result<Vec<AgentRow>> {
             has_running_turn: row.get(8)?,
             newest_turn_status: row.get(9)?,
             newest_turn_error: row.get(10)?,
+            auth_mode: row.get(11)?,
         })
     })?;
     rows.collect()
