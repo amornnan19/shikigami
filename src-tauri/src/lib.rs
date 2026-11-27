@@ -1,7 +1,7 @@
 mod commands;
 pub mod db;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use tauri::Manager;
 
@@ -11,10 +11,30 @@ pub struct DataDir(pub PathBuf);
 
 pub struct AppStartupError(pub String);
 
-fn resolve_data_dir(app: &tauri::App) -> tauri::Result<PathBuf> {
+fn resolve_data_dir(app: &tauri::App) -> Result<PathBuf, String> {
     match std::env::var_os(DATA_DIR_ENV) {
-        Some(dir) if !dir.is_empty() => Ok(PathBuf::from(dir)),
-        _ => app.path().app_data_dir(),
+        Some(dir) if !dir.is_empty() => {
+            let path = PathBuf::from(dir);
+            if path.is_absolute() {
+                Ok(path)
+            } else {
+                Err(format!(
+                    "{DATA_DIR_ENV} must be an absolute path, but it is {}",
+                    path.display()
+                ))
+            }
+        }
+        _ => app
+            .path()
+            .app_data_dir()
+            .map_err(|error| format!("could not find the data folder: {error}")),
+    }
+}
+
+fn open_database(data_dir: &Path) -> Result<db::Database, String> {
+    match std::panic::catch_unwind(|| db::Database::open(data_dir)) {
+        Ok(result) => result.map_err(|error| error.to_string()),
+        Err(_) => Err("the database could not be read".to_string()),
     }
 }
 
@@ -29,13 +49,14 @@ pub fn run() {
     let builder = builder.plugin(tauri_plugin_wdio_webdriver::init());
     builder
         .setup(|app| {
-            let data_dir = resolve_data_dir(app)?;
-            match db::Database::open(&data_dir) {
+            let resolved = resolve_data_dir(app);
+            let data_dir = resolved.clone().unwrap_or_default();
+            match resolved.and_then(|dir| open_database(&dir)) {
                 Ok(database) => {
                     app.manage(database);
                 }
-                Err(error) => {
-                    app.manage(AppStartupError(error.to_string()));
+                Err(message) => {
+                    app.manage(AppStartupError(message));
                 }
             }
             app.manage(DataDir(data_dir));

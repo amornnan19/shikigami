@@ -40,6 +40,13 @@ Libraries and tools (reasons in `docs/decisions/0001-stack.md`):
 - Check a dependency's license before adding it. Permissive licenses (MIT, Apache-2.0, BSD, ISC)
   are fine.
 
+## Database
+
+Migrations run as one grouped refinery run with `PRAGMA foreign_keys = OFF`. `Database::open` turns
+foreign keys on only after the run and a clean `PRAGMA foreign_key_check`. SQLite ignores
+`foreign_keys` inside a transaction, so a table rebuild with foreign keys on would cascade-delete
+every child row. Never edit a migration that has been merged; add a new one.
+
 ## Planning
 
 - Milestones live on GitHub (M0 Foundation ... M9). MVP is M0-M5.

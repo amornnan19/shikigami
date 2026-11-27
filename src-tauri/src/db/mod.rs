@@ -4,6 +4,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::Mutex;
 
+use refinery::Runner;
 use rusqlite::Connection;
 
 pub use error::DbError;
@@ -18,6 +19,35 @@ pub struct Database {
     connection: Mutex<Connection>,
 }
 
+fn configure(connection: &Connection) -> Result<(), DbError> {
+    connection
+        .execute_batch(
+            "PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = OFF;",
+        )
+        .map_err(DbError::Pragma)
+}
+
+fn migrate(connection: &mut Connection, runner: Runner) -> Result<(), DbError> {
+    runner.set_grouped(true).run(connection)?;
+    let violations = foreign_key_violations(connection).map_err(DbError::Pragma)?;
+    if violations > 0 {
+        return Err(DbError::ForeignKeyViolations(violations));
+    }
+    connection
+        .execute_batch("PRAGMA foreign_keys = ON;")
+        .map_err(DbError::Pragma)
+}
+
+fn foreign_key_violations(connection: &Connection) -> rusqlite::Result<usize> {
+    let mut statement = connection.prepare("PRAGMA foreign_key_check")?;
+    let mut rows = statement.query([])?;
+    let mut count = 0;
+    while rows.next()?.is_some() {
+        count += 1;
+    }
+    Ok(count)
+}
+
 impl Database {
     pub fn open(data_dir: &Path) -> Result<Self, DbError> {
         fs::create_dir_all(data_dir).map_err(|source| DbError::CreateDir {
@@ -29,12 +59,8 @@ impl Database {
             path: path.clone(),
             source,
         })?;
-        connection
-            .execute_batch(
-                "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;",
-            )
-            .map_err(DbError::Pragma)?;
-        embedded::migrations::runner().run(&mut connection)?;
+        configure(&connection)?;
+        migrate(&mut connection, embedded::migrations::runner())?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -115,7 +141,23 @@ mod tests {
                 [],
             )
         });
-        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::ConstraintViolation)
+        );
+        assert!(error.to_string().contains("FOREIGN KEY"), "{error}");
+    }
+
+    #[test]
+    fn journal_mode_is_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        let mode: String = db.with_connection(|c| {
+            c.query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .unwrap()
+        });
+        assert_eq!(mode, "wal");
     }
 
     #[test]
@@ -157,7 +199,7 @@ mod tests {
             )
             .unwrap(),
         ];
-        let result = refinery::Runner::new(&migrations).run(&mut connection);
+        let result = migrate(&mut connection, Runner::new(&migrations));
         assert!(result.is_err());
         let version: u32 = connection
             .query_row(
@@ -175,5 +217,77 @@ mod tests {
             )
             .unwrap();
         assert_eq!(probe_tables, 0);
+    }
+
+    #[test]
+    fn a_failing_migration_rolls_back_every_pending_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut connection = Connection::open(dir.path().join(DATABASE_FILE)).unwrap();
+        let migrations = [
+            refinery::Migration::unapplied(
+                "V1__initial",
+                include_str!("../../migrations/V1__initial.sql"),
+            )
+            .unwrap(),
+            refinery::Migration::unapplied("V2__broken", "INSERT INTO missing_table VALUES (1);")
+                .unwrap(),
+        ];
+        assert!(migrate(&mut connection, Runner::new(&migrations)).is_err());
+        let tables: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'agents'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 0);
+    }
+
+    #[test]
+    fn rebuilding_a_parent_table_keeps_its_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        seed_agent_tree(&db);
+        drop(db);
+        let mut connection = Connection::open(dir.path().join(DATABASE_FILE)).unwrap();
+        configure(&connection).unwrap();
+        let migrations = [
+            refinery::Migration::unapplied(
+                "V1__initial",
+                include_str!("../../migrations/V1__initial.sql"),
+            )
+            .unwrap(),
+            refinery::Migration::unapplied(
+                "V2__rebuild_agents",
+                "CREATE TABLE agents_new (
+                   id TEXT PRIMARY KEY,
+                   name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                   color TEXT NOT NULL,
+                   provider TEXT NOT NULL CHECK (provider IN ('claude-code', 'codex')),
+                   model TEXT NOT NULL,
+                   workspace_path TEXT NOT NULL,
+                   provider_session_id TEXT,
+                   created_at INTEGER NOT NULL,
+                   last_activity_at INTEGER NOT NULL
+                 );
+                 INSERT INTO agents_new SELECT * FROM agents;
+                 DROP TABLE agents;
+                 ALTER TABLE agents_new RENAME TO agents;",
+            )
+            .unwrap(),
+        ];
+        migrate(&mut connection, Runner::new(&migrations)).unwrap();
+        let db = Database {
+            connection: Mutex::new(connection),
+        };
+        assert_eq!(schema_version(&db), 2);
+        for table in ["agents", "turns", "messages", "steps", "queued_messages"] {
+            assert_eq!(count(&db, table), 1, "{table}");
+        }
+        let foreign_keys: i64 = db.with_connection(|c| {
+            c.query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+                .unwrap()
+        });
+        assert_eq!(foreign_keys, 1);
     }
 }
