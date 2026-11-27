@@ -3,10 +3,14 @@ mod codex;
 mod probe;
 mod search;
 
+use crate::api_key::{self, ApiKeyStatus};
 use probe::ProbeOutput;
 use serde::Serialize;
 use std::path::PathBuf;
 use std::time::Duration;
+use tauri::AppHandle;
+
+pub const CLAUDE_CODE_ID: &str = claude_code::SPEC.id;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -29,6 +33,7 @@ pub struct ProviderStatus {
     pub signed_in: SignedIn,
     pub install_hint: &'static str,
     pub sign_in_hint: &'static str,
+    pub api_key: Option<ApiKeyStatus>,
 }
 
 pub struct ProviderSpec {
@@ -53,6 +58,7 @@ async fn detect(spec: &ProviderSpec, dirs: &[PathBuf], limit: Duration) -> Provi
         signed_in: SignedIn::Unknown,
         install_hint: spec.install_hint,
         sign_in_hint: spec.sign_in_hint,
+        api_key: None,
     };
     let Some(path) = search::find_executable(spec.executable, dirs) else {
         return status;
@@ -111,11 +117,19 @@ pub fn search_dirs() -> Vec<PathBuf> {
 }
 
 #[tauri::command]
-pub async fn list_providers() -> Result<Vec<ProviderStatus>, String> {
+pub async fn list_providers(app: AppHandle) -> Result<Vec<ProviderStatus>, String> {
     let dirs = tauri::async_runtime::spawn_blocking(search::search_dirs)
         .await
         .map_err(|error| error.to_string())?;
-    Ok(detect_all(&dirs, PROBE_TIMEOUT).await)
+    let mut all = detect_all(&dirs, PROBE_TIMEOUT).await;
+    let claude_api_key =
+        tauri::async_runtime::spawn_blocking(move || api_key::claude_code_status(&app).ok())
+            .await
+            .map_err(|error| error.to_string())?;
+    for status in all.iter_mut().filter(|status| status.id == CLAUDE_CODE_ID) {
+        status.api_key = claude_api_key.clone();
+    }
+    Ok(all)
 }
 
 #[cfg(test)]

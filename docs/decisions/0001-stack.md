@@ -72,6 +72,16 @@ The desktop shell (Tauri 2), the UI framework (React with TypeScript, Vite) and 
   - Its license is MIT, checked when it was added (#8). It works on macOS. If it stops working, the
     fallback is to test the UI in a browser with mocked backend calls, plus Rust integration tests.
 
+### Secret storage: keyring, with the macOS Keychain
+
+- Options: `keyring` 3 with the Keychain; a key file in the data folder; a key column in SQLite.
+- Chosen: `keyring` 3.6.3 (`apple-native`), service `com.amornnan.shikigami`.
+- Why: the API key must never be in the database or in a file, and the OS Keychain keeps it
+  encrypted. The crate is MIT or Apache-2.0. Version 4 exists, but it is a different API; the
+  plan for #28 names version 3.
+- Test builds can use an in-memory store (`e2e` feature and `SHIKIGAMI_SECRET_STORE=memory`) so
+  tests never touch the real Keychain. The store is compiled out of every other build.
+
 ## Licenses
 
 | Dependency | License |
@@ -99,6 +109,8 @@ The desktop shell (Tauri 2), the UI framework (React with TypeScript, Vite) and 
 | `@tauri-apps/plugin-opener` and `tauri-plugin-opener` (open the install page in the default browser) | MIT or Apache-2.0 |
 | `tempfile` (Rust tests only) | MIT or Apache-2.0 |
 | `@radix-ui/react-dialog`, `@radix-ui/react-select`, `@radix-ui/react-label`, `@radix-ui/react-radio-group` (shadcn/ui dialog, select, label and colour picker for the new agent form) | MIT |
+| `keyring` 3.6.3 with its macOS native backend (saves the API key in the macOS Keychain), and its dependencies `security-framework` and `zeroize` | MIT or Apache-2.0 |
+| `@radix-ui/react-switch` (shadcn/ui switch for the "Use API key" setting) | MIT |
 
 All listed licenses are permissive and compatible with PolyForm Noncommercial 1.0.0. Their notices
 go into the shipped app's third-party notices (M5).
