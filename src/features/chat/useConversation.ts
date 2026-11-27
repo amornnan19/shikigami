@@ -1,9 +1,10 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useState } from "react";
-import { type Conversation, getConversation, onTurnEvent } from "./api";
+import { type Conversation, getConversation, listQueue, onQueueChanged, onTurnEvent } from "./api";
 import { applyEvent, mergeNewest, prependOlder } from "./conversation";
 
 const key = (agentId: string) => ["conversation", agentId];
+const queueKey = (agentId: string) => ["queue", agentId];
 
 export function useTurnEvents() {
   const client = useQueryClient();
@@ -21,6 +22,18 @@ export function useTurnEvents() {
       void stop.then((unlisten) => unlisten());
     };
   }, [client]);
+  useEffect(() => {
+    const stop = onQueueChanged((agentId) => {
+      void client.invalidateQueries({ queryKey: queueKey(agentId) });
+    });
+    return () => {
+      void stop.then((unlisten) => unlisten());
+    };
+  }, [client]);
+}
+
+export function useQueue(agentId: string) {
+  return useQuery({ queryKey: queueKey(agentId), queryFn: () => listQueue(agentId), retry: false });
 }
 
 export function useConversation(agentId: string) {

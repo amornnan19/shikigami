@@ -52,8 +52,37 @@ export function getConversation(agentId: string, beforeTurnId?: string) {
   return invoke<Conversation>("get_conversation", { agentId, beforeTurnId });
 }
 
+export interface QueuedMessage {
+  id: string;
+  text: string;
+  position: number;
+  createdAt: number;
+}
+
+export type SendResult = { kind: "started"; turnId: string } | { kind: "queued"; queuedId: string };
+
 export function sendMessage(agentId: string, text: string) {
-  return invoke<{ turnId: string }>("send_message", { agentId, text });
+  return invoke<SendResult>("send_message", { agentId, text });
+}
+
+export function stopTurn(agentId: string) {
+  return invoke<void>("stop_turn", { agentId });
+}
+
+export function listQueue(agentId: string) {
+  return invoke<QueuedMessage[]>("list_queue", { agentId });
+}
+
+export function editQueued(queuedId: string, text: string) {
+  return invoke<QueuedMessage>("edit_queued", { queuedId, text });
+}
+
+export function removeQueued(queuedId: string) {
+  return invoke<void>("remove_queued", { queuedId });
+}
+
+export function onQueueChanged(handler: (agentId: string) => void) {
+  return listen<{ agentId: string }>("queue-changed", (event) => handler(event.payload.agentId));
 }
 
 export function onTurnEvent(handler: (event: TurnEvent) => void) {

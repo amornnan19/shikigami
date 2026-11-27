@@ -47,6 +47,13 @@ case "$1" in
     esac
     message=$(cat)
     case "$message" in
+      *SLOW*)
+        head -n 4 "$dir/claude-stream-basic.jsonl"
+        nums=$(seq -s ' ' 1 60)
+        printf '{"type":"stream_event","api_message_id":"m1","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Counting slowly. %s"}}}\\n' "$nums"
+        sleep 7
+        tail -n +5 "$dir/claude-stream-basic.jsonl"
+        exit 0 ;;
       *files*) fixture="$dir/claude-stream-denied.jsonl" ;;
       *) fixture="$dir/claude-stream-basic.jsonl" ;;
     esac

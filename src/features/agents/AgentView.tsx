@@ -1,11 +1,13 @@
 import { Composer } from "@/features/chat/Composer";
+import { QueueList } from "@/features/chat/QueueList";
 import { Transcript } from "@/features/chat/Transcript";
-import { useConversation } from "@/features/chat/useConversation";
+import { useConversation, useQueue } from "@/features/chat/useConversation";
 import { AgentAvatar } from "./AgentAvatar";
 import type { Agent } from "./api";
 
 export function AgentView({ agent }: { agent: Agent }) {
   const { query, loadOlder, loadingOlder } = useConversation(agent.id);
+  const queue = useQueue(agent.id);
   const turns = query.data?.turns ?? [];
   const running = agent.state === "working" || turns.at(-1)?.status === "running";
 
@@ -28,6 +30,7 @@ export function AgentView({ agent }: { agent: Agent }) {
         loaded={query.isSuccess}
         onLoadOlder={loadOlder}
       />
+      <QueueList agentId={agent.id} messages={queue.data ?? []} />
       <Composer agentId={agent.id} running={running} />
     </section>
   );

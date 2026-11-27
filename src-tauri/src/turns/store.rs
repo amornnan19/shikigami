@@ -85,6 +85,26 @@ pub fn agent(connection: &Connection, agent_id: &str) -> rusqlite::Result<Option
         .optional()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueuedMessage {
+    pub id: String,
+    pub text: String,
+    pub position: i64,
+    pub created_at: i64,
+}
+
+pub enum Sent {
+    Started(Begun),
+    Queued(QueuedMessage),
+}
+
+pub struct Advanced {
+    pub begun: Begun,
+    pub text: String,
+}
+
+#[cfg(test)]
 pub fn begin_turn(
     connection: &Connection,
     agent_id: &str,
@@ -92,7 +112,34 @@ pub fn begin_turn(
     now: i64,
 ) -> Result<Begun, BeginError> {
     let transaction = connection.unchecked_transaction()?;
-    let agent = agent(&transaction, agent_id)?.ok_or(BeginError::NotFound)?;
+    let begun = begin_in(&transaction, agent_id, text, now)?;
+    transaction.commit()?;
+    Ok(begun)
+}
+
+pub fn begin_or_queue(
+    connection: &Connection,
+    agent_id: &str,
+    text: &str,
+    now: i64,
+) -> Result<Sent, BeginError> {
+    let transaction = connection.unchecked_transaction()?;
+    let sent = match begin_in(&transaction, agent_id, text, now) {
+        Ok(begun) => Sent::Started(begun),
+        Err(BeginError::Busy) => Sent::Queued(enqueue(&transaction, agent_id, text, now)?),
+        Err(error) => return Err(error),
+    };
+    transaction.commit()?;
+    Ok(sent)
+}
+
+fn begin_in(
+    transaction: &Connection,
+    agent_id: &str,
+    text: &str,
+    now: i64,
+) -> Result<Begun, BeginError> {
+    let agent = agent(transaction, agent_id)?.ok_or(BeginError::NotFound)?;
     let running: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM turns WHERE agent_id = ?1 AND status = 'running')",
         [agent_id],
@@ -132,12 +179,115 @@ pub fn begin_turn(
         "UPDATE agents SET last_activity_at = ?2 WHERE id = ?1",
         params![agent_id, now],
     )?;
-    transaction.commit()?;
     Ok(Begun {
         turn_id,
         agent,
         session,
     })
+}
+
+fn enqueue(
+    connection: &Connection,
+    agent_id: &str,
+    text: &str,
+    now: i64,
+) -> rusqlite::Result<QueuedMessage> {
+    let id = uuid::Uuid::now_v7().to_string();
+    let position: i64 = connection.query_row(
+        "SELECT COALESCE(MAX(position) + 1, 0) FROM queued_messages WHERE agent_id = ?1",
+        [agent_id],
+        |row| row.get(0),
+    )?;
+    connection.execute(
+        "INSERT INTO queued_messages (id, agent_id, content, position, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![id, agent_id, text, position, now],
+    )?;
+    Ok(QueuedMessage {
+        id,
+        text: text.to_owned(),
+        position,
+        created_at: now,
+    })
+}
+
+pub fn list_queue(connection: &Connection, agent_id: &str) -> rusqlite::Result<Vec<QueuedMessage>> {
+    let mut statement = connection.prepare(
+        "SELECT id, content, position, created_at FROM queued_messages
+         WHERE agent_id = ?1 ORDER BY position",
+    )?;
+    let rows = statement.query_map([agent_id], |row| {
+        Ok(QueuedMessage {
+            id: row.get(0)?,
+            text: row.get(1)?,
+            position: row.get(2)?,
+            created_at: row.get(3)?,
+        })
+    })?;
+    rows.collect()
+}
+
+pub fn edit_queued(
+    connection: &Connection,
+    queued_id: &str,
+    text: &str,
+) -> rusqlite::Result<Option<(String, QueuedMessage)>> {
+    connection
+        .query_row(
+            "UPDATE queued_messages SET content = ?2 WHERE id = ?1
+             RETURNING agent_id, id, content, position, created_at",
+            params![queued_id, text],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    QueuedMessage {
+                        id: row.get(1)?,
+                        text: row.get(2)?,
+                        position: row.get(3)?,
+                        created_at: row.get(4)?,
+                    },
+                ))
+            },
+        )
+        .optional()
+}
+
+pub fn remove_queued(connection: &Connection, queued_id: &str) -> rusqlite::Result<Option<String>> {
+    connection
+        .query_row(
+            "DELETE FROM queued_messages WHERE id = ?1 RETURNING agent_id",
+            [queued_id],
+            |row| row.get(0),
+        )
+        .optional()
+}
+
+pub fn advance_queue(
+    connection: &Connection,
+    agent_id: &str,
+    now: i64,
+) -> Result<Option<Advanced>, BeginError> {
+    let transaction = connection.unchecked_transaction()?;
+    let next: Option<(String, String)> = transaction
+        .query_row(
+            "SELECT id, content FROM queued_messages WHERE agent_id = ?1
+             ORDER BY position LIMIT 1",
+            [agent_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((queued_id, text)) = next else {
+        return Ok(None);
+    };
+    transaction.execute("DELETE FROM queued_messages WHERE id = ?1", [queued_id])?;
+    match begin_in(&transaction, agent_id, &text, now) {
+        Ok(begun) => {
+            transaction.commit()?;
+            Ok(Some(Advanced { begun, text }))
+        }
+        Err(BeginError::Busy) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 pub fn set_session(
