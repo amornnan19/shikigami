@@ -1,7 +1,10 @@
 mod validate;
 
+use std::sync::Mutex;
+
 use serde::Serialize;
 use tauri::{AppHandle, Manager};
+use zeroize::Zeroize;
 
 use crate::db::Database;
 use crate::providers::CLAUDE_CODE_ID;
@@ -64,6 +67,34 @@ pub struct ApiKeyStatus {
     pub saved: bool,
     pub last_four: Option<String>,
     pub enabled: bool,
+    pub read_failed: bool,
+}
+
+impl ApiKeyStatus {
+    fn absent() -> Self {
+        Self {
+            saved: false,
+            last_four: None,
+            enabled: false,
+            read_failed: false,
+        }
+    }
+}
+
+struct CachedStatus {
+    saved: bool,
+    last_four: Option<String>,
+}
+
+#[derive(Default)]
+pub struct StatusCache(Mutex<Option<CachedStatus>>);
+
+impl StatusCache {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<CachedStatus>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 fn supported(provider: &str) -> Result<(), ApiKeyError> {
@@ -75,10 +106,9 @@ fn supported(provider: &str) -> Result<(), ApiKeyError> {
 }
 
 fn last_four(key: &SecretString) -> String {
-    let chars: Vec<char> = key.expose().chars().collect();
-    chars[chars.len().saturating_sub(LAST_FOUR)..]
-        .iter()
-        .collect()
+    let mut tail: Vec<char> = key.expose().chars().rev().take(LAST_FOUR).collect();
+    tail.reverse();
+    tail.into_iter().collect()
 }
 
 fn switch_is_on(db: &Database) -> Result<bool, ApiKeyError> {
@@ -88,69 +118,103 @@ fn switch_is_on(db: &Database) -> Result<bool, ApiKeyError> {
     Ok(value.as_deref() != Some("false"))
 }
 
-fn status_of(db: &Database, store: &dyn SecretStore) -> Result<ApiKeyStatus, ApiKeyError> {
-    let Some(key) = store.get(ACCOUNT)? else {
+fn write_switch(db: &Database, enabled: bool) -> Result<(), ApiKeyError> {
+    let value = if enabled { "true" } else { "false" };
+    db.with_connection(|connection| settings::set(connection, ENABLED_SETTING, value))
+        .map_err(ApiKeyError::database)
+}
+
+fn status_of(
+    db: &Database,
+    store: &dyn SecretStore,
+    cache: &StatusCache,
+) -> Result<ApiKeyStatus, ApiKeyError> {
+    let enabled = switch_is_on(db)?;
+    let Ok(exists) = store.exists(ACCOUNT) else {
         return Ok(ApiKeyStatus {
-            saved: false,
-            last_four: None,
-            enabled: false,
+            enabled,
+            read_failed: true,
+            ..ApiKeyStatus::absent()
         });
     };
+    let mut cached = cache.lock();
+    let last_four = cached
+        .as_ref()
+        .filter(|entry| entry.saved && exists)
+        .and_then(|entry| entry.last_four.clone());
+    *cached = Some(CachedStatus {
+        saved: exists,
+        last_four: last_four.clone(),
+    });
+    if !exists {
+        return Ok(ApiKeyStatus::absent());
+    }
     Ok(ApiKeyStatus {
         saved: true,
-        last_four: Some(last_four(&key)),
-        enabled: switch_is_on(db)?,
+        last_four,
+        enabled,
+        read_failed: false,
     })
 }
 
 pub fn status(
     db: &Database,
     store: &dyn SecretStore,
+    cache: &StatusCache,
     provider: &str,
 ) -> Result<ApiKeyStatus, ApiKeyError> {
     supported(provider)?;
-    status_of(db, store)
+    status_of(db, store, cache)
 }
 
 pub fn save(
     db: &Database,
     store: &dyn SecretStore,
+    cache: &StatusCache,
     provider: &str,
     key: &str,
 ) -> Result<ApiKeyStatus, ApiKeyError> {
     supported(provider)?;
     let key = validate::key(key)?;
-    db.with_connection(|connection| settings::set(connection, ENABLED_SETTING, "true"))
-        .map_err(ApiKeyError::database)?;
     store.set(ACCOUNT, &key)?;
-    status_of(db, store)
+    let last_four = last_four(&key);
+    *cache.lock() = Some(CachedStatus {
+        saved: true,
+        last_four: Some(last_four.clone()),
+    });
+    write_switch(db, true)?;
+    Ok(ApiKeyStatus {
+        saved: true,
+        last_four: Some(last_four),
+        enabled: true,
+        read_failed: false,
+    })
 }
 
 pub fn remove(
     db: &Database,
     store: &dyn SecretStore,
+    cache: &StatusCache,
     provider: &str,
 ) -> Result<ApiKeyStatus, ApiKeyError> {
     supported(provider)?;
     store.delete(ACCOUNT)?;
+    *cache.lock() = None;
     db.with_connection(|connection| settings::delete(connection, ENABLED_SETTING))
         .map_err(ApiKeyError::database)?;
-    status_of(db, store)
+    Ok(ApiKeyStatus::absent())
 }
 
 pub fn set_enabled(
     db: &Database,
     store: &dyn SecretStore,
+    cache: &StatusCache,
     provider: &str,
     enabled: bool,
 ) -> Result<ApiKeyStatus, ApiKeyError> {
     supported(provider)?;
-    if store.get(ACCOUNT)?.is_some() {
-        let value = if enabled { "true" } else { "false" };
-        db.with_connection(|connection| settings::set(connection, ENABLED_SETTING, value))
-            .map_err(ApiKeyError::database)?;
-    }
-    status_of(db, store)
+    write_switch(db, enabled)?;
+    status_of(db, store, cache)
 }
 
 pub fn key_for_turn(
@@ -158,45 +222,51 @@ pub fn key_for_turn(
     store: &dyn SecretStore,
     provider: &str,
 ) -> Result<Option<SecretString>, ApiKeyError> {
-    supported(provider)?;
-    match store.get(ACCOUNT)? {
-        Some(key) if switch_is_on(db)? => Ok(Some(key)),
-        _ => Ok(None),
+    if provider != CLAUDE_CODE_ID || !switch_is_on(db)? || !store.exists(ACCOUNT)? {
+        return Ok(None);
     }
+    Ok(store.get(ACCOUNT)?)
 }
 
 pub fn api_key_for_turn(
     app: &AppHandle,
     provider: &str,
 ) -> Result<Option<SecretString>, ApiKeyError> {
-    let (db, store) = state(app)?;
+    let (db, store, _) = state(app)?;
     key_for_turn(&db, &**store, provider)
 }
 
 pub fn claude_code_status(app: &AppHandle) -> Result<ApiKeyStatus, ApiKeyError> {
-    let (db, store) = state(app)?;
-    status_of(&db, &**store)
+    let (db, store, cache) = state(app)?;
+    status_of(&db, &**store, &cache)
 }
 
-fn state(
-    app: &AppHandle,
-) -> Result<(tauri::State<'_, Database>, tauri::State<'_, SharedStore>), ApiKeyError> {
-    let db = app
-        .try_state::<Database>()
-        .ok_or_else(ApiKeyError::unavailable)?;
-    let store = app
-        .try_state::<SharedStore>()
-        .ok_or_else(ApiKeyError::unavailable)?;
-    Ok((db, store))
+type State<'a> = (
+    tauri::State<'a, Database>,
+    tauri::State<'a, SharedStore>,
+    tauri::State<'a, StatusCache>,
+);
+
+fn state(app: &AppHandle) -> Result<State<'_>, ApiKeyError> {
+    Ok((
+        app.try_state::<Database>()
+            .ok_or_else(ApiKeyError::unavailable)?,
+        app.try_state::<SharedStore>()
+            .ok_or_else(ApiKeyError::unavailable)?,
+        app.try_state::<StatusCache>()
+            .ok_or_else(ApiKeyError::unavailable)?,
+    ))
 }
 
 async fn blocking<T: Send + 'static>(
     app: AppHandle,
-    work: impl FnOnce(&Database, &dyn SecretStore) -> Result<T, ApiKeyError> + Send + 'static,
+    work: impl FnOnce(&Database, &dyn SecretStore, &StatusCache) -> Result<T, ApiKeyError>
+        + Send
+        + 'static,
 ) -> Result<T, ApiKeyError> {
     tauri::async_runtime::spawn_blocking(move || {
-        let (db, store) = state(&app)?;
-        work(&db, &**store)
+        let (db, store, cache) = state(&app)?;
+        work(&db, &**store, &cache)
     })
     .await
     .map_err(ApiKeyError::database)?
@@ -204,21 +274,32 @@ async fn blocking<T: Send + 'static>(
 
 #[tauri::command]
 pub async fn api_key_status(app: AppHandle, provider: String) -> Result<ApiKeyStatus, ApiKeyError> {
-    blocking(app, move |db, store| status(db, store, &provider)).await
+    blocking(app, move |db, store, cache| {
+        status(db, store, cache, &provider)
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn save_api_key(
     app: AppHandle,
     provider: String,
-    key: String,
+    mut key: String,
 ) -> Result<ApiKeyStatus, ApiKeyError> {
-    blocking(app, move |db, store| save(db, store, &provider, &key)).await
+    blocking(app, move |db, store, cache| {
+        let result = save(db, store, cache, &provider, &key);
+        key.zeroize();
+        result
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn remove_api_key(app: AppHandle, provider: String) -> Result<ApiKeyStatus, ApiKeyError> {
-    blocking(app, move |db, store| remove(db, store, &provider)).await
+    blocking(app, move |db, store, cache| {
+        remove(db, store, cache, &provider)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -227,8 +308,8 @@ pub async fn set_api_key_enabled(
     provider: String,
     enabled: bool,
 ) -> Result<ApiKeyStatus, ApiKeyError> {
-    blocking(app, move |db, store| {
-        set_enabled(db, store, &provider, enabled)
+    blocking(app, move |db, store, cache| {
+        set_enabled(db, store, cache, &provider, enabled)
     })
     .await
 }
@@ -245,6 +326,7 @@ mod tests {
         _dir: tempfile::TempDir,
         db: Database,
         store: MemoryStore,
+        cache: StatusCache,
     }
 
     fn fixture() -> Fixture {
@@ -254,16 +336,25 @@ mod tests {
             _dir: dir,
             db,
             store: MemoryStore::default(),
+            cache: StatusCache::default(),
         }
     }
 
     impl Fixture {
         fn save(&self) -> ApiKeyStatus {
-            save(&self.db, &self.store, PROVIDER, KEY).unwrap()
+            save(&self.db, &self.store, &self.cache, PROVIDER, KEY).unwrap()
         }
 
         fn status(&self) -> ApiKeyStatus {
-            status(&self.db, &self.store, PROVIDER).unwrap()
+            status(&self.db, &self.store, &self.cache, PROVIDER).unwrap()
+        }
+
+        fn set_enabled(&self, enabled: bool) -> ApiKeyStatus {
+            set_enabled(&self.db, &self.store, &self.cache, PROVIDER, enabled).unwrap()
+        }
+
+        fn remove(&self) -> ApiKeyStatus {
+            remove(&self.db, &self.store, &self.cache, PROVIDER).unwrap()
         }
 
         fn setting(&self) -> Option<String> {
@@ -307,142 +398,46 @@ mod tests {
         }
     }
 
-    #[test]
-    fn status_without_a_key_is_empty() {
-        let fx = fixture();
-        assert_eq!(
-            fx.status(),
-            ApiKeyStatus {
-                saved: false,
-                last_four: None,
-                enabled: false
-            }
-        );
-    }
+    struct NeverDecrypts(MemoryStore);
 
-    #[test]
-    fn save_stores_the_trimmed_key_and_reports_the_last_four() {
-        let fx = fixture();
-        let status = save(&fx.db, &fx.store, PROVIDER, &format!("  {KEY}\n")).unwrap();
-        assert_eq!(
-            status,
-            ApiKeyStatus {
-                saved: true,
-                last_four: Some("0000".to_string()),
-                enabled: true
-            }
-        );
-        assert_eq!(fx.store.get(ACCOUNT).unwrap().unwrap().expose(), KEY);
-        assert_eq!(fx.setting().as_deref(), Some("true"));
-    }
-
-    #[test]
-    fn the_last_four_are_the_real_last_four() {
-        let fx = fixture();
-        let status = save(&fx.db, &fx.store, PROVIDER, "sk-ant-test-00000000abcd").unwrap();
-        assert_eq!(status.last_four.as_deref(), Some("abcd"));
-    }
-
-    #[test]
-    fn the_database_never_holds_the_key() {
-        let fx = fixture();
-        fx.save();
-        set_enabled(&fx.db, &fx.store, PROVIDER, false).unwrap();
-        assert_eq!(fx.text_columns_containing("sk-ant"), 0);
-        assert_eq!(fx.text_columns_containing("claude-code.use-api-key"), 1);
-    }
-
-    #[test]
-    fn no_command_result_contains_the_key() {
-        let fx = fixture();
-        let results = [
-            serde_json::to_string(&fx.save()).unwrap(),
-            serde_json::to_string(&fx.status()).unwrap(),
-            serde_json::to_string(&set_enabled(&fx.db, &fx.store, PROVIDER, false).unwrap())
-                .unwrap(),
-            serde_json::to_string(&remove(&fx.db, &fx.store, PROVIDER).unwrap()).unwrap(),
-            serde_json::to_string(&save(&fx.db, &fx.store, PROVIDER, "sk-ant bad").unwrap_err())
-                .unwrap(),
-        ];
-        for json in results {
-            assert!(!json.contains("sk-ant-test"), "{json}");
+    impl SecretStore for NeverDecrypts {
+        fn exists(&self, account: &str) -> Result<bool, SecretError> {
+            self.0.exists(account)
+        }
+        fn get(&self, _: &str) -> Result<Option<SecretString>, SecretError> {
+            panic!("the key was decrypted");
+        }
+        fn set(&self, account: &str, value: &SecretString) -> Result<(), SecretError> {
+            self.0.set(account, value)
+        }
+        fn delete(&self, account: &str) -> Result<(), SecretError> {
+            self.0.delete(account)
         }
     }
 
-    #[test]
-    fn a_bad_key_is_refused_and_nothing_is_saved() {
-        let fx = fixture();
-        let error = save(&fx.db, &fx.store, PROVIDER, "sk-ant bad").unwrap_err();
-        assert_eq!(error.code, "key-invalid");
-        assert_eq!(fx.store.get(ACCOUNT).unwrap(), None);
-        assert_eq!(fx.setting(), None);
+    struct NeverTouched;
+
+    impl SecretStore for NeverTouched {
+        fn exists(&self, _: &str) -> Result<bool, SecretError> {
+            panic!("the Keychain was touched");
+        }
+        fn get(&self, _: &str) -> Result<Option<SecretString>, SecretError> {
+            panic!("the Keychain was touched");
+        }
+        fn set(&self, _: &str, _: &SecretString) -> Result<(), SecretError> {
+            panic!("the Keychain was touched");
+        }
+        fn delete(&self, _: &str) -> Result<(), SecretError> {
+            panic!("the Keychain was touched");
+        }
     }
 
-    #[test]
-    fn toggling_off_and_on_controls_the_key_for_a_turn() {
-        let fx = fixture();
-        fx.save();
-        let off = set_enabled(&fx.db, &fx.store, PROVIDER, false).unwrap();
-        assert!(off.saved && !off.enabled);
-        assert_eq!(key_for_turn(&fx.db, &fx.store, PROVIDER).unwrap(), None);
-        let on = set_enabled(&fx.db, &fx.store, PROVIDER, true).unwrap();
-        assert!(on.enabled);
-        let key = key_for_turn(&fx.db, &fx.store, PROVIDER).unwrap().unwrap();
-        assert_eq!(key.expose(), KEY);
-    }
+    struct Broken;
 
-    #[test]
-    fn saving_again_turns_the_switch_back_on() {
-        let fx = fixture();
-        fx.save();
-        set_enabled(&fx.db, &fx.store, PROVIDER, false).unwrap();
-        assert!(fx.save().enabled);
-    }
-
-    #[test]
-    fn no_key_means_none_for_a_turn() {
-        let fx = fixture();
-        assert_eq!(key_for_turn(&fx.db, &fx.store, PROVIDER).unwrap(), None);
-    }
-
-    #[test]
-    fn toggling_without_a_key_changes_nothing() {
-        let fx = fixture();
-        let status = set_enabled(&fx.db, &fx.store, PROVIDER, true).unwrap();
-        assert!(!status.saved && !status.enabled);
-        assert_eq!(fx.setting(), None);
-    }
-
-    #[test]
-    fn remove_deletes_the_item_and_the_setting_and_is_repeatable() {
-        let fx = fixture();
-        fx.save();
-        let status = remove(&fx.db, &fx.store, PROVIDER).unwrap();
-        assert!(!status.saved);
-        assert_eq!(fx.store.get(ACCOUNT).unwrap(), None);
-        assert_eq!(fx.setting(), None);
-        assert!(!remove(&fx.db, &fx.store, PROVIDER).unwrap().saved);
-    }
-
-    #[test]
-    fn other_providers_are_unsupported_by_every_command() {
-        let fx = fixture();
-        let codes = [
-            status(&fx.db, &fx.store, "codex").unwrap_err().code,
-            save(&fx.db, &fx.store, "codex", KEY).unwrap_err().code,
-            remove(&fx.db, &fx.store, "codex").unwrap_err().code,
-            set_enabled(&fx.db, &fx.store, "codex", true)
-                .unwrap_err()
-                .code,
-            key_for_turn(&fx.db, &fx.store, "codex").unwrap_err().code,
-        ];
-        assert!(codes.iter().all(|code| *code == "unsupported"));
-        assert_eq!(fx.store.get(ACCOUNT).unwrap(), None);
-    }
-
-    struct FailingStore;
-
-    impl SecretStore for FailingStore {
+    impl SecretStore for Broken {
+        fn exists(&self, _: &str) -> Result<bool, SecretError> {
+            Err(SecretError::Read)
+        }
         fn get(&self, _: &str) -> Result<Option<SecretString>, SecretError> {
             Err(SecretError::Read)
         }
@@ -455,14 +450,243 @@ mod tests {
     }
 
     #[test]
+    fn status_without_a_key_is_empty() {
+        let fx = fixture();
+        assert_eq!(fx.status(), ApiKeyStatus::absent());
+    }
+
+    #[test]
+    fn save_stores_the_trimmed_key_and_reports_the_last_four() {
+        let fx = fixture();
+        let status = save(
+            &fx.db,
+            &fx.store,
+            &fx.cache,
+            PROVIDER,
+            &format!("  {KEY}\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            status,
+            ApiKeyStatus {
+                saved: true,
+                last_four: Some("0000".to_string()),
+                enabled: true,
+                read_failed: false
+            }
+        );
+        assert_eq!(fx.store.get(ACCOUNT).unwrap().unwrap().expose(), KEY);
+        assert_eq!(fx.setting().as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn the_last_four_are_the_real_last_four() {
+        let fx = fixture();
+        let status = save(
+            &fx.db,
+            &fx.store,
+            &fx.cache,
+            PROVIDER,
+            "sk-ant-test-00000000abcd",
+        )
+        .unwrap();
+        assert_eq!(status.last_four.as_deref(), Some("abcd"));
+        assert_eq!(fx.status().last_four.as_deref(), Some("abcd"));
+        assert_eq!(last_four(&SecretString::new("ab")), "ab");
+        assert_eq!(last_four(&SecretString::new("abcde")), "bcde");
+    }
+
+    #[test]
+    fn the_database_never_holds_the_key() {
+        let fx = fixture();
+        fx.save();
+        fx.set_enabled(false);
+        assert_eq!(fx.text_columns_containing("sk-ant"), 0);
+        assert_eq!(fx.text_columns_containing("claude-code.use-api-key"), 1);
+    }
+
+    #[test]
+    fn no_command_result_contains_the_key() {
+        let fx = fixture();
+        let results = [
+            serde_json::to_string(&fx.save()).unwrap(),
+            serde_json::to_string(&fx.status()).unwrap(),
+            serde_json::to_string(&fx.set_enabled(false)).unwrap(),
+            serde_json::to_string(&fx.remove()).unwrap(),
+            serde_json::to_string(
+                &save(&fx.db, &fx.store, &fx.cache, PROVIDER, "sk-ant bad").unwrap_err(),
+            )
+            .unwrap(),
+        ];
+        for json in results {
+            assert!(!json.contains("sk-ant-test"), "{json}");
+        }
+    }
+
+    #[test]
+    fn a_bad_key_is_refused_and_nothing_is_saved() {
+        let fx = fixture();
+        let error = save(&fx.db, &fx.store, &fx.cache, PROVIDER, "sk-ant bad").unwrap_err();
+        assert_eq!(error.code, "key-invalid");
+        assert_eq!(fx.store.get(ACCOUNT).unwrap(), None);
+        assert_eq!(fx.setting(), None);
+    }
+
+    #[test]
+    fn toggling_off_and_on_controls_the_key_for_a_turn() {
+        let fx = fixture();
+        fx.save();
+        let off = fx.set_enabled(false);
+        assert!(off.saved && !off.enabled);
+        assert_eq!(key_for_turn(&fx.db, &fx.store, PROVIDER).unwrap(), None);
+        assert!(fx.set_enabled(true).enabled);
+        let key = key_for_turn(&fx.db, &fx.store, PROVIDER).unwrap().unwrap();
+        assert_eq!(key.expose(), KEY);
+    }
+
+    #[test]
+    fn saving_again_turns_the_switch_back_on() {
+        let fx = fixture();
+        fx.save();
+        fx.set_enabled(false);
+        assert!(fx.save().enabled);
+    }
+
+    #[test]
+    fn no_key_means_none_for_a_turn() {
+        let fx = fixture();
+        assert_eq!(key_for_turn(&fx.db, &fx.store, PROVIDER).unwrap(), None);
+    }
+
+    #[test]
+    fn a_turn_with_the_switch_off_does_not_touch_the_keychain() {
+        let fx = fixture();
+        fx.save();
+        fx.set_enabled(false);
+        assert_eq!(key_for_turn(&fx.db, &NeverTouched, PROVIDER).unwrap(), None);
+    }
+
+    #[test]
+    fn a_turn_without_an_item_does_not_decrypt() {
+        let fx = fixture();
+        let store = NeverDecrypts(MemoryStore::default());
+        assert_eq!(key_for_turn(&fx.db, &store, PROVIDER).unwrap(), None);
+    }
+
+    #[test]
+    fn another_provider_gets_no_key_and_no_error() {
+        let fx = fixture();
+        fx.save();
+        assert_eq!(key_for_turn(&fx.db, &NeverTouched, "codex").unwrap(), None);
+    }
+
+    #[test]
+    fn a_turn_reports_a_failed_keychain_read() {
+        let fx = fixture();
+        let error = key_for_turn(&fx.db, &Broken, PROVIDER).unwrap_err();
+        assert_eq!(error.code, "keychain-failed");
+    }
+
+    #[test]
+    fn status_and_toggle_never_decrypt() {
+        let fx = fixture();
+        fx.save();
+        let store = NeverDecrypts(MemoryStore::default());
+        store.set(ACCOUNT, &SecretString::new(KEY)).unwrap();
+        let cold = StatusCache::default();
+        let first = status(&fx.db, &store, &cold, PROVIDER).unwrap();
+        assert_eq!(
+            first,
+            ApiKeyStatus {
+                saved: true,
+                last_four: None,
+                enabled: true,
+                read_failed: false
+            }
+        );
+        let off = set_enabled(&fx.db, &store, &cold, PROVIDER, false).unwrap();
+        assert!(off.saved && !off.enabled);
+        assert!(status(&fx.db, &store, &cold, PROVIDER).unwrap().saved);
+    }
+
+    #[test]
+    fn the_cache_keeps_the_last_four_after_a_save_and_clears_on_remove() {
+        let fx = fixture();
+        let store = NeverDecrypts(MemoryStore::default());
+        save(&fx.db, &store, &fx.cache, PROVIDER, KEY).unwrap();
+        let again = status(&fx.db, &store, &fx.cache, PROVIDER).unwrap();
+        assert_eq!(again.last_four.as_deref(), Some("0000"));
+        remove(&fx.db, &store, &fx.cache, PROVIDER).unwrap();
+        assert_eq!(
+            status(&fx.db, &store, &fx.cache, PROVIDER).unwrap(),
+            ApiKeyStatus::absent()
+        );
+        store.0.set(ACCOUNT, &SecretString::new(KEY)).unwrap();
+        let after = status(&fx.db, &store, &fx.cache, PROVIDER).unwrap();
+        assert!(after.saved);
+        assert_eq!(after.last_four, None);
+    }
+
+    #[test]
+    fn a_failed_keychain_read_does_not_trap_the_user() {
+        let fx = fixture();
+        fx.db
+            .with_connection(|c| settings::set(c, ENABLED_SETTING, "true"))
+            .unwrap();
+        let shown = status(&fx.db, &Broken, &fx.cache, PROVIDER).unwrap();
+        assert!(shown.read_failed && shown.enabled);
+        let off = set_enabled(&fx.db, &Broken, &fx.cache, PROVIDER, false).unwrap();
+        assert!(off.read_failed && !off.enabled);
+        assert_eq!(fx.setting().as_deref(), Some("false"));
+    }
+
+    #[test]
+    fn remove_needs_no_decrypt_and_is_repeatable() {
+        let fx = fixture();
+        let store = NeverDecrypts(MemoryStore::default());
+        save(&fx.db, &store, &fx.cache, PROVIDER, KEY).unwrap();
+        assert_eq!(
+            remove(&fx.db, &store, &fx.cache, PROVIDER).unwrap(),
+            ApiKeyStatus::absent()
+        );
+        assert!(!store.0.exists(ACCOUNT).unwrap());
+        assert_eq!(fx.setting(), None);
+        assert!(!remove(&fx.db, &store, &fx.cache, PROVIDER).unwrap().saved);
+    }
+
+    #[test]
+    fn save_writes_the_keychain_before_the_setting() {
+        let fx = fixture();
+        let error = save(&fx.db, &Broken, &fx.cache, PROVIDER, KEY).unwrap_err();
+        assert_eq!(error.code, "keychain-failed");
+        assert_eq!(fx.setting(), None);
+    }
+
+    #[test]
+    fn other_providers_are_unsupported_by_every_command() {
+        let fx = fixture();
+        let codes = [
+            status(&fx.db, &fx.store, &fx.cache, "codex")
+                .unwrap_err()
+                .code,
+            save(&fx.db, &fx.store, &fx.cache, "codex", KEY)
+                .unwrap_err()
+                .code,
+            remove(&fx.db, &fx.store, &fx.cache, "codex")
+                .unwrap_err()
+                .code,
+            set_enabled(&fx.db, &fx.store, &fx.cache, "codex", true)
+                .unwrap_err()
+                .code,
+        ];
+        assert!(codes.iter().all(|code| *code == "unsupported"));
+        assert_eq!(fx.store.get(ACCOUNT).unwrap(), None);
+    }
+
+    #[test]
     fn keychain_failures_are_generic() {
         let fx = fixture();
-        let error = save(&fx.db, &FailingStore, PROVIDER, KEY).unwrap_err();
-        assert_eq!(error.code, "keychain-failed");
+        let error = save(&fx.db, &Broken, &fx.cache, PROVIDER, KEY).unwrap_err();
         assert_eq!(error.message, "could not save the API key in the Keychain");
-        assert_eq!(
-            status(&fx.db, &FailingStore, PROVIDER).unwrap_err().code,
-            "keychain-failed"
-        );
     }
 }

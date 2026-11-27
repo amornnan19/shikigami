@@ -66,6 +66,7 @@ pub fn run() {
                 }
             }
             app.manage(secrets::select_store());
+            app.manage(api_key::StatusCache::default());
             app.manage(agents::WorkspacesRoot(agents::resolve_workspaces_root(
                 app.path().home_dir().ok(),
             )));

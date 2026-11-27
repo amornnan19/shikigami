@@ -4,13 +4,15 @@ mod memory;
 
 use std::fmt;
 
+use zeroize::Zeroize;
+
 pub use keychain::KeychainStore;
 #[cfg(any(test, feature = "e2e"))]
 pub use memory::MemoryStore;
 
 pub const KEYCHAIN_SERVICE: &str = "com.amornnan.shikigami";
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct SecretString(String);
 
 impl SecretString {
@@ -20,6 +22,12 @@ impl SecretString {
 
     pub fn expose(&self) -> &str {
         &self.0
+    }
+}
+
+impl Drop for SecretString {
+    fn drop(&mut self) {
+        self.0.zeroize();
     }
 }
 
@@ -40,6 +48,7 @@ pub enum SecretError {
 }
 
 pub trait SecretStore: Send + Sync {
+    fn exists(&self, account: &str) -> Result<bool, SecretError>;
     fn get(&self, account: &str) -> Result<Option<SecretString>, SecretError>;
     fn set(&self, account: &str, value: &SecretString) -> Result<(), SecretError>;
     fn delete(&self, account: &str) -> Result<(), SecretError>;
@@ -49,7 +58,7 @@ pub type SharedStore = Box<dyn SecretStore>;
 
 pub fn select_store() -> SharedStore {
     #[cfg(feature = "e2e")]
-    if std::env::var("SHIKIGAMI_SECRET_STORE").as_deref() == Ok("memory") {
+    if std::env::var("SHIKIGAMI_SECRET_STORE").as_deref() != Ok("keychain") {
         return Box::new(MemoryStore::default());
     }
     Box::new(KeychainStore)
@@ -70,9 +79,11 @@ mod tests {
     fn memory_store_round_trips_and_deletes_missing_items() {
         let store = MemoryStore::default();
         assert_eq!(store.get("a").unwrap(), None);
+        assert!(!store.exists("a").unwrap());
         store.delete("a").unwrap();
         store.set("a", &SecretString::new("one")).unwrap();
         store.set("a", &SecretString::new("two")).unwrap();
+        assert!(store.exists("a").unwrap());
         assert_eq!(store.get("a").unwrap().unwrap().expose(), "two");
         store.delete("a").unwrap();
         assert_eq!(store.get("a").unwrap(), None);
