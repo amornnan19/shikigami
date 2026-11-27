@@ -26,6 +26,7 @@ const TEXT_WRITE_INTERVAL: Duration = Duration::from_millis(500);
 const EXIT_GRACE: Duration = Duration::from_secs(5);
 const STDERR_GRACE: Duration = Duration::from_secs(2);
 const SESSION_MISSING: &str = "No conversation found";
+const STALL_MESSAGE: &str = "No response from the provider for 5 minutes.";
 
 const RESUME_NOTICE: &str =
     "Started a new Claude Code session. The agent may have lost earlier context.";
@@ -462,7 +463,19 @@ impl Runner<'_> {
         let mut reader = BufReader::new(stdout);
         let mut buffer = Vec::new();
         loop {
-            match read_line(&mut reader, &mut buffer).await {
+            let read = match timeout(launch.stall_timeout, read_line(&mut reader, &mut buffer))
+                .await
+            {
+                Ok(read) => read,
+                Err(_) => {
+                    attempt.failure = Some(STALL_MESSAGE.to_owned());
+                    if let Some(group) = self.registry.terminate(&self.agent_id, &self.turn_id) {
+                        tokio::spawn(kill_group_after(group, EXIT_TERM_GRACE));
+                    }
+                    break;
+                }
+            };
+            match read {
                 Ok(Line::Text(line)) => {
                     for parsed in parser.line(&line) {
                         self.handle(parsed, &mut attempt);
@@ -600,6 +613,7 @@ async fn run_turn(
 
 #[cfg(test)]
 mod tests {
+    use super::super::STALL_TIMEOUT;
     use super::*;
     use crate::api_key::key_for_turn;
     use crate::secrets::{SecretError, SecretStore};
@@ -720,6 +734,7 @@ mod tests {
                 text: text.to_owned(),
                 started_at: now_millis(),
                 environment: self.environment.lock().unwrap().clone(),
+                stall_timeout: STALL_TIMEOUT,
             }
         }
 
@@ -1624,5 +1639,149 @@ mod tests {
             Some("Could not read the saved API key.")
         );
         assert!(!has_record(&world, "args.0"));
+    }
+
+    const SHORT_STALL: Duration = Duration::from_millis(600);
+
+    async fn run_with_stall(world: &World, stall: Duration) -> bool {
+        let mut launch = world.launch("go");
+        launch.stall_timeout = stall;
+        assert!(world.registry.begin("a", &launch.turn_id));
+        timeout(
+            Duration::from_secs(15),
+            run(
+                &world.db,
+                &world.sink,
+                &world.registry,
+                launch,
+                ApiKey::Absent,
+            ),
+        )
+        .await
+        .expect("a stalled turn must end")
+    }
+
+    #[tokio::test]
+    async fn a_turn_with_no_output_for_the_stall_timeout_fails_and_its_group_is_killed() {
+        let world = World::new();
+        let pid_file = world.records().join("shell.pid");
+        install_streaming_then(
+            &world,
+            &format!("echo $$ > \"{}\"", pid_file.display()),
+            "sleep 60",
+        );
+        let started = Instant::now();
+        let advance = run_with_stall(&world, SHORT_STALL).await;
+        assert!(started.elapsed() < Duration::from_secs(8));
+        assert!(advance);
+        let turn = only_turn(&world);
+        assert_eq!(turn.status, "failed");
+        assert_eq!(
+            turn.error.as_deref(),
+            Some("No response from the provider for 5 minutes.")
+        );
+        let steps: Vec<_> = turn
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ItemView::Step(step) => Some(step.status.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(steps, ["stopped"]);
+        assert!(turn.items.iter().any(
+            |item| matches!(item, ItemView::Text { text, .. } if text.starts_with("partial"))
+        ));
+        let pid: i32 = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_ne!(unsafe { libc::killpg(pid, 0) }, 0);
+        assert!(world.registry.slots().is_empty());
+        assert_eq!(world.sink.kinds().last().map(String::as_str), Some("ended"));
+    }
+
+    #[tokio::test]
+    async fn a_stalled_provider_that_ignores_the_term_signal_is_killed_after_the_grace() {
+        let world = World::new();
+        let pid_file = world.records().join("shell.pid");
+        install_streaming_then(
+            &world,
+            &format!("trap '' TERM\necho $$ > \"{}\"", pid_file.display()),
+            "while true; do sleep 1; done",
+        );
+        let started = Instant::now();
+        run_with_stall(&world, SHORT_STALL).await;
+        assert!(started.elapsed() >= SHORT_STALL + EXIT_TERM_GRACE);
+        assert_eq!(only_turn(&world).status, "failed");
+        let pid: i32 = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_ne!(unsafe { libc::killpg(pid, 0) }, 0);
+    }
+
+    #[tokio::test]
+    async fn a_provider_that_keeps_printing_within_the_timeout_is_not_stalled() {
+        let world = World::new();
+        let fixture = world.fixture("basic.jsonl", BASIC);
+        world.install(&recording(
+            &world,
+            &format!(
+                "while IFS= read -r line; do printf '%s\\n' \"$line\"; sleep 0.3; done < \"{}\"",
+                fixture.display()
+            ),
+        ));
+        let started = Instant::now();
+        run_with_stall(&world, SHORT_STALL).await;
+        assert!(started.elapsed() > SHORT_STALL);
+        let turn = only_turn(&world);
+        assert_eq!(turn.status, "completed");
+        assert_eq!(turn.error, None);
+    }
+
+    #[tokio::test]
+    async fn output_that_the_parser_ignores_still_counts_as_activity() {
+        let world = World::new();
+        let fixture = world.fixture("basic.jsonl", BASIC);
+        world.install(&recording(
+            &world,
+            &format!(
+                "for i in 1 2 3 4 5 6; do echo 'not json at all'; sleep 0.3; done\ncat \"{}\"",
+                fixture.display()
+            ),
+        ));
+        run_with_stall(&world, SHORT_STALL).await;
+        assert_eq!(only_turn(&world).status, "completed");
+    }
+
+    #[tokio::test]
+    async fn a_provider_killed_mid_turn_fails_with_its_stderr_line_and_the_next_message_works() {
+        let world = World::new();
+        let fixture = world.fixture("basic.jsonl", BASIC);
+        world.install(&recording(
+            &world,
+            &format!(
+                "head -n 3 \"{}\"\necho 'provider crashed: out of memory' >&2\nkill -9 $$",
+                fixture.display()
+            ),
+        ));
+        world.send("first", ApiKey::Absent).await;
+        let crashed = only_turn(&world);
+        assert_eq!(crashed.status, "failed");
+        assert_eq!(
+            crashed.error.as_deref(),
+            Some("provider crashed: out of memory")
+        );
+        assert!(world.registry.slots().is_empty());
+        world.install(&recording(
+            &world,
+            &format!("cat \"{}\"", fixture.display()),
+        ));
+        world.send("second", ApiKey::Absent).await;
+        let statuses: Vec<_> = world.turns().into_iter().map(|turn| turn.status).collect();
+        assert_eq!(statuses, ["failed", "completed"]);
     }
 }

@@ -47,6 +47,10 @@ case "$1" in
     esac
     message=$(cat)
     case "$message" in
+      *STALL*)
+        head -n 4 "$dir/claude-stream-basic.jsonl"
+        sleep 60
+        exit 0 ;;
       *SLOW*)
         head -n 4 "$dir/claude-stream-basic.jsonl"
         nums=$(seq -s ' ' 1 60)

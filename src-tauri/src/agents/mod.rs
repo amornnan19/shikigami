@@ -78,6 +78,12 @@ pub enum AgentState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Attention {
+    pub code: &'static str,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Agent {
     pub id: String,
@@ -89,6 +95,7 @@ pub struct Agent {
     pub created_at: i64,
     pub last_activity_at: i64,
     pub state: AgentState,
+    pub attention: Option<Attention>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -107,20 +114,56 @@ struct Validated {
     model: String,
 }
 
-fn derive_state(
+struct Facts<'a> {
     has_running_turn: bool,
-    newest_turn_status: Option<&str>,
+    newest_turn_status: Option<&'a str>,
+    newest_turn_error: Option<&'a str>,
     folder_exists: bool,
     provider_installed: bool,
-) -> AgentState {
-    if has_running_turn {
-        return AgentState::Working;
+    provider_name: &'a str,
+}
+
+fn derive_attention(facts: &Facts) -> Option<Attention> {
+    if facts.has_running_turn {
+        return None;
     }
-    let newest_turn_failed = matches!(newest_turn_status, Some("failed" | "interrupted"));
-    if newest_turn_failed || !folder_exists || !provider_installed {
-        AgentState::NeedsAttention
-    } else {
-        AgentState::Idle
+    if !facts.folder_exists {
+        return Some(Attention {
+            code: "workspace-missing",
+            message: "The workspace folder is missing.".to_owned(),
+        });
+    }
+    if !facts.provider_installed {
+        return Some(Attention {
+            code: "provider-unavailable",
+            message: format!("{} is not installed.", facts.provider_name),
+        });
+    }
+    match facts.newest_turn_status {
+        Some("interrupted") => Some(Attention {
+            code: "last-turn-interrupted",
+            message: "The app closed while the agent was working.".to_owned(),
+        }),
+        Some("failed") => Some(Attention {
+            code: "last-turn-failed",
+            message: match facts.newest_turn_error {
+                Some(error) if !error.trim().is_empty() => {
+                    format!("The last reply failed: {error}")
+                }
+                _ => "The last reply failed.".to_owned(),
+            },
+        }),
+        _ => None,
+    }
+}
+
+fn derive_state(facts: &Facts) -> (AgentState, Option<Attention>) {
+    if facts.has_running_turn {
+        return (AgentState::Working, None);
+    }
+    match derive_attention(facts) {
+        Some(attention) => (AgentState::NeedsAttention, Some(attention)),
+        None => (AgentState::Idle, None),
     }
 }
 
@@ -172,6 +215,7 @@ fn persist(db: &Database, root: &Path, valid: Validated) -> Result<Agent, AgentE
         created_at: now,
         last_activity_at: now,
         state: AgentState::Idle,
+        attention: None,
     };
     let saved = workspace::write_instruction_file(&folder, &agent.provider, &agent.name)
         .map_err(AgentError::folder)
@@ -203,12 +247,14 @@ fn list(db: &Database, dirs: &[PathBuf]) -> Result<Vec<Agent>, AgentError> {
     Ok(rows
         .into_iter()
         .map(|row| {
-            let state = derive_state(
-                row.has_running_turn,
-                row.newest_turn_status.as_deref(),
-                Path::new(&row.workspace_path).is_dir(),
-                providers::is_installed(&row.provider, dirs),
-            );
+            let (state, attention) = derive_state(&Facts {
+                has_running_turn: row.has_running_turn,
+                newest_turn_status: row.newest_turn_status.as_deref(),
+                newest_turn_error: row.newest_turn_error.as_deref(),
+                folder_exists: Path::new(&row.workspace_path).is_dir(),
+                provider_installed: providers::is_installed(&row.provider, dirs),
+                provider_name: providers::name_of(&row.provider),
+            });
             Agent {
                 id: row.id,
                 name: row.name,
@@ -219,9 +265,29 @@ fn list(db: &Database, dirs: &[PathBuf]) -> Result<Vec<Agent>, AgentError> {
                 created_at: row.created_at,
                 last_activity_at: row.last_activity_at,
                 state,
+                attention,
             }
         })
         .collect())
+}
+
+fn recreate(db: &Database, dirs: &[PathBuf], agent_id: &str) -> Result<Agent, AgentError> {
+    let (name, provider, path) = db
+        .with_connection(|connection| store::workspace_of(connection, agent_id))
+        .map_err(AgentError::database)?
+        .ok_or_else(|| AgentError::new("not-found", "This agent no longer exists."))?;
+    let folder = PathBuf::from(path);
+    fs::create_dir_all(&folder).map_err(AgentError::folder)?;
+    match workspace::write_instruction_file(&folder, &provider, &name) {
+        Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => {
+            return Err(AgentError::folder(error));
+        }
+        _ => {}
+    }
+    list(db, dirs)?
+        .into_iter()
+        .find(|agent| agent.id == agent_id)
+        .ok_or_else(|| AgentError::new("not-found", "This agent no longer exists."))
 }
 
 fn unavailable() -> AgentError {
@@ -244,6 +310,16 @@ pub async fn create_agent(app: AppHandle, input: CreateAgentInput) -> Result<Age
         let db = app.try_state::<Database>().ok_or_else(unavailable)?;
         let root = app.try_state::<WorkspacesRoot>().ok_or_else(unavailable)?;
         create(&db, &root.0, input, &providers::search_dirs())
+    })
+    .await
+    .map_err(AgentError::database)?
+}
+
+#[tauri::command]
+pub async fn recreate_workspace(app: AppHandle, agent_id: String) -> Result<Agent, AgentError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let db = app.try_state::<Database>().ok_or_else(unavailable)?;
+        recreate(&db, &providers::search_dirs(), &agent_id)
     })
     .await
     .map_err(AgentError::database)?
@@ -437,35 +513,134 @@ mod tests {
         assert_eq!(fx.agent_count(), 0);
     }
 
+    fn facts() -> Facts<'static> {
+        Facts {
+            has_running_turn: false,
+            newest_turn_status: None,
+            newest_turn_error: None,
+            folder_exists: true,
+            provider_installed: true,
+            provider_name: "Claude Code",
+        }
+    }
+
+    fn state_of(facts: Facts) -> AgentState {
+        derive_state(&facts).0
+    }
+
+    fn code_of(facts: Facts) -> Option<&'static str> {
+        derive_state(&facts).1.map(|attention| attention.code)
+    }
+
     #[test]
     fn state_follows_the_turn_rules() {
-        assert_eq!(derive_state(false, None, true, true), AgentState::Idle);
+        assert_eq!(state_of(facts()), AgentState::Idle);
+        for status in ["completed", "stopped"] {
+            let settled = Facts {
+                newest_turn_status: Some(status),
+                ..facts()
+            };
+            assert_eq!(state_of(settled), AgentState::Idle);
+        }
+        let running = Facts {
+            has_running_turn: true,
+            ..facts()
+        };
+        assert_eq!(state_of(running), AgentState::Working);
+        let running_but_broken = Facts {
+            has_running_turn: true,
+            newest_turn_status: Some("failed"),
+            folder_exists: false,
+            provider_installed: false,
+            ..facts()
+        };
         assert_eq!(
-            derive_state(false, Some("completed"), true, true),
-            AgentState::Idle
-        );
-        assert_eq!(
-            derive_state(false, Some("stopped"), true, true),
-            AgentState::Idle
-        );
-        assert_eq!(derive_state(true, None, true, true), AgentState::Working);
-        assert_eq!(
-            derive_state(true, Some("failed"), false, false),
-            AgentState::Working
+            derive_state(&running_but_broken),
+            (AgentState::Working, None)
         );
         for status in ["failed", "interrupted"] {
-            assert_eq!(
-                derive_state(false, Some(status), true, true),
-                AgentState::NeedsAttention
-            );
+            let broken = Facts {
+                newest_turn_status: Some(status),
+                ..facts()
+            };
+            assert_eq!(state_of(broken), AgentState::NeedsAttention);
         }
+        let no_folder = Facts {
+            folder_exists: false,
+            ..facts()
+        };
+        assert_eq!(state_of(no_folder), AgentState::NeedsAttention);
+        let no_provider = Facts {
+            provider_installed: false,
+            ..facts()
+        };
+        assert_eq!(state_of(no_provider), AgentState::NeedsAttention);
+    }
+
+    #[test]
+    fn each_attention_reason_has_its_code_and_message() {
+        let missing = derive_attention(&Facts {
+            folder_exists: false,
+            ..facts()
+        })
+        .unwrap();
+        assert_eq!(missing.code, "workspace-missing");
+        assert_eq!(missing.message, "The workspace folder is missing.");
+        let unavailable = derive_attention(&Facts {
+            provider_installed: false,
+            ..facts()
+        })
+        .unwrap();
+        assert_eq!(unavailable.code, "provider-unavailable");
+        assert_eq!(unavailable.message, "Claude Code is not installed.");
+        let interrupted = derive_attention(&Facts {
+            newest_turn_status: Some("interrupted"),
+            ..facts()
+        })
+        .unwrap();
+        assert_eq!(interrupted.code, "last-turn-interrupted");
         assert_eq!(
-            derive_state(false, None, false, true),
-            AgentState::NeedsAttention
+            interrupted.message,
+            "The app closed while the agent was working."
         );
+        let failed = derive_attention(&Facts {
+            newest_turn_status: Some("failed"),
+            newest_turn_error: Some("boom"),
+            ..facts()
+        })
+        .unwrap();
+        assert_eq!(failed.code, "last-turn-failed");
+        assert_eq!(failed.message, "The last reply failed: boom");
+        assert_eq!(derive_attention(&facts()), None);
+    }
+
+    #[test]
+    fn attention_reasons_are_checked_in_priority_order() {
+        let everything = Facts {
+            newest_turn_status: Some("failed"),
+            newest_turn_error: Some("boom"),
+            folder_exists: false,
+            provider_installed: false,
+            ..facts()
+        };
+        assert_eq!(code_of(everything), Some("workspace-missing"));
+        let no_provider_and_failed = Facts {
+            newest_turn_status: Some("failed"),
+            provider_installed: false,
+            ..facts()
+        };
         assert_eq!(
-            derive_state(false, None, true, false),
-            AgentState::NeedsAttention
+            code_of(no_provider_and_failed),
+            Some("provider-unavailable")
+        );
+        let interrupted_and_failed_text = Facts {
+            newest_turn_status: Some("interrupted"),
+            newest_turn_error: Some("boom"),
+            ..facts()
+        };
+        assert_eq!(
+            code_of(interrupted_and_failed_text),
+            Some("last-turn-interrupted")
         );
     }
 
@@ -556,6 +731,7 @@ mod tests {
         assert!(value["workspacePath"].is_string());
         assert!(value["lastActivityAt"].is_i64());
         assert_eq!(value["state"], "idle");
+        assert!(value["attention"].is_null());
         assert_eq!(
             serde_json::to_value(AgentState::NeedsAttention).unwrap(),
             "needs-attention"
@@ -581,5 +757,115 @@ mod tests {
             PathBuf::from("/tmp/elsewhere")
         );
         std::env::remove_var(WORKSPACES_DIR_ENV);
+    }
+
+    #[test]
+    fn a_listed_agent_carries_the_reason_it_needs_attention() {
+        let fx = Fixture::new(&["claude"]);
+        let failed = fx.create("Failed", "claude-code").unwrap();
+        let gone = fx.create("Gone", "claude-code").unwrap();
+        insert_turn(&fx, "t1", &failed.id, "failed", 10);
+        fx.db.with_connection(|c| {
+            c.execute("UPDATE turns SET error = 'boom' WHERE id = 't1'", [])
+                .unwrap()
+        });
+        fs::remove_dir_all(&gone.workspace_path).unwrap();
+        let agents = fx.list();
+        let attention = |name: &str| {
+            agents
+                .iter()
+                .find(|agent| agent.name == name)
+                .and_then(|agent| agent.attention.clone())
+        };
+        assert_eq!(
+            attention("Failed").map(|a| (a.code, a.message)),
+            Some(("last-turn-failed", "The last reply failed: boom".to_owned()))
+        );
+        assert_eq!(attention("Gone").unwrap().code, "workspace-missing");
+        let value = serde_json::to_value(attention("Gone")).unwrap();
+        assert_eq!(value["code"], "workspace-missing");
+    }
+
+    #[test]
+    fn recreating_a_missing_workspace_makes_the_folder_and_the_instruction_file() {
+        let fx = Fixture::new(&["claude"]);
+        let agent = fx.create("Gone", "claude-code").unwrap();
+        fs::remove_dir_all(&agent.workspace_path).unwrap();
+        assert_eq!(fx.list()[0].state, AgentState::NeedsAttention);
+        let fixed = recreate(&fx.db, &fx.dirs(), &agent.id).unwrap();
+        assert_eq!(fixed.state, AgentState::Idle);
+        assert_eq!(fixed.attention, None);
+        assert_eq!(
+            fs::read_to_string(Path::new(&agent.workspace_path).join("CLAUDE.md")).unwrap(),
+            workspace::instruction_text("Gone")
+        );
+    }
+
+    #[test]
+    fn recreating_makes_missing_parent_folders_too() {
+        let fx = Fixture::new(&["claude"]);
+        let agent = fx.create("Deep", "claude-code").unwrap();
+        let deep = fx.workspaces.path().join("a").join("b").join("deep");
+        fx.db.with_connection(|c| {
+            c.execute(
+                "UPDATE agents SET workspace_path = ?2 WHERE id = ?1",
+                rusqlite::params![agent.id, deep.to_string_lossy()],
+            )
+            .unwrap()
+        });
+        recreate(&fx.db, &fx.dirs(), &agent.id).unwrap();
+        assert!(deep.join("CLAUDE.md").is_file());
+    }
+
+    #[test]
+    fn recreating_never_touches_an_existing_folder_or_instruction_file() {
+        let fx = Fixture::new(&["claude"]);
+        let agent = fx.create("Keep", "claude-code").unwrap();
+        let folder = PathBuf::from(&agent.workspace_path);
+        fs::write(folder.join("CLAUDE.md"), "my own words").unwrap();
+        fs::write(folder.join("notes.txt"), "work").unwrap();
+        recreate(&fx.db, &fx.dirs(), &agent.id).unwrap();
+        assert_eq!(
+            fs::read_to_string(folder.join("CLAUDE.md")).unwrap(),
+            "my own words"
+        );
+        assert_eq!(
+            fs::read_to_string(folder.join("notes.txt")).unwrap(),
+            "work"
+        );
+        fs::remove_file(folder.join("CLAUDE.md")).unwrap();
+        recreate(&fx.db, &fx.dirs(), &agent.id).unwrap();
+        assert_eq!(
+            fs::read_to_string(folder.join("CLAUDE.md")).unwrap(),
+            workspace::instruction_text("Keep")
+        );
+        assert_eq!(
+            fs::read_to_string(folder.join("notes.txt")).unwrap(),
+            "work"
+        );
+    }
+
+    #[test]
+    fn recreating_for_an_unknown_agent_is_refused() {
+        let fx = Fixture::new(&["claude"]);
+        let error = recreate(&fx.db, &fx.dirs(), "nope").unwrap_err();
+        assert_eq!(error.code, "not-found");
+    }
+
+    #[test]
+    fn recreating_reports_a_folder_that_cannot_be_made() {
+        let fx = Fixture::new(&["claude"]);
+        let agent = fx.create("Blocked", "claude-code").unwrap();
+        let blocker = fx.workspaces.path().join("file");
+        fs::write(&blocker, "x").unwrap();
+        fx.db.with_connection(|c| {
+            c.execute(
+                "UPDATE agents SET workspace_path = ?2 WHERE id = ?1",
+                rusqlite::params![agent.id, blocker.join("inside").to_string_lossy()],
+            )
+            .unwrap()
+        });
+        let error = recreate(&fx.db, &fx.dirs(), &agent.id).unwrap_err();
+        assert_eq!(error.code, "folder-failed");
     }
 }

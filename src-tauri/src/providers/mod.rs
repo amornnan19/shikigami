@@ -105,6 +105,13 @@ pub fn is_known(id: &str) -> bool {
     [claude_code::SPEC.id, codex::SPEC.id].contains(&id)
 }
 
+pub fn name_of(id: &str) -> &'static str {
+    [&claude_code::SPEC, &codex::SPEC]
+        .into_iter()
+        .find(|spec| spec.id == id)
+        .map_or("The provider", |spec| spec.name)
+}
+
 pub fn is_installed(id: &str, dirs: &[PathBuf]) -> bool {
     [&claude_code::SPEC, &codex::SPEC]
         .into_iter()

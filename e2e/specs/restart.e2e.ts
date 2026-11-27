@@ -36,6 +36,28 @@ describe("after a restart", () => {
       const scroller = document.querySelector('section[aria-label="Agent"] .overflow-y-auto');
       if (scroller) scroller.scrollTop = scroller.scrollHeight;
     });
+    await expect($('[aria-label="Queue waiting"]')).toHaveText(
+      expect.stringContaining(
+        "The app closed while the agent was working. 1 queued message is waiting.",
+      ),
+    );
+    await expect($('[aria-label="Queue waiting"]').$("button=Resume")).toBeEnabled();
     await browser.saveScreenshot(join(artifacts, "chat-queue-after-restart.png"));
+  });
+
+  it("starts the queued message when Resume is pressed", async () => {
+    await $('[aria-label="Queue waiting"]').$("button=Resume").click();
+    const next = $(`${agentView} article:nth-of-type(7)`);
+    await expect(next).toHaveText(expect.stringContaining("queued before restart"), {
+      wait: 20000,
+    });
+    await expect(next).toHaveText(expect.stringMatching(/restart\s*pong$/), { wait: 20000 });
+    await expect($('section[aria-label="Queue"]')).not.toExist();
+    await expect($('[aria-label="Queue waiting"]')).not.toExist();
+    await browser.execute(() => {
+      const scroller = document.querySelector('section[aria-label="Agent"] .overflow-y-auto');
+      if (scroller) scroller.scrollTop = scroller.scrollHeight;
+    });
+    await browser.saveScreenshot(join(artifacts, "chat-resumed.png"));
   });
 });

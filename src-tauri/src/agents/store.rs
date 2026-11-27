@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection, ErrorCode};
+use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 
 use super::{Agent, AgentError};
 
@@ -13,6 +13,7 @@ pub struct AgentRow {
     pub last_activity_at: i64,
     pub has_running_turn: bool,
     pub newest_turn_status: Option<String>,
+    pub newest_turn_error: Option<String>,
 }
 
 pub fn name_exists(connection: &Connection, name: &str) -> rusqlite::Result<bool> {
@@ -49,11 +50,26 @@ pub fn insert(connection: &Connection, agent: &Agent) -> Result<(), AgentError> 
         })
 }
 
+pub fn workspace_of(
+    connection: &Connection,
+    agent_id: &str,
+) -> rusqlite::Result<Option<(String, String, String)>> {
+    connection
+        .query_row(
+            "SELECT name, provider, workspace_path FROM agents WHERE id = ?1",
+            [agent_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+}
+
 pub fn list(connection: &Connection) -> rusqlite::Result<Vec<AgentRow>> {
     let mut statement = connection.prepare(
         "SELECT a.id, a.name, a.color, a.provider, a.model, a.workspace_path, a.created_at, a.last_activity_at,
                 EXISTS(SELECT 1 FROM turns t WHERE t.agent_id = a.id AND t.status = 'running'),
                 (SELECT t.status FROM turns t WHERE t.agent_id = a.id
+                   ORDER BY t.started_at DESC, t.rowid DESC LIMIT 1),
+                (SELECT t.error FROM turns t WHERE t.agent_id = a.id
                    ORDER BY t.started_at DESC, t.rowid DESC LIMIT 1)
          FROM agents a
          ORDER BY a.last_activity_at DESC, a.created_at DESC, a.rowid DESC",
@@ -70,6 +86,7 @@ pub fn list(connection: &Connection) -> rusqlite::Result<Vec<AgentRow>> {
             last_activity_at: row.get(7)?,
             has_running_turn: row.get(8)?,
             newest_turn_status: row.get(9)?,
+            newest_turn_error: row.get(10)?,
         })
     })?;
     rows.collect()

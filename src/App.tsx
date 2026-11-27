@@ -26,7 +26,12 @@ function ErrorScreen({ message, dataDir }: { message: string; dataDir: string })
 
 function Workspace() {
   useTurnEvents();
-  const agents = useQuery({ queryKey: ["agents"], queryFn: listAgents, retry: false });
+  const agents = useQuery({
+    queryKey: ["agents"],
+    queryFn: listAgents,
+    retry: false,
+    refetchOnWindowFocus: true,
+  });
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
   const list = agents.data ?? [];

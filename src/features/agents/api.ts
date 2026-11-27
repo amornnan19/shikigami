@@ -2,6 +2,11 @@ import { invoke } from "@tauri-apps/api/core";
 
 export type AgentState = "idle" | "working" | "needs-attention";
 
+export interface Attention {
+  code: string;
+  message: string;
+}
+
 export interface Agent {
   id: string;
   name: string;
@@ -12,6 +17,7 @@ export interface Agent {
   createdAt: number;
   lastActivityAt: number;
   state: AgentState;
+  attention: Attention | null;
 }
 
 export interface CreateAgentInput {
@@ -44,4 +50,8 @@ export function listAgents() {
 
 export function createAgent(input: CreateAgentInput) {
   return invoke<Agent>("create_agent", { input });
+}
+
+export function recreateWorkspace(agentId: string) {
+  return invoke<Agent>("recreate_workspace", { agentId });
 }
