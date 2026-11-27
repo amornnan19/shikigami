@@ -64,8 +64,8 @@ The desktop shell (Tauri 2), the UI framework (React with TypeScript, Vite) and 
   - On macOS we use WebdriverIO's Tauri service with its embedded provider, which runs a WebDriver
     server inside a debug build of the app through a plugin. The plugin is included in test builds
     only, never in the shipped app.
-  - Its license and maturity are checked when it is added (#3). If it does not work, the fallback is
-    to test the UI in a browser with mocked backend calls, plus Rust integration tests.
+  - Its license is MIT, checked when it was added (#8). It works on macOS. If it stops working, the
+    fallback is to test the UI in a browser with mocked backend calls, plus Rust integration tests.
 
 ## Licenses
 
@@ -84,7 +84,8 @@ The desktop shell (Tauri 2), the UI framework (React with TypeScript, Vite) and 
 | Biome | MIT or Apache-2.0 |
 | Vitest | MIT |
 | WebdriverIO | MIT |
-| Tauri WebdriverIO embedded plugin | to be checked in #3 |
+| `tauri-plugin-wdio-webdriver` (Tauri embedded WebDriver plugin, test builds only) | MIT |
+| `@wdio/tauri-service` (WebdriverIO Tauri service) | MIT |
 
 All listed licenses are permissive and compatible with PolyForm Noncommercial 1.0.0. Their notices
 go into the shipped app's third-party notices (M5).

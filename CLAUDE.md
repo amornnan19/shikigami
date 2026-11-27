@@ -80,7 +80,12 @@ Run the narrowest check for what changed, one at a time, narrowest first:
 4. Rust changes in `src-tauri/`: `bun run rust:fmt`, then `bun run rust:lint` (clippy, warnings are
    errors), then `bun run rust:test`.
 5. `bun run lint` checks the whole repository with Biome.
-6. `bun run check` runs every check above in sequence. Run it before you ask to ship an issue.
+6. `bun run e2e` builds a debug binary with the `e2e` Cargo feature and drives the real app with
+   WebdriverIO. Screenshots go to `e2e/artifacts/` (git ignores it). It takes about a minute. Run it
+   when you change what the user sees or a flow, and before you ask to ship such an issue. The `e2e`
+   feature is for test builds only: never enable it in `app:dev` or `app:build`.
+7. `bun run check` runs every check above except `bun run e2e` (it is slow), in sequence. Run it
+   before you ask to ship an issue.
 
 The pre-commit hook (`.githooks/pre-commit`) runs automatically on every commit. It checks staged
 files with Biome and, when a staged file is under `src-tauri/`, runs `cargo fmt --check` and

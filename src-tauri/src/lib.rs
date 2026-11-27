@@ -4,7 +4,10 @@ fn app_context() -> tauri::Context {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(feature = "e2e")]
+    let builder = builder.plugin(tauri_plugin_wdio_webdriver::init());
+    builder
         .run(app_context())
         .expect("error while running tauri application");
 }
