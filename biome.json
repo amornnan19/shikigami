@@ -10,8 +10,10 @@
       "src/**",
       "*.json",
       "*.ts",
+      "e2e/**",
       "!**/node_modules",
       "!**/dist",
+      "!e2e/artifacts",
       "!src-tauri/target",
       "!src-tauri/gen"
     ]
