@@ -95,6 +95,21 @@ async fn detect_all(dirs: &[PathBuf], limit: Duration) -> Vec<ProviderStatus> {
     vec![claude, codex]
 }
 
+pub fn is_known(id: &str) -> bool {
+    [claude_code::SPEC.id, codex::SPEC.id].contains(&id)
+}
+
+pub fn is_installed(id: &str, dirs: &[PathBuf]) -> bool {
+    [&claude_code::SPEC, &codex::SPEC]
+        .into_iter()
+        .find(|spec| spec.id == id)
+        .is_some_and(|spec| search::find_executable(spec.executable, dirs).is_some())
+}
+
+pub fn search_dirs() -> Vec<PathBuf> {
+    search::search_dirs()
+}
+
 #[tauri::command]
 pub async fn list_providers() -> Result<Vec<ProviderStatus>, String> {
     let dirs = tauri::async_runtime::spawn_blocking(search::search_dirs)

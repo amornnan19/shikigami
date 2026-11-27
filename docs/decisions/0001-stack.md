@@ -93,6 +93,7 @@ The desktop shell (Tauri 2), the UI framework (React with TypeScript, Vite) and 
 | `@radix-ui/react-slot` (used by the shadcn/ui button) | MIT |
 | `@tauri-apps/plugin-opener` and `tauri-plugin-opener` (open the install page in the default browser) | MIT or Apache-2.0 |
 | `tempfile` (Rust tests only) | MIT or Apache-2.0 |
+| `@radix-ui/react-dialog`, `@radix-ui/react-select`, `@radix-ui/react-label`, `@radix-ui/react-radio-group` (shadcn/ui dialog, select, label and colour picker for the new agent form) | MIT |
 
 All listed licenses are permissive and compatible with PolyForm Noncommercial 1.0.0. Their notices
 go into the shipped app's third-party notices (M5).

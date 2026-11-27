@@ -1,3 +1,4 @@
+mod agents;
 mod commands;
 pub mod db;
 mod providers;
@@ -61,12 +62,17 @@ pub fn run() {
                     app.manage(AppStartupError(message));
                 }
             }
+            app.manage(agents::WorkspacesRoot(agents::resolve_workspaces_root(
+                app.path().home_dir().ok(),
+            )));
             app.manage(DataDir(data_dir));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::app_status,
-            providers::list_providers
+            providers::list_providers,
+            agents::list_agents,
+            agents::create_agent
         ])
         .run(app_context())
         .expect("error while running tauri application");
