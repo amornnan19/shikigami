@@ -15,8 +15,8 @@ describe("after a restart", () => {
     await expect(first).toHaveText(expect.stringContaining("pong"));
     const second = $(`${agentView} article:nth-of-type(2)`);
     await expect(second).toHaveText(expect.stringContaining("List the files in your folder"));
-    await expect(second.$("button=1 step")).toBeExisting();
-    await expect(second).toHaveText(expect.stringContaining("CLAUDE.md"));
+    await expect(second.$("button=2 steps")).toBeExisting();
+    await expect(second).toHaveText(expect.stringContaining("eza"));
     await browser.saveScreenshot(join(artifacts, "chat-after-restart.png"));
   });
 });

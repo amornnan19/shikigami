@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
+use super::redact::Redactor;
+
 pub const DETAIL_LIMIT: usize = 4096;
 const TITLE_LIMIT: usize = 120;
 const TITLE_FIELDS: [&str; 4] = ["file_path", "pattern", "command", "url"];
@@ -12,6 +14,15 @@ pub enum Session {
     Resume(String),
 }
 
+const ISOLATION_FLAGS: [&str; 6] = [
+    "--setting-sources",
+    "project",
+    "--strict-mcp-config",
+    "--permission-mode",
+    "manual",
+    "--permission-prompts",
+];
+
 pub fn arguments(model: &str, session: &Session) -> Vec<String> {
     let mut args: Vec<String> = [
         "-p",
@@ -21,6 +32,8 @@ pub fn arguments(model: &str, session: &Session) -> Vec<String> {
         "--include-partial-messages",
     ]
     .into_iter()
+    .chain(ISOLATION_FLAGS)
+    .chain(["none"])
     .map(str::to_owned)
     .collect();
     if model != "default" {
@@ -79,6 +92,7 @@ struct MessageTexts {
 
 #[derive(Default)]
 pub struct StreamParser {
+    redactor: Redactor,
     message_id: Option<String>,
     streamed: HashMap<(String, u64), String>,
     messages: HashMap<String, MessageTexts>,
@@ -129,6 +143,13 @@ fn result_text(content: &Value) -> String {
 }
 
 impl StreamParser {
+    pub fn new(redactor: Redactor) -> Self {
+        Self {
+            redactor,
+            ..Self::default()
+        }
+    }
+
     pub fn line(&mut self, line: &str) -> Vec<Parsed> {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             return Vec::new();
@@ -272,7 +293,9 @@ impl StreamParser {
             return None;
         }
         let kind = block.get("name").and_then(Value::as_str).unwrap_or("tool");
-        let input = block.get("input").cloned().unwrap_or(Value::Null);
+        let input = self
+            .redactor
+            .redact_value(block.get("input").unwrap_or(&Value::Null));
         let id = new_id();
         self.steps.insert(tool_use_id.to_owned(), id.clone());
         Some(Parsed::StepStarted(StepStart {
@@ -297,7 +320,9 @@ impl StreamParser {
                     step_id,
                     failed: block.get("is_error").and_then(Value::as_bool) == Some(true),
                     output: truncate(
-                        &block.get("content").map(result_text).unwrap_or_default(),
+                        &self
+                            .redactor
+                            .redact(&block.get("content").map(result_text).unwrap_or_default()),
                         DETAIL_LIMIT,
                     ),
                 })
@@ -317,11 +342,52 @@ impl StreamParser {
 }
 
 #[cfg(test)]
+const ISOLATION: [&str; 7] = [
+    "--setting-sources",
+    "project",
+    "--strict-mcp-config",
+    "--permission-mode",
+    "manual",
+    "--permission-prompts",
+    "none",
+];
+
+#[cfg(test)]
+pub fn assert_isolated(args: &[String]) {
+    let at = args
+        .iter()
+        .position(|arg| arg == "--setting-sources")
+        .expect("--setting-sources missing");
+    assert_eq!(args[at..at + ISOLATION.len()], ISOLATION);
+    for forbidden in ["bypassPermissions", "acceptEdits", "auto", "dontAsk"] {
+        assert!(!args.iter().any(|arg| arg == forbidden), "{forbidden}");
+    }
+    assert!(!args.iter().any(|arg| arg.starts_with("--dangerously")));
+    assert!(!args
+        .iter()
+        .any(|arg| arg.starts_with("--allow-dangerously")));
+    assert!(!args
+        .iter()
+        .any(|arg| arg.to_lowercase().contains("allowedtools")));
+    assert!(!args
+        .iter()
+        .any(|arg| arg.to_lowercase().contains("allowed-tools")));
+    assert_eq!(
+        args.iter()
+            .filter(|arg| *arg == "--permission-mode")
+            .count(),
+        1
+    );
+    assert_eq!(args[at + 1].split(',').count(), 1);
+    assert!(!args[at + 1].contains("user"));
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     const BASIC: &str = include_str!("../../tests/fixtures/claude-stream-basic.jsonl");
-    const TOOL: &str = include_str!("../../tests/fixtures/claude-stream-tool.jsonl");
+    const DENIED: &str = include_str!("../../tests/fixtures/claude-stream-denied.jsonl");
 
     fn parse(source: &str) -> Vec<Parsed> {
         let mut parser = StreamParser::default();
@@ -339,7 +405,7 @@ mod tests {
     }
 
     #[test]
-    fn arguments_pass_the_model_and_the_session_without_permission_flags() {
+    fn arguments_pass_the_isolation_flags_the_model_and_the_session() {
         let first = arguments("default", &Session::New("abc".into()));
         assert_eq!(
             first,
@@ -349,18 +415,31 @@ mod tests {
                 "stream-json",
                 "--verbose",
                 "--include-partial-messages",
+                "--setting-sources",
+                "project",
+                "--strict-mcp-config",
+                "--permission-mode",
+                "manual",
+                "--permission-prompts",
+                "none",
                 "--session-id",
                 "abc"
             ]
         );
         let later = arguments("claude-haiku-5-5", &Session::Resume("abc".into()));
         assert_eq!(
-            &later[5..],
+            &later[12..],
             ["--model", "claude-haiku-5-5", "--resume", "abc"]
         );
-        for flag in later.iter().chain(first.iter()) {
-            assert!(!flag.contains("permission") && !flag.contains("dangerously"));
-            assert!(!flag.contains("allowedTools") && !flag.contains("allowed-tools"));
+    }
+
+    #[test]
+    fn every_argument_list_keeps_the_isolation_flags_and_no_widening_value() {
+        for model in ["default", "haiku"] {
+            for session in [Session::New("abc".into()), Session::Resume("abc".into())] {
+                let args = arguments(model, &session);
+                assert_isolated(&args);
+            }
         }
     }
 
@@ -387,7 +466,7 @@ mod tests {
 
     #[test]
     fn streamed_text_assembles_into_the_authoritative_text() {
-        let parsed = parse(TOOL);
+        let parsed = parse(DENIED);
         let sets: Vec<(&String, &String)> = parsed
             .iter()
             .filter_map(|event| match event {
@@ -397,7 +476,6 @@ mod tests {
             .collect();
         assert_eq!(sets.len(), 1);
         let (item_id, text) = sets[0];
-        assert!(text.contains("CLAUDE.md"));
         assert!(text.chars().count() > 20);
         assert_eq!(&streamed_text(&parsed, item_id), text);
         assert!(
@@ -409,45 +487,55 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_tool_use_starts_a_step_with_its_title_and_ends_it_done() {
-        let parsed = parse(TOOL);
-        let started: Vec<&StepStart> = parsed
+    fn started_steps(parsed: &[Parsed]) -> Vec<&StepStart> {
+        parsed
             .iter()
             .filter_map(|event| match event {
                 Parsed::StepStarted(step) => Some(step),
                 _ => None,
             })
-            .collect();
-        assert_eq!(started.len(), 1);
-        assert_eq!(started[0].kind, "Bash");
-        assert!(started[0].title.starts_with("ls -la"));
-        assert!(started[0].input.contains("\"command\""));
-        let ended: Vec<&Parsed> = parsed
+            .collect()
+    }
+
+    fn ended_steps(parsed: &[Parsed]) -> Vec<(&String, bool, &String)> {
+        parsed
             .iter()
-            .filter(|event| matches!(event, Parsed::StepEnded { .. }))
-            .collect();
-        assert_eq!(ended.len(), 1);
-        let Parsed::StepEnded {
-            step_id,
-            failed,
-            output,
-        } = ended[0]
-        else {
-            unreachable!()
-        };
-        assert_eq!(step_id, &started[0].id);
-        assert!(!failed);
-        assert!(output.contains("CLAUDE.md"));
+            .filter_map(|event| match event {
+                Parsed::StepEnded {
+                    step_id,
+                    failed,
+                    output,
+                } => Some((step_id, *failed, output)),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
-    fn an_error_tool_result_ends_the_step_failed() {
-        let failing = TOOL.replace("\"is_error\":false", "\"is_error\":true");
-        let parsed = parse(&failing);
-        assert!(parsed
-            .iter()
-            .any(|event| matches!(event, Parsed::StepEnded { failed: true, .. })));
+    fn tool_uses_start_steps_with_their_titles_and_failed_results_end_them_failed() {
+        let parsed = parse(DENIED);
+        let started = started_steps(&parsed);
+        assert_eq!(started.len(), 2);
+        assert!(started.iter().all(|step| step.kind == "Bash"));
+        assert!(started[0].title.starts_with("ls -la"));
+        assert!(started[1].title.starts_with("/bin/ls -la"));
+        assert!(started[0].input.contains("\"command\""));
+        let ended = ended_steps(&parsed);
+        assert_eq!(ended.len(), 2);
+        assert_eq!(ended[0].0, &started[0].id);
+        assert_eq!(ended[1].0, &started[1].id);
+        assert!(ended.iter().all(|(_, failed, _)| *failed));
+        assert!(ended[0].2.contains("command not found"));
+        assert!(ended[1].2.contains("denied"));
+    }
+
+    #[test]
+    fn a_tool_result_without_an_error_ends_the_step_done() {
+        let succeeding = DENIED.replace("\"is_error\":true", "\"is_error\":false");
+        let parsed = parse(&succeeding);
+        let ended = ended_steps(&parsed);
+        assert_eq!(ended.len(), 2);
+        assert!(ended.iter().all(|(_, failed, _)| !*failed));
     }
 
     #[test]

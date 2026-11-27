@@ -1,10 +1,13 @@
 mod claude_code;
+mod redact;
 mod runner;
 mod store;
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
@@ -17,6 +20,8 @@ use store::{BeginError, ConversationPage, StepView};
 
 pub const EVENT_NAME: &str = "turn-event";
 pub const MESSAGE_MAX_CHARS: usize = 100_000;
+const EXIT_TERM_GRACE: Duration = Duration::from_secs(2);
+const EXIT_POLL: Duration = Duration::from_millis(25);
 
 #[derive(Debug, Serialize)]
 pub struct TurnError {
@@ -128,6 +133,31 @@ impl TurnRegistry {
             }
         }
     }
+
+    pub fn kill_all(&self, grace: Duration) {
+        let groups: Vec<i32> = std::mem::take(&mut *self.groups()).into_values().collect();
+        for group in &groups {
+            unsafe {
+                libc::killpg(*group, libc::SIGTERM);
+            }
+        }
+        let deadline = Instant::now() + grace;
+        let gone = |group: &i32| unsafe { libc::killpg(*group, 0) } != 0;
+        while Instant::now() < deadline && !groups.iter().all(gone) {
+            std::thread::sleep(EXIT_POLL);
+        }
+        for group in groups.iter().filter(|group| !gone(group)) {
+            unsafe {
+                libc::killpg(*group, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+pub fn stop_all_turns(app: &AppHandle) {
+    if let Some(registry) = app.try_state::<TurnRegistry>() {
+        registry.kill_all(EXIT_TERM_GRACE);
+    }
 }
 
 pub struct Launch {
@@ -140,6 +170,7 @@ pub struct Launch {
     pub session: claude_code::Session,
     pub text: String,
     pub started_at: i64,
+    pub environment: Vec<(OsString, OsString)>,
 }
 
 fn prepare(
@@ -188,6 +219,7 @@ fn prepare(
         session: begun.session,
         text: text.to_owned(),
         started_at,
+        environment: std::env::vars_os().collect(),
     })
 }
 
@@ -203,9 +235,8 @@ async fn drive(app: AppHandle, launch: Launch) {
     })
     .await;
     let key = match key {
-        Ok(Ok(Some(key))) => runner::ApiKey::Present(key),
-        Ok(Ok(None)) => runner::ApiKey::Absent,
-        _ => runner::ApiKey::Unreadable,
+        Ok(read) => runner::ApiKey::from_read(read),
+        Err(_) => runner::ApiKey::Unreadable,
     };
     let (Some(db), Some(registry)) = (app.try_state::<Database>(), app.try_state::<TurnRegistry>())
     else {
@@ -367,5 +398,54 @@ mod tests {
             serde_json::to_value(&ended).unwrap()["kind"],
             serde_json::json!("ended")
         );
+    }
+
+    fn spawn_group(script: &str) -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+        std::process::Command::new("/bin/sh")
+            .args(["-c", script])
+            .process_group(0)
+            .spawn()
+            .unwrap()
+    }
+
+    fn group_of(child: &std::process::Child) -> i32 {
+        i32::try_from(child.id()).unwrap()
+    }
+
+    #[test]
+    fn exit_kills_every_registered_group_with_a_term_signal_first() {
+        use std::os::unix::process::ExitStatusExt;
+        let registry = TurnRegistry::default();
+        let mut first = spawn_group("sleep 30");
+        let mut second = spawn_group("sleep 30");
+        registry.set_group("a", group_of(&first));
+        registry.set_group("b", group_of(&second));
+        let started = Instant::now();
+        let reaper = std::thread::spawn(move || (first.wait().unwrap(), second.wait().unwrap()));
+        registry.kill_all(Duration::from_secs(5));
+        let (first, second) = reaper.join().unwrap();
+        assert_eq!(first.signal(), Some(libc::SIGTERM));
+        assert_eq!(second.signal(), Some(libc::SIGTERM));
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(registry.groups().is_empty());
+    }
+
+    #[test]
+    fn exit_kills_a_group_that_ignores_the_term_signal_after_the_grace() {
+        use std::os::unix::process::ExitStatusExt;
+        let registry = TurnRegistry::default();
+        let child = spawn_group("trap '' TERM; while true; do sleep 1; done");
+        registry.set_group("a", group_of(&child));
+        let reaper = std::thread::spawn(move || {
+            let mut child = child;
+            child.wait().unwrap()
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        let started = Instant::now();
+        registry.kill_all(Duration::from_millis(500));
+        let status = reaper.join().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert!(started.elapsed() >= Duration::from_millis(500));
     }
 }

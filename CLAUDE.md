@@ -52,13 +52,18 @@ every child row. Never edit a migration that has been merged; add a new one.
 A CLI that Shikigami starts gets an explicit PATH built from the provider search list; a
 Finder-launched app only has /usr/bin:/bin:/usr/sbin:/sbin, and npm-installed CLIs need node on
 PATH. Start each CLI in its own process group and kill the group on timeout or stop. Bound how much
-output is read.
+output is read. Start each agent CLI isolated from the user's own configuration of that CLI: no
+user-level settings, hooks, plugins, output styles or MCP servers. For Claude Code:
+`--setting-sources project --strict-mcp-config --permission-mode manual --permission-prompts none`.
+Keep the CLI's own sign-in working.
 
 ## Secrets
 
 Secrets live only in the macOS Keychain. Decrypt a secret only when it is about to be used (a turn),
 never on a status or list path. A failed read must never block turning the feature off or removing
-it. The value never reaches the UI, logs, errors, the database or Debug output.
+it. The value never reaches the UI, logs, errors, the database or Debug output. Redact a secret passed
+to a child from every text that reaches the database or an event: step input and output, reply
+text, notices and errors.
 
 ## Planning
 

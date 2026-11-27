@@ -7,8 +7,19 @@ pub struct KeychainStore;
 
 const ITEM_NOT_FOUND: i32 = -25300;
 
-fn entry(account: &str, failure: SecretError) -> Result<Entry, SecretError> {
-    Entry::new(KEYCHAIN_SERVICE, account).map_err(|_| failure)
+fn read_failure(error: &Error) -> SecretError {
+    let source = match error {
+        Error::PlatformFailure(source) | Error::NoStorageAccess(source) => Some(source),
+        _ => None,
+    };
+    let status = source
+        .and_then(|source| source.downcast_ref::<security_framework::base::Error>())
+        .map(|error| error.code());
+    SecretError::Read(status)
+}
+
+fn entry(account: &str) -> keyring::Result<Entry> {
+    Entry::new(KEYCHAIN_SERVICE, account)
 }
 
 impl SecretStore for KeychainStore {
@@ -23,26 +34,26 @@ impl SecretStore for KeychainStore {
         match found {
             Ok(items) => Ok(!items.is_empty()),
             Err(error) if error.code() == ITEM_NOT_FOUND => Ok(false),
-            Err(_) => Err(SecretError::Read),
+            Err(error) => Err(SecretError::Read(Some(error.code()))),
         }
     }
 
     fn get(&self, account: &str) -> Result<Option<SecretString>, SecretError> {
-        match entry(account, SecretError::Read)?.get_password() {
+        match entry(account).and_then(|entry| entry.get_password()) {
             Ok(value) => Ok(Some(SecretString::new(value))),
             Err(Error::NoEntry) => Ok(None),
-            Err(_) => Err(SecretError::Read),
+            Err(error) => Err(read_failure(&error)),
         }
     }
 
     fn set(&self, account: &str, value: &SecretString) -> Result<(), SecretError> {
-        entry(account, SecretError::Write)?
-            .set_password(value.expose())
+        entry(account)
+            .and_then(|entry| entry.set_password(value.expose()))
             .map_err(|_| SecretError::Write)
     }
 
     fn delete(&self, account: &str) -> Result<(), SecretError> {
-        match entry(account, SecretError::Delete)?.delete_credential() {
+        match entry(account).and_then(|entry| entry.delete_credential()) {
             Ok(()) | Err(Error::NoEntry) => Ok(()),
             Err(_) => Err(SecretError::Delete),
         }

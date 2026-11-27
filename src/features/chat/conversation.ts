@@ -34,7 +34,9 @@ export function applyEvent(data: Conversation, event: TurnEvent): Conversation {
     case "notice":
       return withTurn(data, event.turnId, (turn) => ({
         ...turn,
-        items: [...turn.items, { type: "notice", id: event.itemId, text: event.text }],
+        items: turn.items.some((item) => item.id === event.itemId)
+          ? turn.items
+          : [...turn.items, { type: "notice", id: event.itemId, text: event.text }],
       }));
     case "step-started":
       return withTurn(data, event.turnId, (turn) => ({
@@ -66,14 +68,36 @@ export function applyEvent(data: Conversation, event: TurnEvent): Conversation {
   }
 }
 
-export function mergeNewest(previous: Conversation | undefined, fresh: Conversation) {
-  const first = fresh.turns[0];
-  const at = previous && first ? previous.turns.findIndex((turn) => turn.id === first.id) : -1;
-  if (!previous || at < 0) {
+function keepLongerText(fresh: Turn, known: Turn | undefined): Turn {
+  if (fresh.status !== "running" || !known) {
     return fresh;
   }
+  const knownTexts = new Map<string, string>();
+  for (const item of known.items) {
+    if (item.type === "text") knownTexts.set(item.id, item.text);
+  }
   return {
-    turns: [...previous.turns.slice(0, at), ...fresh.turns],
+    ...fresh,
+    items: fresh.items.map((item) => {
+      if (item.type !== "text") return item;
+      const text = knownTexts.get(item.id);
+      return text !== undefined && text.length > item.text.length ? { ...item, text } : item;
+    }),
+  };
+}
+
+export function mergeNewest(previous: Conversation | undefined, fresh: Conversation) {
+  const known = new Map(previous?.turns.map((turn) => [turn.id, turn]));
+  const turns = fresh.turns.map((turn) => keepLongerText(turn, known.get(turn.id)));
+  const first = turns[0];
+  const at = previous && first ? previous.turns.findIndex((turn) => turn.id === first.id) : -1;
+  if (!previous || at < 0) {
+    return turns.every((turn, index) => turn === fresh.turns[index])
+      ? fresh
+      : { turns, hasMore: fresh.hasMore };
+  }
+  return {
+    turns: [...previous.turns.slice(0, at), ...turns],
     hasMore: at > 0 ? previous.hasMore : fresh.hasMore,
   };
 }
