@@ -86,6 +86,24 @@ pub fn set_auth_mode(
     )
 }
 
+pub fn workspace_paths(connection: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut statement = connection.prepare("SELECT workspace_path FROM agents")?;
+    let rows = statement.query_map([], |row| row.get(0))?;
+    rows.collect()
+}
+
+pub fn path_used_by_other(
+    connection: &Connection,
+    agent_id: &str,
+    path: &str,
+) -> rusqlite::Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM agents WHERE workspace_path = ?1 AND id <> ?2)",
+        params![path, agent_id],
+        |row| row.get(0),
+    )
+}
+
 pub fn workspace_of(
     connection: &Connection,
     agent_id: &str,
