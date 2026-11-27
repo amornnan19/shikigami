@@ -1,5 +1,4 @@
-import * as RadioGroup from "@radix-ui/react-radio-group";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { type FormEvent, useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
@@ -13,40 +12,20 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import {
-  AUTH_MODE_LABELS,
-  type AuthMode,
-  CLAUDE_AUTH_KEY,
-  getClaudeAuth,
-} from "@/features/providers/api";
-import { cn } from "@/lib/utils";
+  APP_DEFAULT_AUTH,
+  authModeOf,
+  ColorField,
+  DEFAULT_MODEL,
+  errorFor,
+  FieldError,
+  ModelField,
+  NAME_CODES,
+  SignInField,
+  useModelChoice,
+} from "./AgentFields";
 import { type Agent, type AgentError, asAgentError, createAgent } from "./api";
 import { AGENT_COLORS } from "./colors";
-import { CLAUDE_CODE, MODEL_SUGGESTIONS, modelProblem, nameProblem } from "./models";
-
-const OTHER_MODEL = "__other__";
-const DEFAULT_MODEL = "default";
-const APP_DEFAULT_AUTH = "app-default";
-const NAME_CODES = ["name-empty", "name-too-long", "name-taken"];
-
-function FieldError({ id, message }: { id: string; message: string | null }) {
-  if (!message) return null;
-  return (
-    <p id={id} role="alert" className="text-sm text-red-600">
-      {message}
-    </p>
-  );
-}
-
-function errorFor(error: AgentError | null, codes: string[]) {
-  return error && codes.includes(error.code) ? error.message : null;
-}
+import { CLAUDE_CODE, nameProblem } from "./models";
 
 function NewAgentForm({
   onOpenChange,
@@ -58,14 +37,9 @@ function NewAgentForm({
   const queryClient = useQueryClient();
   const [name, setName] = useState("");
   const [color, setColor] = useState<string>(AGENT_COLORS[0].name);
-  const [modelChoice, setModelChoice] = useState(DEFAULT_MODEL);
-  const [customModel, setCustomModel] = useState("");
+  const modelState = useModelChoice(DEFAULT_MODEL);
   const [authChoice, setAuthChoice] = useState<string>(APP_DEFAULT_AUTH);
   const [serverError, setServerError] = useState<AgentError | null>(null);
-  const claudeAuth = useQuery({ queryKey: CLAUDE_AUTH_KEY, queryFn: getClaudeAuth, retry: false });
-  const appDefaultLabel = claudeAuth.data
-    ? `Use app default (${AUTH_MODE_LABELS[claudeAuth.data.appMode]})`
-    : "Use app default";
 
   const create = useMutation({
     mutationFn: createAgent,
@@ -77,15 +51,13 @@ function NewAgentForm({
     onError: (error) => setServerError(asAgentError(error)),
   });
 
-  const model = modelChoice === OTHER_MODEL ? customModel.trim() : modelChoice;
-
   const clientNameProblem = nameProblem(name);
-  const clientModelProblem = modelChoice === OTHER_MODEL ? modelProblem(customModel) : null;
-  const valid = clientNameProblem === null && clientModelProblem === null && !create.isPending;
+  const valid = clientNameProblem === null && modelState.problem === null && !create.isPending;
 
   const nameError = errorFor(serverError, NAME_CODES);
   const modelError =
-    errorFor(serverError, ["model-invalid"]) ?? (customModel === "" ? null : clientModelProblem);
+    errorFor(serverError, ["model-invalid"]) ??
+    (modelState.custom === "" ? null : modelState.problem);
   const colorError = errorFor(serverError, ["color-invalid"]);
   const formError =
     serverError && ![...NAME_CODES, "model-invalid", "color-invalid"].includes(serverError.code)
@@ -100,8 +72,8 @@ function NewAgentForm({
       name,
       color,
       provider: CLAUDE_CODE,
-      model,
-      authMode: authChoice === APP_DEFAULT_AUTH ? null : (authChoice as AuthMode),
+      model: modelState.model,
+      authMode: authModeOf(authChoice),
     });
   }
 
@@ -123,79 +95,16 @@ function NewAgentForm({
         <FieldError id="agent-name-error" message={nameError} />
       </div>
 
-      <div className="flex flex-col gap-2">
-        <Label id="agent-color-label">Colour</Label>
-        <RadioGroup.Root
-          aria-labelledby="agent-color-label"
-          value={color}
-          onValueChange={setColor}
-          className="flex flex-wrap gap-2"
-        >
-          {AGENT_COLORS.map((entry) => (
-            <RadioGroup.Item
-              key={entry.name}
-              value={entry.name}
-              aria-label={entry.label}
-              className={cn(
-                "size-7 rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 data-[state=checked]:ring-2 data-[state=checked]:ring-foreground data-[state=checked]:ring-offset-2",
-                entry.swatch,
-              )}
-            />
-          ))}
-        </RadioGroup.Root>
-        <FieldError id="agent-color-error" message={colorError} />
-      </div>
+      <ColorField idPrefix="agent" value={color} onChange={setColor} error={colorError} />
 
-      <div className="flex flex-col gap-2">
-        <Label htmlFor="agent-model">Model</Label>
-        <Select
-          value={modelChoice}
-          onValueChange={(value) => {
-            setModelChoice(value);
-            setServerError(null);
-          }}
-        >
-          <SelectTrigger id="agent-model" aria-describedby="agent-model-error">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            {MODEL_SUGGESTIONS.map((suggestion) => (
-              <SelectItem key={suggestion} value={suggestion}>
-                {suggestion}
-              </SelectItem>
-            ))}
-            <SelectItem value={OTHER_MODEL}>Other...</SelectItem>
-          </SelectContent>
-        </Select>
-        {modelChoice === OTHER_MODEL && (
-          <Input
-            aria-label="Model name"
-            value={customModel}
-            autoComplete="off"
-            aria-invalid={modelError !== null}
-            aria-describedby="agent-model-error"
-            onChange={(event) => {
-              setCustomModel(event.target.value);
-              setServerError(null);
-            }}
-          />
-        )}
-        <FieldError id="agent-model-error" message={modelError} />
-      </div>
+      <ModelField
+        idPrefix="agent"
+        state={modelState}
+        error={modelError}
+        onEdit={() => setServerError(null)}
+      />
 
-      <div className="flex flex-col gap-2">
-        <Label htmlFor="agent-sign-in">Sign-in</Label>
-        <Select value={authChoice} onValueChange={setAuthChoice}>
-          <SelectTrigger id="agent-sign-in">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value={APP_DEFAULT_AUTH}>{appDefaultLabel}</SelectItem>
-            <SelectItem value="subscription">Claude subscription</SelectItem>
-            <SelectItem value="api-key">API key</SelectItem>
-          </SelectContent>
-        </Select>
-      </div>
+      <SignInField id="agent-sign-in" value={authChoice} onChange={setAuthChoice} />
 
       <FieldError id="agent-form-error" message={formError} />
       <DialogFooter>

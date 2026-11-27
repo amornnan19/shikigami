@@ -53,6 +53,28 @@ pub fn insert(connection: &Connection, agent: &Agent) -> Result<(), AgentError> 
         })
 }
 
+pub fn update(
+    connection: &Connection,
+    agent_id: &str,
+    name: Option<&str>,
+    color: Option<&str>,
+    model: Option<&str>,
+) -> Result<usize, AgentError> {
+    connection
+        .execute(
+            "UPDATE agents SET name = COALESCE(?1, name), color = COALESCE(?2, color), model = COALESCE(?3, model)
+             WHERE id = ?4",
+            params![name, color, model, agent_id],
+        )
+        .map_err(|error| {
+            if error.sqlite_error_code() == Some(ErrorCode::ConstraintViolation) {
+                AgentError::name_taken()
+            } else {
+                AgentError::database(error)
+            }
+        })
+}
+
 pub fn set_auth_mode(
     connection: &Connection,
     agent_id: &str,

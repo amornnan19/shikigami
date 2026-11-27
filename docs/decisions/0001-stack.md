@@ -90,6 +90,17 @@ The desktop shell (Tauri 2), the UI framework (React with TypeScript, Vite) and 
   markup or scripts to the page. Links and code blocks are replaced by our own components (links open
   in the default browser; code blocks have a Copy button). `remark-gfm` adds tables and task lists.
 
+### Moving a deleted agent's folder to the Trash: trash
+
+- Options: `trash` 5.4.0; `osascript` with Finder; a hand-written call to `NSFileManager`.
+- Chosen: `trash` 5.4.0 (exact pin, default features off), with its `NsFileManager` method.
+- Why: the crate calls `trashItemAtURL` and needs no extra permission and no child process. The
+  Finder method is the crate's default, but it runs `osascript` and can ask the user to allow
+  automation. The Rust side checks that the folder is a real directory inside the workspaces folder
+  before it calls the crate. Test builds (the `e2e` feature) replace the Trash with a plain move into
+  the folder named by `SHIKIGAMI_E2E_TRASH_DIR`, and refuse to run without it, so tests never fill
+  the user's Trash.
+
 ## Licenses
 
 | Dependency | License |
@@ -121,6 +132,7 @@ The desktop shell (Tauri 2), the UI framework (React with TypeScript, Vite) and 
 | `security-framework` 3.7.0 (checks that the Keychain item exists without reading the secret) | MIT or Apache-2.0 |
 | `zeroize` 1.9.2 (wipes the key from memory on drop) | Apache-2.0 or MIT |
 | `react-markdown` 10.1.0 and `remark-gfm` 4.0.1 (render agent replies as Markdown) | MIT |
+| `trash` 5.4.0 (moves a deleted agent's folder to the macOS Trash) | MIT |
 | `uuid` feature `v4` (random session ids for Claude Code; same crate as before) | MIT or Apache-2.0 |
 
 All listed licenses are permissive and compatible with PolyForm Noncommercial 1.0.0. Their notices

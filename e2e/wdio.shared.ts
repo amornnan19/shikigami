@@ -5,6 +5,8 @@ import { browser } from "@wdio/globals";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 export const workspacesRoot = join(root, "e2e", "artifacts", "workspaces");
+export const trashDir = join(root, "e2e", "artifacts", "trash");
+export const revealLog = join(root, "e2e", "artifacts", "reveal.log");
 const appBinaryPath = join(root, "src-tauri", "target", "debug", "shikigami");
 
 mkdirSync(join(root, "e2e", "artifacts"), { recursive: true });
