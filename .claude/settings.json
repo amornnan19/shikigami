@@ -19,7 +19,10 @@
       "Bash(bun run typecheck:*)",
       "Bash(bun run lint:*)",
       "Bash(bun run test:*)",
-      "Bash(bun run format:*)"
+      "Bash(bun run format:*)",
+      "Bash(bun run check:*)",
+      "Bash(bun run rust:*)",
+      "Bash(bunx biome check:*)"
     ],
     "deny": [
       "Bash(git push --force:*)",

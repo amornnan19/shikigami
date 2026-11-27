@@ -71,5 +71,18 @@ These come from the specs and hold for every feature:
 
 ## Checks
 
-Run the narrowest check for what changed, one at a time. Commands are added here in M0 once the
-project exists.
+Run the narrowest check for what changed, one at a time, narrowest first:
+
+1. `bunx biome check <changed files>`: lint and format check for the TypeScript files you changed.
+   `bun run format` fixes the whole repository with Biome.
+2. `bun run typecheck`: after any change in `src/`.
+3. `bunx vitest run <test file>`: the one test file for the code you changed. `bun run test` runs all.
+4. Rust changes in `src-tauri/`: `bun run rust:fmt`, then `bun run rust:lint` (clippy, warnings are
+   errors), then `bun run rust:test`.
+5. `bun run lint` checks the whole repository with Biome.
+6. `bun run check` runs every check above in sequence. Run it before you ask to ship an issue.
+
+The pre-commit hook (`.githooks/pre-commit`) runs automatically on every commit. It checks staged
+files with Biome and, when a staged file is under `src-tauri/`, runs `cargo fmt --check` and
+`cargo clippy`. It never changes files. `bun install` turns the hook on. Never bypass it: fix the
+error and commit again.
