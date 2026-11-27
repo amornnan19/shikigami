@@ -1,6 +1,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -104,8 +104,22 @@ pub fn read(folder: &Path) -> Result<Instructions, AgentError> {
     })
 }
 
+fn current_state(path: &Path) -> Result<Option<(Option<i64>, fs::Permissions)>, AgentError> {
+    Ok(open_regular(path)?.map(|(_, metadata)| (micros(&metadata), metadata.permissions())))
+}
+
 fn current_modified_at(path: &Path) -> Result<Option<i64>, AgentError> {
-    Ok(open_regular(path)?.and_then(|(_, metadata)| micros(&metadata)))
+    Ok(current_state(path)?.and_then(|(modified, _)| modified))
+}
+
+fn changed_on_disk() -> AgentError {
+    AgentError::new(
+        "changed-on-disk",
+        format!(
+            "{} changed on disk since you opened it.",
+            workspace::instruction_file()
+        ),
+    )
 }
 
 fn write_temp(folder: &Path, text: &str) -> Result<PathBuf, AgentError> {
@@ -137,24 +151,53 @@ pub fn write(
     expected_modified_at: Option<i64>,
     force: bool,
 ) -> Result<Written, AgentError> {
+    write_with(folder, text, expected_modified_at, force, &|| {})
+}
+
+fn write_with(
+    folder: &Path,
+    text: &str,
+    expected_modified_at: Option<i64>,
+    force: bool,
+    before_rename: &dyn Fn(),
+) -> Result<Written, AgentError> {
     if text.len() as u64 > MAX_BYTES {
         return Err(too_large());
     }
     let path = path_in(folder);
-    let current = current_modified_at(&path)?;
-    if !force && current != expected_modified_at {
+    let existing = current_state(&path)?;
+    let (current, permissions) = match existing {
+        Some((modified, permissions)) => (modified, Some(permissions)),
+        None => (None, None),
+    };
+    if permissions
+        .as_ref()
+        .is_some_and(|permissions| permissions.mode() & 0o222 == 0)
+    {
         return Err(AgentError::new(
-            "changed-on-disk",
-            format!(
-                "{} changed on disk since you opened it.",
-                workspace::instruction_file()
-            ),
+            "read-only",
+            format!("{} is read-only.", workspace::instruction_file()),
         ));
     }
+    if !force && current != expected_modified_at {
+        return Err(changed_on_disk());
+    }
     let temp = write_temp(folder, text)?;
-    if let Err(error) = fs::rename(&temp, &path) {
+    let finished = permissions
+        .map_or(Ok(()), |permissions| {
+            fs::set_permissions(&temp, permissions)
+        })
+        .map_err(io_failed)
+        .and_then(|()| {
+            before_rename();
+            if !force && current_modified_at(&path)? != current {
+                return Err(changed_on_disk());
+            }
+            fs::rename(&temp, &path).map_err(io_failed)
+        });
+    if let Err(error) = finished {
         let _ = fs::remove_file(&temp);
-        return Err(io_failed(error));
+        return Err(error);
     }
     Ok(Written {
         modified_at: current_modified_at(&path)?,
@@ -384,6 +427,59 @@ mod tests {
         write(folder.path(), "new", opened.modified_at, false).unwrap();
         assert_eq!(names(folder.path()), vec!["CLAUDE.md"]);
         assert_ne!(before.ino(), fs::metadata(&path).unwrap().ino());
+    }
+
+    #[test]
+    fn a_change_between_the_check_and_the_rename_is_refused_and_leaves_no_temp_file() {
+        let folder = folder_with("old");
+        let path = folder.path().join("CLAUDE.md");
+        set_mtime(&path, 1_000);
+        let opened = read(folder.path()).unwrap();
+        let error = write_with(folder.path(), "mine", opened.modified_at, false, &|| {
+            set_mtime(&path, 2_000)
+        })
+        .unwrap_err();
+        assert_eq!(error.code, "changed-on-disk");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "old");
+        assert_eq!(names(folder.path()), vec!["CLAUDE.md"]);
+    }
+
+    #[test]
+    fn a_forced_write_ignores_a_change_before_the_rename() {
+        let folder = folder_with("old");
+        let path = folder.path().join("CLAUDE.md");
+        write_with(folder.path(), "mine", None, true, &|| {
+            set_mtime(&path, 2_000)
+        })
+        .unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "mine");
+    }
+
+    #[test]
+    fn a_write_keeps_the_permissions_of_the_file_it_replaces() {
+        let folder = folder_with("old");
+        let path = folder.path().join("CLAUDE.md");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        let opened = read(folder.path()).unwrap();
+        write(folder.path(), "new", opened.modified_at, false).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o640);
+    }
+
+    #[test]
+    fn a_read_only_file_is_refused_even_when_forced_and_stays_as_it_was() {
+        let folder = folder_with("old");
+        let path = folder.path().join("CLAUDE.md");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+        let opened = read(folder.path()).unwrap();
+        for force in [false, true] {
+            assert_eq!(
+                code(write(folder.path(), "new", opened.modified_at, force)),
+                "read-only"
+            );
+        }
+        assert_eq!(fs::read_to_string(&path).unwrap(), "old");
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o444);
+        assert_eq!(names(folder.path()), vec!["CLAUDE.md"]);
     }
 
     #[test]

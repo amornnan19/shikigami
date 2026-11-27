@@ -48,6 +48,9 @@ foreign keys on only after the run and a clean `PRAGMA foreign_key_check`. SQLit
 `foreign_keys` inside a transaction, so a table rebuild with foreign keys on would cascade-delete
 every child row. Never edit a migration that has been merged; add a new one.
 
+A workspace folder belongs to exactly one agent row. Code that creates, recreates, moves or trashes a
+workspace folder must check that no other agent row records that path.
+
 ## Running agent CLIs
 
 A CLI that Shikigami starts gets an explicit PATH built from the provider search list; a

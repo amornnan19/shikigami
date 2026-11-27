@@ -93,7 +93,17 @@ fn trash_target(root: &Result<PathBuf, String>, recorded: &str) -> Result<PathBu
     Ok(folder)
 }
 
-fn delete_row(connection: &Connection, agent_id: &str) -> Result<String, AgentError> {
+pub const SHARED_FOLDER_MESSAGE: &str = "Another agent uses this folder.";
+
+fn resolved(path: &str) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path))
+}
+
+fn overlaps(first: &Path, second: &Path) -> bool {
+    first.starts_with(second) || second.starts_with(first)
+}
+
+fn delete_row(connection: &Connection, agent_id: &str) -> Result<(String, bool), AgentError> {
     let transaction = connection
         .unchecked_transaction()
         .map_err(AgentError::database)?;
@@ -121,11 +131,23 @@ fn delete_row(connection: &Connection, agent_id: &str) -> Result<String, AgentEr
             "Stop the agent before deleting it.",
         ));
     }
+    let others: Vec<String> = transaction
+        .prepare("SELECT workspace_path FROM agents WHERE id <> ?1")
+        .and_then(|mut statement| {
+            statement
+                .query_map([agent_id], |row| row.get(0))
+                .and_then(|rows| rows.collect())
+        })
+        .map_err(AgentError::database)?;
+    let target = resolved(&recorded);
+    let shared = others
+        .iter()
+        .any(|other| overlaps(&target, &resolved(other)));
     transaction
         .execute("DELETE FROM agents WHERE id = ?1", [agent_id])
         .map_err(AgentError::database)?;
     transaction.commit().map_err(AgentError::database)?;
-    Ok(recorded)
+    Ok((recorded, shared))
 }
 
 pub fn delete(
@@ -135,12 +157,15 @@ pub fn delete(
     move_folder_to_trash: bool,
     trasher: &dyn Fn(&Path) -> Result<(), String>,
 ) -> Result<Deleted, AgentError> {
-    let recorded = db.with_connection(|connection| delete_row(connection, agent_id))?;
+    let (recorded, shared) = db.with_connection(|connection| delete_row(connection, agent_id))?;
     if !move_folder_to_trash {
         return Ok(Deleted {
             folder_kept: true,
             reason: None,
         });
+    }
+    if shared {
+        return Ok(Deleted::folder_left(SHARED_FOLDER_MESSAGE));
     }
     Ok(match trash_target(root, &recorded) {
         Err(reason) => Deleted::folder_left(reason),

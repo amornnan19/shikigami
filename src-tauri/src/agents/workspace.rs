@@ -38,7 +38,7 @@ pub fn instruction_text(name: &str) -> String {
     format!("# {name}\n\nYou are {name}, a coding agent working in this folder.\n")
 }
 
-pub fn create_folder(root: &Path, name: &str) -> io::Result<PathBuf> {
+pub fn create_folder(root: &Path, name: &str, recorded: &[PathBuf]) -> io::Result<PathBuf> {
     fs::create_dir_all(root)?;
     let base = folder_name(name);
     let mut attempt = 1u32;
@@ -49,6 +49,10 @@ pub fn create_folder(root: &Path, name: &str) -> io::Result<PathBuf> {
             format!("{base}-{attempt}")
         };
         let path = root.join(candidate);
+        if recorded.contains(&path) {
+            attempt += 1;
+            continue;
+        }
         match fs::create_dir(&path) {
             Ok(()) => return Ok(path),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => attempt += 1,
@@ -96,19 +100,28 @@ mod tests {
     #[test]
     fn colliding_names_get_numbered_folders() {
         let root = tempfile::tempdir().unwrap();
-        let first = create_folder(root.path(), "Test Agent").unwrap();
-        let second = create_folder(root.path(), "test agent").unwrap();
-        let third = create_folder(root.path(), "TEST-AGENT").unwrap();
+        let first = create_folder(root.path(), "Test Agent", &[]).unwrap();
+        let second = create_folder(root.path(), "test agent", &[]).unwrap();
+        let third = create_folder(root.path(), "TEST-AGENT", &[]).unwrap();
         assert_eq!(first.file_name().unwrap(), "test-agent");
         assert_eq!(second.file_name().unwrap(), "test-agent-2");
         assert_eq!(third.file_name().unwrap(), "test-agent-3");
     }
 
     #[test]
+    fn a_recorded_path_is_skipped_even_when_its_folder_is_missing() {
+        let root = tempfile::tempdir().unwrap();
+        let recorded = vec![root.path().join("test-agent")];
+        let folder = create_folder(root.path(), "Test Agent", &recorded).unwrap();
+        assert_eq!(folder.file_name().unwrap(), "test-agent-2");
+        assert!(!recorded[0].exists());
+    }
+
+    #[test]
     fn the_root_is_created_when_missing() {
         let base = tempfile::tempdir().unwrap();
         let root = base.path().join("deep").join("agents");
-        let folder = create_folder(&root, "a").unwrap();
+        let folder = create_folder(&root, "a", &[]).unwrap();
         assert!(folder.is_dir());
     }
 

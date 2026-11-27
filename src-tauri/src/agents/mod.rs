@@ -229,7 +229,14 @@ fn persist(
     valid: Validated,
     app: &AppAuth,
 ) -> Result<Agent, AgentError> {
-    let folder = workspace::create_folder(root, &valid.name).map_err(AgentError::folder)?;
+    let recorded: Vec<PathBuf> = db
+        .with_connection(store::workspace_paths)
+        .map_err(AgentError::database)?
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    let folder =
+        workspace::create_folder(root, &valid.name, &recorded).map_err(AgentError::folder)?;
     let now = now_millis();
     let agent = Agent {
         id: uuid::Uuid::now_v7().to_string(),
@@ -313,6 +320,15 @@ fn recreate(
         .with_connection(|connection| store::workspace_of(connection, agent_id))
         .map_err(AgentError::database)?
         .ok_or_else(|| AgentError::new("not-found", "This agent no longer exists."))?;
+    let shared = db
+        .with_connection(|connection| store::path_used_by_other(connection, agent_id, &path))
+        .map_err(AgentError::database)?;
+    if shared {
+        return Err(AgentError::new(
+            "folder-in-use",
+            remove::SHARED_FOLDER_MESSAGE,
+        ));
+    }
     let folder = PathBuf::from(path);
     fs::create_dir_all(&folder).map_err(AgentError::folder)?;
     match workspace::write_instruction_file(&folder, &name) {
@@ -1122,6 +1138,111 @@ mod tests {
         let fx = Fixture::new(&["claude"]);
         let error = recreate(&fx.db, &fx.dirs(), &APP_AUTH, "nope").unwrap_err();
         assert_eq!(error.code, "not-found");
+    }
+
+    fn share_path(fx: &Fixture, from: &Agent, to: &Agent) {
+        fx.db.with_connection(|c| {
+            c.execute(
+                "UPDATE agents SET workspace_path = ?1 WHERE id = ?2",
+                rusqlite::params![from.workspace_path, to.id],
+            )
+            .unwrap();
+        });
+    }
+
+    #[test]
+    fn deleting_an_agent_whose_folder_another_agent_records_never_trashes_it() {
+        let fx = Fixture::new(&["claude"]);
+        let first = fx.create("First", "claude-code").unwrap();
+        let second = fx.create("Second", "claude-code").unwrap();
+        share_path(&fx, &first, &second);
+        let outcome = delete_agent_of(&fx, &first, true, &never_trash).unwrap();
+        assert!(outcome.folder_kept);
+        assert_eq!(
+            outcome.reason.as_deref(),
+            Some("Another agent uses this folder.")
+        );
+        assert_eq!(fx.agent_count(), 1);
+        assert!(fx
+            .workspaces
+            .path()
+            .join("first")
+            .join("CLAUDE.md")
+            .is_file());
+    }
+
+    #[test]
+    fn a_folder_that_contains_or_sits_inside_another_agents_folder_is_kept_too() {
+        let fx = Fixture::new(&["claude"]);
+        let outer = fx.create("Outer", "claude-code").unwrap();
+        let inner = fx.create("Inner", "claude-code").unwrap();
+        let nested = fx.workspaces.path().join("outer").join("nested");
+        fs::create_dir(&nested).unwrap();
+        fx.db.with_connection(|c| {
+            c.execute(
+                "UPDATE agents SET workspace_path = ?1 WHERE id = ?2",
+                rusqlite::params![nested.to_str().unwrap(), inner.id],
+            )
+            .unwrap();
+        });
+        let outcome = delete_agent_of(&fx, &outer, true, &never_trash).unwrap();
+        assert_eq!(
+            outcome.reason.as_deref(),
+            Some("Another agent uses this folder.")
+        );
+        assert!(nested.is_dir());
+    }
+
+    #[test]
+    fn a_folder_nested_in_another_agents_folder_is_kept() {
+        let fx = Fixture::new(&["claude"]);
+        let outer = fx.create("Outer", "claude-code").unwrap();
+        let inner = fx.create("Inner", "claude-code").unwrap();
+        let nested = fx.workspaces.path().join("outer").join("nested");
+        fs::create_dir(&nested).unwrap();
+        fx.db.with_connection(|c| {
+            c.execute(
+                "UPDATE agents SET workspace_path = ?1 WHERE id = ?2",
+                rusqlite::params![nested.to_str().unwrap(), inner.id],
+            )
+            .unwrap();
+        });
+        let outcome = delete_agent_of(&fx, &inner, true, &never_trash).unwrap();
+        assert_eq!(
+            outcome.reason.as_deref(),
+            Some("Another agent uses this folder.")
+        );
+        assert!(nested.is_dir());
+        assert_eq!(fx.agent_count(), 1);
+        assert_eq!(fx.list()[0].id, outer.id);
+    }
+
+    #[test]
+    fn a_new_agent_skips_a_path_another_agent_records_even_when_the_folder_is_gone() {
+        let fx = Fixture::new(&["claude"]);
+        let first = fx.create("Test Agent", "claude-code").unwrap();
+        fs::remove_dir_all(&first.workspace_path).unwrap();
+        let second = fx.create("test-agent", "claude-code").unwrap();
+        assert_ne!(second.workspace_path, first.workspace_path);
+        assert!(second.workspace_path.ends_with("test-agent-2"));
+    }
+
+    #[test]
+    fn recreating_refuses_a_path_another_agent_records() {
+        let fx = Fixture::new(&["claude"]);
+        let first = fx.create("First", "claude-code").unwrap();
+        let second = fx.create("Second", "claude-code").unwrap();
+        fs::remove_dir_all(&second.workspace_path).unwrap();
+        share_path(&fx, &first, &second);
+        let error = recreate(&fx.db, &fx.dirs(), &APP_AUTH, &second.id).unwrap_err();
+        assert_eq!(error.code, "folder-in-use");
+        assert_eq!(error.message, "Another agent uses this folder.");
+        assert!(fx
+            .workspaces
+            .path()
+            .join("first")
+            .join("CLAUDE.md")
+            .is_file());
     }
 
     #[test]
