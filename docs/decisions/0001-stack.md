@@ -81,6 +81,9 @@ The desktop shell (Tauri 2), the UI framework (React with TypeScript, Vite) and 
 | refinery | MIT |
 | Tokio | MIT |
 | serde, serde_json | MIT or Apache-2.0 |
+| uuid | MIT or Apache-2.0 |
+| thiserror | MIT or Apache-2.0 |
+| tempfile (tests only) | MIT or Apache-2.0 |
 | Biome | MIT or Apache-2.0 |
 | Vitest | MIT |
 | WebdriverIO | MIT |
