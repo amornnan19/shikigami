@@ -1,35 +1,44 @@
 ---
 name: ship-issue
-description: Finish one Shikigami GitHub issue - verify its acceptance checks, review the diff, ask the user to approve the commit, then commit, push and open a pull request. Use when the work for an issue is done and the user wants to wrap it up, or says ship.
+description: Land one Shikigami GitHub issue - verify, commit, push, open a pull request with the standard body, merge it with a rebase, and sync main. Use when the work for an issue is done and checked, or the user says ship.
 ---
 
 # Ship one issue
 
-The user approves every commit and every push. Never skip that.
+`main` is protected: every change lands through a pull request; no review approval is required.
+Commit, push and merge need the user's approval unless the user has allowed them for the session.
 
 ## Steps
 
-1. Identify the issue: from the branch name (`<number>-<slug>`) or ask. Read it:
-   `gh issue view <number>`.
-2. If you are on `main`, create the branch first: `git switch -c <number>-<slug>`.
-3. Verify:
-   - Run the checks listed under "Checks" in `CLAUDE.md` that cover the changed files, one at a
-     time. Paste the real result.
-   - Go through every acceptance check in the issue. Each one is proven by a command result, a
-     test, or a screenshot of the running app, or reported as not verified. A check that can pass
-     by luck runs three times.
-4. Review:
-   - Read `git diff main...` yourself.
-   - For new logic, anything touching the sandbox, approvals, permissions, deletion or the
-     database, ask the `reviewer` agent for a review and fix what it finds.
-   - Clean-room check: `git diff main... | grep -niE 'openbot|openbot-reference'` must find nothing
-     but the clean-room rule itself. Nothing in the diff may come from `../openbot-reference`.
-5. Ask the user for approval. Show:
-   - the files changed and a short summary,
-   - the check results, including anything not verified,
-   - the commit message: Conventional Commits, `Closes #<number>` in the body.
-6. After approval: commit. Then ask before pushing; push with `git push -u origin <branch>`.
-7. Open a pull request when the user agrees:
-   `gh pr create --title "<commit subject>" --body-file <file> --milestone "<milestone title>"`.
-   The body lists what changed, how it was verified, and `Closes #<number>`.
-8. Do not merge. The user merges.
+1. Verify before committing:
+   - `bun run check` passes, and `bun run e2e` when UI or e2e changed. Paste real results.
+   - Every acceptance check in the issue is proven (command output, test, screenshot) or listed as
+     not verified.
+   - Clean-room: `git diff main... | grep -niE 'openbot'` finds nothing but the clean-room rule.
+2. Commit on the issue branch with Conventional Commits; the body ends with `Closes #<n>` (or
+   `Refs #<n>` for a partial commit). Stage only intended files; `.claude/agent-memory/` and
+   `.claude/settings.local.json` are ignored.
+3. If the branch was cut from another unmerged branch, rebase it first:
+   `git fetch origin && git rebase --onto origin/main <old-base-commit>`.
+4. Push: `git push -u origin <branch>`. Never force-push. If the remote branch already has commits
+   that a rebase replaced, push to a new branch name instead and delete the old remote branch after
+   the merge.
+5. Open the pull request with a body file in the scratchpad:
+
+   ```markdown
+   ## What changed
+   - ...
+
+   ## Verification
+   - real check results, test counts, manual checks, review outcome
+   - anything not verified, said plainly
+
+   Closes #<n>
+   ```
+
+   `gh pr create --base main --head <branch> --title "<commit subject>" --body-file <file> --milestone "<milestone>"`
+6. Merge: wait a few seconds after creating, then
+   `gh pr merge <branch> --rebase --delete-branch`. Confirm the issue is closed.
+7. Sync: `git switch main && git pull --ff-only`, delete the local branch.
+8. When a milestone has no open issues left, close it:
+   `gh api -X PATCH repos/amornnan19/shikigami/milestones/<number> -f state=closed`.
