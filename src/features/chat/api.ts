@@ -65,8 +65,8 @@ export function sendMessage(agentId: string, text: string) {
   return invoke<SendResult>("send_message", { agentId, text });
 }
 
-export function stopTurn(agentId: string) {
-  return invoke<void>("stop_turn", { agentId });
+export function stopTurn(agentId: string, turnId: string) {
+  return invoke<void>("stop_turn", { agentId, turnId });
 }
 
 export function listQueue(agentId: string) {

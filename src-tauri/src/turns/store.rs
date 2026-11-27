@@ -96,7 +96,10 @@ pub struct QueuedMessage {
 
 pub enum Sent {
     Started(Begun),
-    Queued(QueuedMessage),
+    Queued {
+        queued: QueuedMessage,
+        started: Option<Advanced>,
+    },
 }
 
 pub struct Advanced {
@@ -124,10 +127,24 @@ pub fn begin_or_queue(
     now: i64,
 ) -> Result<Sent, BeginError> {
     let transaction = connection.unchecked_transaction()?;
-    let sent = match begin_in(&transaction, agent_id, text, now) {
-        Ok(begun) => Sent::Started(begun),
-        Err(BeginError::Busy) => Sent::Queued(enqueue(&transaction, agent_id, text, now)?),
-        Err(error) => return Err(error),
+    let backlog: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM queued_messages WHERE agent_id = ?1)",
+        [agent_id],
+        |row| row.get(0),
+    )?;
+    let sent = if backlog {
+        let queued = enqueue(&transaction, agent_id, text, now)?;
+        let started = advance_in(&transaction, agent_id, now)?;
+        Sent::Queued { queued, started }
+    } else {
+        match begin_in(&transaction, agent_id, text, now) {
+            Ok(begun) => Sent::Started(begun),
+            Err(BeginError::Busy) => Sent::Queued {
+                queued: enqueue(&transaction, agent_id, text, now)?,
+                started: None,
+            },
+            Err(error) => return Err(error),
+        }
     };
     transaction.commit()?;
     Ok(sent)
@@ -262,12 +279,19 @@ pub fn remove_queued(connection: &Connection, queued_id: &str) -> rusqlite::Resu
         .optional()
 }
 
-pub fn advance_queue(
-    connection: &Connection,
+fn advance_in(
+    transaction: &Connection,
     agent_id: &str,
     now: i64,
 ) -> Result<Option<Advanced>, BeginError> {
-    let transaction = connection.unchecked_transaction()?;
+    let running: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM turns WHERE agent_id = ?1 AND status = 'running')",
+        [agent_id],
+        |row| row.get(0),
+    )?;
+    if running {
+        return Ok(None);
+    }
     let next: Option<(String, String)> = transaction
         .query_row(
             "SELECT id, content FROM queued_messages WHERE agent_id = ?1
@@ -280,14 +304,19 @@ pub fn advance_queue(
         return Ok(None);
     };
     transaction.execute("DELETE FROM queued_messages WHERE id = ?1", [queued_id])?;
-    match begin_in(&transaction, agent_id, &text, now) {
-        Ok(begun) => {
-            transaction.commit()?;
-            Ok(Some(Advanced { begun, text }))
-        }
-        Err(BeginError::Busy) => Ok(None),
-        Err(error) => Err(error),
-    }
+    let begun = begin_in(transaction, agent_id, &text, now)?;
+    Ok(Some(Advanced { begun, text }))
+}
+
+pub fn advance_queue(
+    connection: &Connection,
+    agent_id: &str,
+    now: i64,
+) -> Result<Option<Advanced>, BeginError> {
+    let transaction = connection.unchecked_transaction()?;
+    let advanced = advance_in(&transaction, agent_id, now)?;
+    transaction.commit()?;
+    Ok(advanced)
 }
 
 pub fn set_session(

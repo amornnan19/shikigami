@@ -93,7 +93,7 @@ describe("chat", () => {
   it("stops a running turn and keeps the partial reply", async () => {
     await send("SLOW stop me");
     const turn = $(`${agentView} article:nth-of-type(3)`);
-    await expect($(stopButton)).toBeDisplayed({ wait: 15000 });
+    await expect($(stopButton)).toBeEnabled({ wait: 15000 });
     await expect(turn).toHaveText(expect.stringContaining("Counting slowly."), { wait: 15000 });
     await expect($(messageBox)).toBeEnabled();
     await expect($(agentView)).toHaveText(
@@ -116,6 +116,7 @@ describe("chat", () => {
     await queueMessage("queued two");
     await expect($(queue)).toHaveText(expect.stringContaining("Queued (2)"), { wait: 15000 });
     await expect($(messageBox)).toHaveValue("");
+    await expect($(stopButton)).toBeEnabled();
     await scrollToEnd();
     await browser.saveScreenshot(join(artifacts, "chat-queue.png"));
     await $(`${queue} li:nth-child(1)`).$("button=Edit").click();

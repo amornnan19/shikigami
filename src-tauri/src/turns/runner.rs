@@ -11,7 +11,9 @@ use tokio::time::timeout;
 use super::claude_code::{self, Parsed, Session, StepStart, StreamParser};
 use super::redact::Redactor;
 use super::store::{self, StepView};
-use super::{EventSink, Launch, TurnEnvelope, TurnEvent, TurnRegistry};
+use super::{
+    kill_group_after, EventSink, Launch, TurnEnvelope, TurnEvent, TurnRegistry, EXIT_TERM_GRACE,
+};
 use crate::agents::now_millis;
 use crate::api_key::ApiKeyError;
 use crate::db::Database;
@@ -366,7 +368,7 @@ impl Runner<'_> {
         }
     }
 
-    fn finish(&mut self, status: &str, error: Option<String>) -> String {
+    fn finish(&mut self, status: &str, error: Option<String>) {
         self.flush_texts();
         let error = error.map(|message| self.redactor.redact(&message));
         let (status, error) = if status == "completed" && self.save_failed {
@@ -390,7 +392,6 @@ impl Runner<'_> {
             status: status.to_owned(),
             error,
         });
-        status.to_owned()
     }
 
     fn command(&self, launch: &Launch, session: &Session, key: &ApiKey) -> Option<Command> {
@@ -420,6 +421,10 @@ impl Runner<'_> {
 
     async fn attempt(&mut self, launch: &Launch, session: &Session, key: &ApiKey) -> Attempt {
         let mut attempt = Attempt::default();
+        if self.registry.is_closing() || self.registry.stop_requested(&self.agent_id, &self.turn_id)
+        {
+            return attempt;
+        }
         let Some(mut command) = self.command(launch, session, key) else {
             attempt.failure = Some("Could not start Claude Code.".to_owned());
             return attempt;
@@ -430,15 +435,20 @@ impl Runner<'_> {
         };
         attempt.spawned = true;
         if let Some(group) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
-            self.registry.set_group(&self.agent_id, group);
+            if self
+                .registry
+                .set_group(&self.agent_id, &self.turn_id, group)
+            {
+                tokio::spawn(kill_group_after(group, EXIT_TERM_GRACE));
+            }
         }
         let (Some(mut stdin), Some(stdout), Some(stderr)) =
             (child.stdin.take(), child.stdout.take(), child.stderr.take())
         else {
             attempt.failure = Some("Could not start Claude Code.".to_owned());
-            self.registry.kill(&self.agent_id);
+            self.registry.kill(&self.agent_id, &self.turn_id);
             let _ = child.wait().await;
-            self.registry.clear_group(&self.agent_id);
+            self.registry.clear_group(&self.agent_id, &self.turn_id);
             return attempt;
         };
         let message = launch.text.clone();
@@ -465,22 +475,22 @@ impl Runner<'_> {
                 Ok(Line::TooLong) => {
                     attempt.failure =
                         Some("Claude Code sent a line that is too long to read.".to_owned());
-                    self.registry.kill(&self.agent_id);
+                    self.registry.kill(&self.agent_id, &self.turn_id);
                     break;
                 }
                 Err(_) => {
                     attempt.failure = Some("Could not read the output of Claude Code.".to_owned());
-                    self.registry.kill(&self.agent_id);
+                    self.registry.kill(&self.agent_id, &self.turn_id);
                     break;
                 }
             }
         }
         drop(reader);
         if timeout(EXIT_GRACE, child.wait()).await.is_err() {
-            self.registry.kill(&self.agent_id);
+            self.registry.kill(&self.agent_id, &self.turn_id);
             let _ = child.wait().await;
         }
-        self.registry.clear_group(&self.agent_id);
+        self.registry.clear_group(&self.agent_id, &self.turn_id);
         match timeout(STDERR_GRACE, &mut stderr_task).await {
             Ok(Ok(summary)) => attempt.stderr = summary,
             _ => stderr_task.abort(),
@@ -510,11 +520,11 @@ pub async fn run(
     registry: &TurnRegistry,
     launch: Launch,
     key: ApiKey,
-) -> String {
-    let agent_id = launch.agent_id.clone();
-    let status = run_turn(db, sink, registry, launch, key).await;
-    registry.clear(&agent_id);
-    status
+) -> bool {
+    let (agent_id, turn_id) = (launch.agent_id.clone(), launch.turn_id.clone());
+    let advance = run_turn(db, sink, registry, launch, key).await;
+    registry.clear(&agent_id, &turn_id);
+    advance
 }
 
 async fn run_turn(
@@ -523,7 +533,7 @@ async fn run_turn(
     registry: &TurnRegistry,
     launch: Launch,
     key: ApiKey,
-) -> String {
+) -> bool {
     let stored_session = match &launch.session {
         Session::New(id) | Session::Resume(id) => id.clone(),
     };
@@ -543,16 +553,18 @@ async fn run_turn(
     };
     runner.emit(TurnEvent::Started);
     if !launch.workspace.is_dir() {
-        return runner.finish(
+        runner.finish(
             "failed",
             Some("The workspace folder is missing.".to_owned()),
         );
+        return false;
     }
     if matches!(key, ApiKey::Unreadable) {
-        return runner.finish(
+        runner.finish(
             "failed",
             Some("Could not read the saved API key.".to_owned()),
         );
+        return false;
     }
     let mut session = launch.session.clone();
     let mut attempt = runner.attempt(&launch, &session, &key).await;
@@ -560,22 +572,29 @@ async fn run_turn(
         && !attempt.saw_init
         && !attempt.succeeded()
         && attempt.session_missing()
-        && !registry.stop_requested(&launch.agent_id)
+        && !registry.stop_requested(&launch.agent_id, &launch.turn_id)
     {
         session = Session::New(uuid::Uuid::new_v4().to_string());
         runner.add_notice(RESUME_NOTICE);
         attempt = runner.attempt(&launch, &session, &key).await;
+    }
+    if registry.is_closing() {
+        runner.flush_texts();
+        return false;
     }
     if matches!(session, Session::New(_)) && !attempt.saw_init {
         let agent_id = runner.agent_id.clone();
         runner.save(|connection| store::set_session(connection, &agent_id, None));
     }
     if attempt.succeeded() {
-        runner.finish("completed", None)
-    } else if registry.stop_requested(&launch.agent_id) {
-        runner.finish("stopped", None)
+        runner.finish("completed", None);
+        true
+    } else if registry.stop_requested(&launch.agent_id, &launch.turn_id) {
+        runner.finish("stopped", None);
+        true
     } else {
-        runner.finish("failed", Some(failure_of(&attempt)))
+        runner.finish("failed", Some(failure_of(&attempt)));
+        attempt.spawned
     }
 }
 
@@ -585,12 +604,12 @@ mod tests {
     use crate::api_key::key_for_turn;
     use crate::secrets::{SecretError, SecretStore};
     use crate::turns::claude_code::assert_isolated;
-    use crate::turns::escalate_stop;
     use crate::turns::store::{self as turn_store, ItemView};
     use std::ffi::OsString;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::Ordering;
     use std::sync::Mutex;
 
     const BASIC: &str = include_str!("../../tests/fixtures/claude-stream-basic.jsonl");
@@ -1299,18 +1318,19 @@ mod tests {
         ])
     }
 
-    async fn run_and_stop(world: &World, grace: Duration) -> (String, Duration) {
+    async fn run_and_stop(world: &World, grace: Duration) -> (bool, Duration) {
         let launch = world.launch("go");
-        world.registry.begin("a");
+        let turn_id = launch.turn_id.clone();
+        assert!(world.registry.begin("a", &turn_id));
         let started = Instant::now();
         let stopper = async {
             while !world.sink.kinds().iter().any(|kind| kind == "step-started") {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            assert!(world.registry.request_stop("a"));
-            escalate_stop(&world.registry, "a", grace).await;
+            let target = world.registry.request_stop("a", &turn_id).unwrap();
+            kill_group_after(target.group.unwrap(), grace).await;
         };
-        let (status, ()) = timeout(Duration::from_secs(10), async {
+        let (advance, ()) = timeout(Duration::from_secs(10), async {
             tokio::join!(
                 run(
                     &world.db,
@@ -1324,23 +1344,23 @@ mod tests {
         })
         .await
         .expect("a stopped turn must end");
-        (status, started.elapsed())
+        (advance, started.elapsed())
     }
 
-    fn install_streaming_then(world: &World, rest: &str) {
+    fn install_streaming_then(world: &World, before: &str, rest: &str) {
         let fixture = world.fixture("partial.jsonl", &partial_stream());
         world.install(&recording(
             world,
-            &format!("cat \"{}\"\n{rest}", fixture.display()),
+            &format!("{before}\ncat \"{}\"\n{rest}", fixture.display()),
         ));
     }
 
     #[tokio::test]
     async fn a_stop_ends_the_turn_stopped_and_keeps_the_partial_reply_redacted() {
         let world = World::new();
-        install_streaming_then(&world, "sleep 30");
-        let (status, elapsed) = run_and_stop(&world, Duration::from_secs(2)).await;
-        assert_eq!(status, "stopped");
+        install_streaming_then(&world, "", "sleep 30");
+        let (advance, elapsed) = run_and_stop(&world, Duration::from_secs(2)).await;
+        assert!(advance);
         assert!(elapsed < Duration::from_secs(3));
         let turn = only_turn(&world);
         assert_eq!(turn.status, "stopped");
@@ -1365,9 +1385,8 @@ mod tests {
     #[tokio::test]
     async fn a_child_that_ignores_the_term_signal_is_killed_after_the_grace() {
         let world = World::new();
-        install_streaming_then(&world, "trap '' TERM\nwhile true; do sleep 1; done");
-        let (status, elapsed) = run_and_stop(&world, Duration::from_millis(300)).await;
-        assert_eq!(status, "stopped");
+        install_streaming_then(&world, "", "trap '' TERM\nwhile true; do sleep 1; done");
+        let (_, elapsed) = run_and_stop(&world, Duration::from_millis(300)).await;
         assert!(elapsed >= Duration::from_millis(300));
         assert!(elapsed < Duration::from_secs(3));
         assert_eq!(only_turn(&world).status, "stopped");
@@ -1377,9 +1396,9 @@ mod tests {
     async fn a_stop_is_never_retried_as_a_missing_session() {
         let world = World::new();
         with_old_session(&world);
-        install_streaming_then(&world, "echo 'No conversation found' >&2\nsleep 30");
-        let (status, _) = run_and_stop(&world, Duration::from_secs(2)).await;
-        assert_eq!(status, "stopped");
+        install_streaming_then(&world, "echo 'No conversation found' >&2", "sleep 30");
+        run_and_stop(&world, Duration::from_secs(2)).await;
+        assert_eq!(only_turn(&world).status, "stopped");
         assert!(has_record(&world, "args.0"));
         assert!(!has_record(&world, "args.1"));
         let turn = only_turn(&world);
@@ -1390,14 +1409,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_stop_requested_before_the_process_registers_still_stops_it() {
+    async fn a_stop_requested_before_the_spawn_ends_stopped_without_starting_a_process() {
         let world = World::new();
-        world.install(&recording(&world, "sleep 30"));
         let launch = world.launch("go");
-        world.registry.begin("a");
-        assert!(world.registry.request_stop("a"));
+        assert!(world.registry.begin("a", &launch.turn_id));
+        assert!(world.registry.request_stop("a", &launch.turn_id).is_some());
         let started = Instant::now();
-        let status = timeout(
+        let advance = timeout(
             Duration::from_secs(10),
             run(
                 &world.db,
@@ -1409,9 +1427,166 @@ mod tests {
         )
         .await
         .expect("a stopped turn must end");
-        assert_eq!(status, "stopped");
+        assert!(advance);
         assert!(started.elapsed() < Duration::from_secs(3));
-        assert_eq!(only_turn(&world).status, "stopped");
+        let turn = only_turn(&world);
+        assert_eq!(turn.status, "stopped");
+        assert_eq!(turn.error, None);
+    }
+
+    #[tokio::test]
+    async fn a_turn_stopped_by_another_turns_request_is_not_affected() {
+        let world = World::new();
+        let fixture = world.fixture("basic.jsonl", BASIC);
+        world.install(&recording(
+            &world,
+            &format!("cat \"{}\"", fixture.display()),
+        ));
+        let launch = world.launch("go");
+        assert!(world.registry.begin("a", &launch.turn_id));
+        assert!(world.registry.request_stop("a", "an-older-turn").is_none());
+        let advance = run(
+            &world.db,
+            &world.sink,
+            &world.registry,
+            launch,
+            ApiKey::Absent,
+        )
+        .await;
+        assert!(advance);
+        assert_eq!(only_turn(&world).status, "completed");
+    }
+
+    #[tokio::test]
+    async fn a_closing_app_starts_no_process_and_leaves_the_turn_for_the_startup_sweep() {
+        let world = World::new();
+        world.install(&recording(&world, "sleep 30"));
+        world.registry.closing.store(true, Ordering::SeqCst);
+        let launch = world.launch("go");
+        let advance = run(
+            &world.db,
+            &world.sink,
+            &world.registry,
+            launch,
+            ApiKey::Absent,
+        )
+        .await;
+        assert!(!advance);
+        assert!(!has_record(&world, "args.0"));
+        assert_eq!(only_turn(&world).status, "running");
+        assert!(!world.sink.kinds().iter().any(|kind| kind == "ended"));
+    }
+
+    #[tokio::test]
+    async fn a_turn_ended_by_the_shutdown_kill_stays_running_and_does_not_advance() {
+        let world = World::new();
+        install_streaming_then(&world, "", "sleep 30");
+        let launch = world.launch("go");
+        let turn_id = launch.turn_id.clone();
+        assert!(world.registry.begin("a", &turn_id));
+        let closer = async {
+            while !world.sink.kinds().iter().any(|kind| kind == "step-started") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            world.registry.closing.store(true, Ordering::SeqCst);
+            world.registry.request_stop("a", &turn_id).unwrap();
+        };
+        let (advance, ()) = timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                run(
+                    &world.db,
+                    &world.sink,
+                    &world.registry,
+                    launch,
+                    ApiKey::Absent,
+                ),
+                closer
+            )
+        })
+        .await
+        .expect("the killed turn must end");
+        assert!(!advance);
+        assert_eq!(only_turn(&world).status, "running");
+        assert!(!world.sink.kinds().iter().any(|kind| kind == "ended"));
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_fails_before_its_process_starts_does_not_advance_the_queue() {
+        let world = World::new();
+        let fixture = world.fixture("basic.jsonl", BASIC);
+        world.install(&recording(
+            &world,
+            &format!("cat \"{}\"", fixture.display()),
+        ));
+        let missing_folder = world.launch("one");
+        fs::remove_dir_all(world.workspace.path()).unwrap();
+        let advance = run(
+            &world.db,
+            &world.sink,
+            &world.registry,
+            missing_folder,
+            ApiKey::Absent,
+        )
+        .await;
+        assert!(!advance);
+        fs::create_dir_all(world.workspace.path()).unwrap();
+        let unreadable = world.launch("two");
+        let advance = run(
+            &world.db,
+            &world.sink,
+            &world.registry,
+            unreadable,
+            ApiKey::Unreadable,
+        )
+        .await;
+        assert!(!advance);
+        fs::remove_file(world.bin.path().join("claude")).unwrap();
+        let no_provider = world.launch("three");
+        let advance = run(
+            &world.db,
+            &world.sink,
+            &world.registry,
+            no_provider,
+            ApiKey::Absent,
+        )
+        .await;
+        assert!(!advance);
+        let turns = world.turns();
+        assert_eq!(turns.len(), 3);
+        assert!(turns.iter().all(|turn| turn.status == "failed"));
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_completes_or_fails_after_its_process_started_advances_the_queue() {
+        let world = World::new();
+        let fixture = world.fixture("basic.jsonl", BASIC);
+        world.install(&recording(
+            &world,
+            &format!("cat \"{}\"", fixture.display()),
+        ));
+        let launch = world.launch("ok");
+        let advance = run(
+            &world.db,
+            &world.sink,
+            &world.registry,
+            launch,
+            ApiKey::Absent,
+        )
+        .await;
+        assert!(advance);
+        world.install("echo broke >&2\nexit 1");
+        let launch = world.launch("bad");
+        let advance = run(
+            &world.db,
+            &world.sink,
+            &world.registry,
+            launch,
+            ApiKey::Absent,
+        )
+        .await;
+        assert!(advance);
+        let statuses: Vec<_> = world.turns().into_iter().map(|turn| turn.status).collect();
+        assert_eq!(statuses, ["completed", "failed"]);
     }
 
     struct VanishedItem;

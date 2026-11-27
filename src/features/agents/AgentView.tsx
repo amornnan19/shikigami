@@ -9,7 +9,9 @@ export function AgentView({ agent }: { agent: Agent }) {
   const { query, loadOlder, loadingOlder } = useConversation(agent.id);
   const queue = useQueue(agent.id);
   const turns = query.data?.turns ?? [];
-  const running = agent.state === "working" || turns.at(-1)?.status === "running";
+  const last = turns.at(-1);
+  const runningTurnId = last?.status === "running" ? last.id : null;
+  const running = agent.state === "working" || runningTurnId !== null;
 
   return (
     <section aria-label="Agent" className="flex h-screen min-w-0 flex-1 flex-col">
@@ -31,7 +33,7 @@ export function AgentView({ agent }: { agent: Agent }) {
         onLoadOlder={loadOlder}
       />
       <QueueList agentId={agent.id} messages={queue.data ?? []} />
-      <Composer agentId={agent.id} running={running} />
+      <Composer agentId={agent.id} running={running} runningTurnId={runningTurnId} />
     </section>
   );
 }
