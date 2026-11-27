@@ -149,3 +149,51 @@ Stop and queue (#18), recovery UI, stall timeout and needs-attention reasons (#1
 ## Done
 
 `bun run check` and `bun run e2e` (3/3) pass; the manual check passes with Haiku 5.5.
+
+## Review fixes (round 2)
+
+Decided with the user on 2026-11-28: agents are fully isolated from the user's own Claude Code
+configuration, and the CLI's own sign-in keeps working.
+
+1. Isolation flags on every turn: `--setting-sources project --strict-mcp-config
+   --permission-mode manual --permission-prompts none`. Keep `--model`, `--session-id` / `--resume`.
+   Tests: replace the "no argument contains permission" checks with a check that the forbidden values
+   never appear (`bypassPermissions`, `acceptEdits`, `auto`, `dontAsk`, any `--dangerously-*`,
+   `--allowedTools`, `--setting-sources` containing `user`) and that the four isolation flags always
+   do. Update the e2e fake and spec the same way.
+2. Redact the saved key (and any `sk-ant-` token of 20+ characters from the key alphabet) from every
+   text before it is saved or emitted: step input, step output, text deltas (redact the stored text;
+   hold back the last 120 characters of a streaming block until the block ends so a key split across
+   deltas is never emitted whole), `text-set`, notices and errors. Test: a fake tool result containing
+   the key is stored and emitted as `[redacted]`.
+3. On app exit (`RunEvent::Exit` / `ExitRequested`), kill every registered process group: SIGTERM,
+   wait up to 2 s, then SIGKILL, synchronously. Test the registry function that does it.
+4. Resume failure only when stderr or the result text contains "No conversation found". Do not store
+   the fresh session id before the retry; the init line stores it. If a `--session-id` attempt never
+   sees init, set `provider_session_id` back to NULL. Tests for both cases.
+5. Markdown: do not render images (`disallowedElements={["img"]}`, show the alt text and the URL as
+   a plain link instead). Add a Content Security Policy in `tauri.conf.json`: `default-src 'self';
+   img-src 'self' data:; style-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost`
+   (adjust only what Tauri 2 needs; read the Tauri CSP docs). E2E must still pass.
+6. Refetch during a stream: in the conversation `queryFn`, read the cache after the `await` and, for a
+   turn still running, keep the longer text per item id. De-duplicate notices by id.
+7. With a key present, also remove `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_BASE_URL` from the child
+   environment. Abort the stderr task when the turn ends. Replace `env::set_var` in tests with an
+   injected environment.
+8. Keychain: in `key_for_turn`, if `exists` is true and `get` returns `None`, return an error (the turn
+   fails with "Could not read the saved API key."). Record the raw OSStatus code (never the value) in
+   the error kept for diagnostics. Test with a store whose `exists` is true and `get` is `Ok(None)`,
+   through the same mapping `drive` uses.
+9. `CLAUDE.md`: in "Running agent CLIs" add: "Start each agent CLI isolated from the user's own
+   configuration of that CLI: no user-level settings, hooks, plugins, output styles or MCP servers.
+   For Claude Code: `--setting-sources project --strict-mcp-config --permission-mode manual
+   --permission-prompts none`. Keep the CLI's own sign-in working." In "Secrets" add: "Redact a secret
+   passed to a child from every text that reaches the database or an event: step input and output,
+   reply text, notices and errors."
+
+Manual check (round 2): 2 real turns with `claude-haiku-5-5` through the app, using the saved key.
+The user must approve the macOS Keychain prompt; never click it yourself. Capture the init line and
+confirm `permissionMode` is `manual`, there is no output style, no MCP servers or plugins, and
+`apiKeySource` shows the key was used. Turn 1 "Reply with the word pong"; turn 2 "List the files in
+your folder" (expect a read-only tool such as LS or Glob to work, or Bash to be denied with the CLI's
+message). Re-capture the fixtures from these runs (redacted).
