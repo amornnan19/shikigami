@@ -5,7 +5,15 @@ import { Button } from "@/components/ui/button";
 import { asAgentError } from "@/features/agents/api";
 import { MESSAGE_MAX_CHARS, sendMessage, stopTurn } from "./api";
 
-export function Composer({ agentId, running }: { agentId: string; running: boolean }) {
+export function Composer({
+  agentId,
+  running,
+  runningTurnId,
+}: {
+  agentId: string;
+  running: boolean;
+  runningTurnId: string | null;
+}) {
   const client = useQueryClient();
   const [text, setText] = useState("");
   const length = Array.from(text).length;
@@ -19,7 +27,7 @@ export function Composer({ agentId, running }: { agentId: string; running: boole
       void client.invalidateQueries({ queryKey: ["agents"] });
     },
   });
-  const stop = useMutation({ mutationFn: () => stopTurn(agentId) });
+  const stop = useMutation({ mutationFn: (turnId: string) => stopTurn(agentId, turnId) });
   const canSend = text.trim().length > 0 && !tooLong && !send.isPending;
 
   function submit() {
@@ -57,17 +65,25 @@ export function Composer({ agentId, running }: { agentId: string; running: boole
         />
         {running ? (
           <Button
+            key="stop"
             type="button"
             variant="secondary"
             aria-label="Stop"
-            disabled={stop.isPending}
-            onClick={() => stop.mutate()}
+            disabled={stop.isPending || runningTurnId === null}
+            onClick={() => runningTurnId && stop.mutate(runningTurnId)}
           >
             <Square />
             Stop
           </Button>
         ) : (
-          <Button type="button" size="icon" aria-label="Send" disabled={!canSend} onClick={submit}>
+          <Button
+            key="send"
+            type="button"
+            size="icon"
+            aria-label="Send"
+            disabled={!canSend}
+            onClick={submit}
+          >
             <ArrowUp />
           </Button>
         )}

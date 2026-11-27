@@ -6,6 +6,7 @@ mod store;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -43,6 +44,10 @@ impl TurnError {
             "database-failed",
             format!("Could not save the message: {error}"),
         )
+    }
+
+    fn shutting_down() -> Self {
+        Self::new("shutting-down", "Shikigami is closing.")
     }
 
     fn unavailable() -> Self {
@@ -124,82 +129,121 @@ impl EventSink for AppHandle {
     }
 }
 
-#[derive(Default)]
 struct Slot {
+    turn_id: String,
     group: Option<i32>,
     stop_requested: bool,
 }
 
+struct StopTarget {
+    group: Option<i32>,
+}
+
 #[derive(Default)]
-pub struct TurnRegistry(Mutex<HashMap<String, Slot>>);
+pub struct TurnRegistry {
+    slots: Mutex<HashMap<String, Slot>>,
+    closing: AtomicBool,
+}
 
 impl TurnRegistry {
     fn slots(&self) -> std::sync::MutexGuard<'_, HashMap<String, Slot>> {
-        self.0
+        self.slots
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn begin(&self, agent_id: &str) {
-        self.slots().insert(agent_id.to_owned(), Slot::default());
+    fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::SeqCst)
     }
 
-    fn set_group(&self, agent_id: &str, group: i32) {
+    fn begin(&self, agent_id: &str, turn_id: &str) -> bool {
         let mut slots = self.slots();
-        let slot = slots.entry(agent_id.to_owned()).or_default();
+        if self.is_closing() {
+            return false;
+        }
+        slots.insert(
+            agent_id.to_owned(),
+            Slot {
+                turn_id: turn_id.to_owned(),
+                group: None,
+                stop_requested: false,
+            },
+        );
+        true
+    }
+
+    fn set_group(&self, agent_id: &str, turn_id: &str, group: i32) -> bool {
+        let mut slots = self.slots();
+        let slot = slots.entry(agent_id.to_owned()).or_insert_with(|| Slot {
+            turn_id: turn_id.to_owned(),
+            group: None,
+            stop_requested: false,
+        });
+        if slot.turn_id != turn_id {
+            return false;
+        }
         slot.group = Some(group);
+        if self.is_closing() {
+            unsafe {
+                libc::killpg(group, libc::SIGKILL);
+            }
+            return false;
+        }
         if slot.stop_requested {
             unsafe {
                 libc::killpg(group, libc::SIGTERM);
             }
         }
+        slot.stop_requested
     }
 
-    fn clear_group(&self, agent_id: &str) {
-        if let Some(slot) = self.slots().get_mut(agent_id) {
+    fn clear_group(&self, agent_id: &str, turn_id: &str) {
+        if let Some(slot) = self
+            .slots()
+            .get_mut(agent_id)
+            .filter(|slot| slot.turn_id == turn_id)
+        {
             slot.group = None;
         }
     }
 
-    fn clear(&self, agent_id: &str) {
-        self.slots().remove(agent_id);
+    fn clear(&self, agent_id: &str, turn_id: &str) {
+        let mut slots = self.slots();
+        if slots
+            .get(agent_id)
+            .is_some_and(|slot| slot.turn_id == turn_id)
+        {
+            slots.remove(agent_id);
+        }
     }
 
-    fn stop_requested(&self, agent_id: &str) -> bool {
+    fn stop_requested(&self, agent_id: &str, turn_id: &str) -> bool {
         self.slots()
             .get(agent_id)
-            .is_some_and(|slot| slot.stop_requested)
+            .is_some_and(|slot| slot.turn_id == turn_id && slot.stop_requested)
     }
 
-    fn request_stop(&self, agent_id: &str) -> bool {
+    fn request_stop(&self, agent_id: &str, turn_id: &str) -> Option<StopTarget> {
         let mut slots = self.slots();
-        let Some(slot) = slots.get_mut(agent_id) else {
-            return false;
-        };
+        let slot = slots
+            .get_mut(agent_id)
+            .filter(|slot| slot.turn_id == turn_id)?;
         slot.stop_requested = true;
         if let Some(group) = slot.group {
             unsafe {
                 libc::killpg(group, libc::SIGTERM);
             }
         }
-        true
+        Some(StopTarget { group: slot.group })
     }
 
-    fn kill_stopping(&self, agent_id: &str) {
-        if let Some(group) = self
+    fn kill(&self, agent_id: &str, turn_id: &str) {
+        let group = self
             .slots()
             .get(agent_id)
-            .filter(|slot| slot.stop_requested)
-            .and_then(|slot| slot.group)
-        {
-            unsafe {
-                libc::killpg(group, libc::SIGKILL);
-            }
-        }
-    }
-
-    fn kill(&self, agent_id: &str) {
-        if let Some(group) = self.slots().get(agent_id).and_then(|slot| slot.group) {
+            .filter(|slot| slot.turn_id == turn_id)
+            .and_then(|slot| slot.group);
+        if let Some(group) = group {
             unsafe {
                 libc::killpg(group, libc::SIGKILL);
             }
@@ -207,6 +251,7 @@ impl TurnRegistry {
     }
 
     pub fn kill_all(&self, grace: Duration) {
+        self.closing.store(true, Ordering::SeqCst);
         let groups: Vec<i32> = std::mem::take(&mut *self.slots())
             .into_values()
             .filter_map(|slot| slot.group)
@@ -229,9 +274,11 @@ impl TurnRegistry {
     }
 }
 
-async fn escalate_stop(registry: &TurnRegistry, agent_id: &str, grace: Duration) {
+async fn kill_group_after(group: i32, grace: Duration) {
     tokio::time::sleep(grace).await;
-    registry.kill_stopping(agent_id);
+    unsafe {
+        libc::killpg(group, libc::SIGKILL);
+    }
 }
 
 pub fn stop_all_turns(app: &AppHandle) {
@@ -290,9 +337,11 @@ fn launch_of(
     begun: store::Begun,
     text: String,
     started_at: i64,
-) -> Launch {
-    registry.begin(agent_id);
-    Launch {
+) -> Option<Launch> {
+    if !registry.begin(agent_id, &begun.turn_id) {
+        return None;
+    }
+    Some(Launch {
         agent_id: agent_id.to_owned(),
         turn_id: begun.turn_id,
         executable,
@@ -303,12 +352,15 @@ fn launch_of(
         text,
         started_at,
         environment: std::env::vars_os().collect(),
-    }
+    })
 }
 
 enum Prepared {
     Started(Launch),
-    Queued(QueuedMessage),
+    Queued {
+        queued: QueuedMessage,
+        launch: Option<Launch>,
+    },
 }
 
 fn prepare(
@@ -318,6 +370,9 @@ fn prepare(
     agent_id: &str,
     text: &str,
 ) -> Result<Prepared, TurnError> {
+    if registry.is_closing() {
+        return Err(TurnError::shutting_down());
+    }
     validate(text)?;
     let executable = executable_of(db, dirs, agent_id)?;
     let started_at = now_millis();
@@ -328,8 +383,8 @@ fn prepare(
             BeginError::Busy => TurnError::new("busy", "This agent is already working."),
             BeginError::Database(error) => TurnError::database(error),
         })?;
-    Ok(match sent {
-        Sent::Started(begun) => Prepared::Started(launch_of(
+    match sent {
+        Sent::Started(begun) => launch_of(
             registry,
             dirs,
             agent_id,
@@ -337,9 +392,27 @@ fn prepare(
             begun,
             text.to_owned(),
             started_at,
-        )),
-        Sent::Queued(queued) => Prepared::Queued(queued),
-    })
+        )
+        .map(Prepared::Started)
+        .ok_or_else(TurnError::shutting_down),
+        Sent::Queued { queued, started } => {
+            let launch = started
+                .map(|advanced| {
+                    launch_of(
+                        registry,
+                        dirs,
+                        agent_id,
+                        executable,
+                        advanced.begun,
+                        advanced.text,
+                        started_at,
+                    )
+                    .ok_or_else(TurnError::shutting_down)
+                })
+                .transpose()?;
+            Ok(Prepared::Queued { queued, launch })
+        }
+    }
 }
 
 fn start_next(
@@ -348,12 +421,21 @@ fn start_next(
     dirs: &[PathBuf],
     agent_id: &str,
 ) -> Option<Launch> {
+    if registry.is_closing() {
+        return None;
+    }
     let executable = executable_of(db, dirs, agent_id).ok()?;
     let started_at = now_millis();
     let advanced = db
-        .with_connection(|connection| store::advance_queue(connection, agent_id, started_at))
+        .with_connection(|connection| {
+            if registry.is_closing() {
+                Ok(None)
+            } else {
+                store::advance_queue(connection, agent_id, started_at)
+            }
+        })
         .ok()??;
-    Some(launch_of(
+    launch_of(
         registry,
         dirs,
         agent_id,
@@ -361,7 +443,7 @@ fn start_next(
         advanced.begun,
         advanced.text,
         started_at,
-    ))
+    )
 }
 
 pub fn sweep_interrupted(db: &Database) -> Result<usize, String> {
@@ -369,7 +451,7 @@ pub fn sweep_interrupted(db: &Database) -> Result<usize, String> {
         .map_err(|error| format!("could not recover running turns: {error}"))
 }
 
-async fn drive_one(app: &AppHandle, launch: Launch) {
+async fn drive_one(app: &AppHandle, launch: Launch) -> bool {
     let key_app = app.clone();
     let key = tauri::async_runtime::spawn_blocking(move || {
         api_key::api_key_for_turn(&key_app, CLAUDE_CODE_ID)
@@ -381,9 +463,9 @@ async fn drive_one(app: &AppHandle, launch: Launch) {
     };
     let (Some(db), Some(registry)) = (app.try_state::<Database>(), app.try_state::<TurnRegistry>())
     else {
-        return;
+        return false;
     };
-    runner::run(&db, app, &registry, launch, key).await;
+    runner::run(&db, app, &registry, launch, key).await
 }
 
 async fn next_launch(app: &AppHandle, agent_id: String) -> Option<Launch> {
@@ -391,8 +473,9 @@ async fn next_launch(app: &AppHandle, agent_id: String) -> Option<Launch> {
     let next = tauri::async_runtime::spawn_blocking(move || {
         let db = next_app.try_state::<Database>()?;
         let registry = next_app.try_state::<TurnRegistry>()?;
-        start_next(&db, &registry, &providers::search_dirs(), &agent_id)
-            .inspect(|launch| emit_queue_changed(&next_app, &launch.agent_id))
+        let launch = start_next(&db, &registry, &providers::search_dirs(), &agent_id);
+        emit_queue_changed(&next_app, &agent_id);
+        launch
     })
     .await;
     next.ok().flatten()
@@ -402,8 +485,13 @@ async fn drive(app: AppHandle, first: Launch) {
     let mut current = Some(first);
     while let Some(launch) = current.take() {
         let agent_id = launch.agent_id.clone();
-        drive_one(&app, launch).await;
-        current = next_launch(&app, agent_id).await;
+        let advance = drive_one(&app, launch).await;
+        let closing = app
+            .try_state::<TurnRegistry>()
+            .is_none_or(|registry| registry.is_closing());
+        if advance && !closing {
+            current = next_launch(&app, agent_id).await;
+        }
     }
 }
 
@@ -432,8 +520,11 @@ pub async fn send_message(
             tauri::async_runtime::spawn(drive(app, launch));
             Ok(SendResult::Started { turn_id })
         }
-        Prepared::Queued(queued) => {
+        Prepared::Queued { queued, launch } => {
             emit_queue_changed(&app, &queue_agent);
+            if let Some(launch) = launch {
+                tauri::async_runtime::spawn(drive(app, launch));
+            }
             Ok(SendResult::Queued {
                 queued_id: queued.id,
             })
@@ -442,18 +533,16 @@ pub async fn send_message(
 }
 
 #[tauri::command]
-pub async fn stop_turn(app: AppHandle, agent_id: String) {
+pub async fn stop_turn(app: AppHandle, agent_id: String, turn_id: String) {
     let Some(registry) = app.try_state::<TurnRegistry>() else {
         return;
     };
-    if !registry.request_stop(&agent_id) {
+    let Some(target) = registry.request_stop(&agent_id, &turn_id) else {
         return;
+    };
+    if let Some(group) = target.group {
+        tauri::async_runtime::spawn(kill_group_after(group, EXIT_TERM_GRACE));
     }
-    tauri::async_runtime::spawn(async move {
-        if let Some(registry) = app.try_state::<TurnRegistry>() {
-            escalate_stop(&registry, &agent_id, EXIT_TERM_GRACE).await;
-        }
-    });
 }
 
 #[tauri::command]
@@ -586,15 +675,26 @@ mod tests {
         fn send(&self, agent: &str, text: &str) -> Result<Launch, TurnError> {
             match self.prepare(agent, text)? {
                 Prepared::Started(launch) => Ok(launch),
-                Prepared::Queued(_) => panic!("expected a started turn"),
+                Prepared::Queued { .. } => panic!("expected a started turn"),
             }
         }
 
         fn queue(&self, agent: &str, text: &str) -> QueuedMessage {
             match self.prepare(agent, text).unwrap() {
-                Prepared::Queued(queued) => queued,
+                Prepared::Queued { queued, .. } => queued,
                 Prepared::Started(_) => panic!("expected a queued message"),
             }
+        }
+
+        fn queue_with_launch(&self, agent: &str, text: &str) -> (QueuedMessage, Option<Launch>) {
+            match self.prepare(agent, text).unwrap() {
+                Prepared::Queued { queued, launch } => (queued, launch),
+                Prepared::Started(_) => panic!("expected a queued message"),
+            }
+        }
+
+        fn dirs(&self) -> [PathBuf; 1] {
+            [self.bin.path().to_path_buf()]
         }
 
         fn queued(&self) -> Vec<(String, i64)> {
@@ -818,8 +918,10 @@ mod tests {
         let registry = TurnRegistry::default();
         let mut first = spawn_group("sleep 30");
         let mut second = spawn_group("sleep 30");
-        registry.set_group("a", group_of(&first));
-        registry.set_group("b", group_of(&second));
+        assert!(registry.begin("a", "t1"));
+        registry.set_group("a", "t1", group_of(&first));
+        assert!(registry.begin("b", "t2"));
+        registry.set_group("b", "t2", group_of(&second));
         let started = Instant::now();
         let reaper = std::thread::spawn(move || (first.wait().unwrap(), second.wait().unwrap()));
         registry.kill_all(Duration::from_secs(5));
@@ -833,9 +935,149 @@ mod tests {
     #[test]
     fn a_stop_with_no_running_turn_is_a_no_op() {
         let registry = TurnRegistry::default();
-        assert!(!registry.request_stop("a"));
-        assert!(!registry.stop_requested("a"));
+        assert!(registry.request_stop("a", "t").is_none());
+        assert!(!registry.stop_requested("a", "t"));
         assert!(registry.slots().is_empty());
+    }
+
+    #[test]
+    fn a_stop_names_its_turn_so_a_stale_request_cannot_stop_the_next_turn() {
+        let registry = TurnRegistry::default();
+        assert!(registry.begin("a", "t2"));
+        assert!(registry.request_stop("a", "t1").is_none());
+        assert!(!registry.stop_requested("a", "t2"));
+        assert!(registry.request_stop("a", "t2").is_some());
+        assert!(registry.stop_requested("a", "t2"));
+        assert!(!registry.stop_requested("a", "t1"));
+        registry.clear("a", "t1");
+        assert!(registry.stop_requested("a", "t2"));
+        registry.clear("a", "t2");
+        assert!(registry.slots().is_empty());
+    }
+
+    #[test]
+    fn an_earlier_turns_kill_timer_cannot_kill_a_later_turns_process() {
+        let registry = TurnRegistry::default();
+        let mut old = spawn_group("sleep 30");
+        assert!(registry.begin("a", "t1"));
+        registry.set_group("a", "t1", group_of(&old));
+        let target = registry.request_stop("a", "t1").unwrap();
+        old.wait().unwrap();
+        registry.clear("a", "t1");
+        let mut next = spawn_group("sleep 30");
+        assert!(registry.begin("a", "t2"));
+        registry.set_group("a", "t2", group_of(&next));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(kill_group_after(
+            target.group.unwrap(),
+            Duration::from_millis(50),
+        ));
+        assert!(next.try_wait().unwrap().is_none());
+        assert!(!registry.stop_requested("a", "t2"));
+        registry.kill("a", "t2");
+        next.wait().unwrap();
+    }
+
+    #[test]
+    fn a_stop_before_the_group_registers_terminates_it_when_it_registers() {
+        use std::os::unix::process::ExitStatusExt;
+        let registry = TurnRegistry::default();
+        assert!(registry.begin("a", "t"));
+        let target = registry.request_stop("a", "t").unwrap();
+        assert!(target.group.is_none());
+        let mut child = spawn_group("sleep 30");
+        assert!(registry.set_group("a", "t", group_of(&child)));
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGTERM));
+    }
+
+    #[test]
+    fn the_kill_after_the_grace_reaches_a_group_whose_leader_already_exited() {
+        let registry = TurnRegistry::default();
+        let mut leader = spawn_group("(trap '' TERM; exec sleep 30) & exec sleep 30");
+        let group = group_of(&leader);
+        assert!(registry.begin("a", "t"));
+        registry.set_group("a", "t", group);
+        std::thread::sleep(Duration::from_millis(300));
+        let target = registry.request_stop("a", "t").unwrap();
+        leader.wait().unwrap();
+        registry.clear_group("a", "t");
+        assert_eq!(unsafe { libc::killpg(group, 0) }, 0);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(kill_group_after(
+            target.group.unwrap(),
+            Duration::from_millis(200),
+        ));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while unsafe { libc::killpg(group, 0) } == 0 && Instant::now() < deadline {
+            std::thread::sleep(EXIT_POLL);
+        }
+        assert_ne!(unsafe { libc::killpg(group, 0) }, 0);
+    }
+
+    #[test]
+    fn shutdown_with_a_running_turn_and_two_queued_messages_starts_nothing_more() {
+        let fx = Fixture::new("claude-code");
+        let first = fx.send("a", "one").unwrap();
+        fx.queue("a", "two");
+        fx.queue("a", "three");
+        let child = spawn_group("sleep 30");
+        fx.registry.set_group("a", &first.turn_id, group_of(&child));
+        let reaper = std::thread::spawn(move || {
+            let mut child = child;
+            child.wait().unwrap()
+        });
+        fx.registry.kill_all(Duration::from_secs(2));
+        reaper.join().unwrap();
+        fx.db.with_connection(|c| {
+            store::finish_turn(c, &first.turn_id, "a", "failed", None, 9).unwrap()
+        });
+        assert!(start_next(&fx.db, &fx.registry, &fx.dirs(), "a").is_none());
+        assert_eq!(fx.queued(), [("two".into(), 0), ("three".into(), 1)]);
+        assert_eq!(fx.turns(), 1);
+        assert_eq!(prepared_code(fx.prepare("a", "four")), "shutting-down");
+        assert_eq!(fx.queued().len(), 2);
+        assert_eq!(fx.turns(), 1);
+        assert!(!fx.registry.begin("a", "t9"));
+    }
+
+    #[test]
+    fn a_new_message_never_overtakes_a_stalled_queue() {
+        let fx = Fixture::new("claude-code");
+        let first = fx.send("a", "one").unwrap();
+        fx.queue("a", "two");
+        fx.db.with_connection(|c| {
+            store::finish_turn(c, &first.turn_id, "a", "failed", None, 9).unwrap()
+        });
+        let (queued, launch) = fx.queue_with_launch("a", "three");
+        assert_eq!(queued.position, 1);
+        assert_eq!(launch.unwrap().text, "two");
+        assert_eq!(fx.queued(), [("three".into(), 1)]);
+        assert_eq!(fx.turns(), 2);
+    }
+
+    #[test]
+    fn a_queue_that_cannot_start_stays_untouched_and_the_next_send_still_queues() {
+        let fx = Fixture::new("claude-code");
+        let first = fx.send("a", "one").unwrap();
+        fx.queue("a", "two");
+        fx.db.with_connection(|c| {
+            store::finish_turn(c, &first.turn_id, "a", "failed", None, 9).unwrap()
+        });
+        fs::remove_file(fx.bin.path().join("claude")).unwrap();
+        assert!(start_next(&fx.db, &fx.registry, &fx.dirs(), "a").is_none());
+        assert_eq!(fx.queued(), [("two".into(), 0)]);
+        assert_eq!(
+            prepared_code(fx.prepare("a", "three")),
+            "provider-unavailable"
+        );
+        assert_eq!(fx.queued(), [("two".into(), 0)]);
+        assert_eq!(fx.turns(), 1);
     }
 
     #[test]
@@ -843,7 +1085,8 @@ mod tests {
         use std::os::unix::process::ExitStatusExt;
         let registry = TurnRegistry::default();
         let child = spawn_group("trap '' TERM; while true; do sleep 1; done");
-        registry.set_group("a", group_of(&child));
+        assert!(registry.begin("a", "t"));
+        registry.set_group("a", "t", group_of(&child));
         let reaper = std::thread::spawn(move || {
             let mut child = child;
             child.wait().unwrap()
