@@ -24,6 +24,9 @@ pub const QUEUE_EVENT_NAME: &str = "queue-changed";
 pub const MESSAGE_MAX_CHARS: usize = 100_000;
 const EXIT_TERM_GRACE: Duration = Duration::from_secs(2);
 const EXIT_POLL: Duration = Duration::from_millis(25);
+pub const STALL_TIMEOUT: Duration = Duration::from_secs(300);
+#[cfg(feature = "e2e")]
+const STALL_SECONDS_ENV: &str = "SHIKIGAMI_STALL_SECONDS";
 
 #[derive(Debug, Serialize)]
 pub struct TurnError {
@@ -237,6 +240,18 @@ impl TurnRegistry {
         Some(StopTarget { group: slot.group })
     }
 
+    fn terminate(&self, agent_id: &str, turn_id: &str) -> Option<i32> {
+        let group = self
+            .slots()
+            .get(agent_id)
+            .filter(|slot| slot.turn_id == turn_id)
+            .and_then(|slot| slot.group)?;
+        unsafe {
+            libc::killpg(group, libc::SIGTERM);
+        }
+        Some(group)
+    }
+
     fn kill(&self, agent_id: &str, turn_id: &str) {
         let group = self
             .slots()
@@ -298,6 +313,19 @@ pub struct Launch {
     pub text: String,
     pub started_at: i64,
     pub environment: Vec<(OsString, OsString)>,
+    pub stall_timeout: Duration,
+}
+
+fn stall_timeout() -> Duration {
+    #[cfg(feature = "e2e")]
+    if let Some(seconds) = std::env::var(STALL_SECONDS_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+    {
+        return Duration::from_secs(seconds);
+    }
+    STALL_TIMEOUT
 }
 
 fn validate(text: &str) -> Result<(), TurnError> {
@@ -352,6 +380,7 @@ fn launch_of(
         text,
         started_at,
         environment: std::env::vars_os().collect(),
+        stall_timeout: stall_timeout(),
     })
 }
 
@@ -446,6 +475,18 @@ fn start_next(
     )
 }
 
+fn resume(
+    db: &Database,
+    registry: &TurnRegistry,
+    dirs: &[PathBuf],
+    agent_id: &str,
+) -> Result<Option<Launch>, TurnError> {
+    if registry.is_closing() {
+        return Err(TurnError::shutting_down());
+    }
+    Ok(start_next(db, registry, dirs, agent_id))
+}
+
 pub fn sweep_interrupted(db: &Database) -> Result<usize, String> {
     db.with_connection(|connection| store::sweep_interrupted(connection, now_millis()))
         .map_err(|error| format!("could not recover running turns: {error}"))
@@ -530,6 +571,28 @@ pub async fn send_message(
             })
         }
     }
+}
+
+#[tauri::command]
+pub async fn resume_queue(app: AppHandle, agent_id: String) -> Result<(), TurnError> {
+    let resume_app = app.clone();
+    let queue_agent = agent_id.clone();
+    let launch = tauri::async_runtime::spawn_blocking(move || {
+        let db = resume_app
+            .try_state::<Database>()
+            .ok_or_else(TurnError::unavailable)?;
+        let registry = resume_app
+            .try_state::<TurnRegistry>()
+            .ok_or_else(TurnError::unavailable)?;
+        resume(&db, &registry, &providers::search_dirs(), &agent_id)
+    })
+    .await
+    .map_err(TurnError::database)??;
+    if let Some(launch) = launch {
+        emit_queue_changed(&app, &queue_agent);
+        tauri::async_runtime::spawn(drive(app, launch));
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -704,6 +767,14 @@ mod tests {
                 .into_iter()
                 .map(|queued| (queued.text, queued.position))
                 .collect()
+        }
+
+        fn queued_id(&self) -> String {
+            self.db
+                .with_connection(|c| store::list_queue(c, "a"))
+                .unwrap()
+                .remove(0)
+                .id
         }
 
         fn turns(&self) -> i64 {
@@ -1097,5 +1168,66 @@ mod tests {
         let status = reaper.join().unwrap();
         assert_eq!(status.signal(), Some(libc::SIGKILL));
         assert!(started.elapsed() >= Duration::from_millis(500));
+    }
+
+    #[test]
+    fn resume_starts_the_head_of_a_queue_that_waits_after_an_interrupted_turn() {
+        let fx = Fixture::new("claude-code");
+        let first = fx.send("a", "one").unwrap();
+        fx.queue("a", "two");
+        fx.queue("a", "three");
+        fx.db
+            .with_connection(|c| store::sweep_interrupted(c, 9))
+            .unwrap();
+        let _ = first;
+        let launch = resume(&fx.db, &fx.registry, &fx.dirs(), "a")
+            .unwrap()
+            .expect("the head of the queue starts");
+        assert_eq!(launch.text, "two");
+        assert_eq!(fx.queued(), [("three".into(), 1)]);
+        assert_eq!(fx.turns(), 2);
+    }
+
+    #[test]
+    fn resume_does_nothing_while_a_turn_runs_or_when_the_queue_is_empty() {
+        let fx = Fixture::new("claude-code");
+        assert!(resume(&fx.db, &fx.registry, &fx.dirs(), "a")
+            .unwrap()
+            .is_none());
+        let first = fx.send("a", "one").unwrap();
+        fx.queue("a", "two");
+        assert!(resume(&fx.db, &fx.registry, &fx.dirs(), "a")
+            .unwrap()
+            .is_none());
+        assert_eq!(fx.queued(), [("two".into(), 0)]);
+        assert_eq!(fx.turns(), 1);
+        fx.db.with_connection(|c| {
+            store::finish_turn(c, &first.turn_id, "a", "completed", None, 9).unwrap()
+        });
+        let queued_id = fx.queued_id();
+        fx.db
+            .with_connection(|c| store::remove_queued(c, &queued_id))
+            .unwrap();
+        assert!(resume(&fx.db, &fx.registry, &fx.dirs(), "a")
+            .unwrap()
+            .is_none());
+        assert_eq!(fx.turns(), 1);
+    }
+
+    #[test]
+    fn resume_is_refused_while_closing_and_leaves_the_queue_alone() {
+        let fx = Fixture::new("claude-code");
+        let first = fx.send("a", "one").unwrap();
+        fx.queue("a", "two");
+        fx.db.with_connection(|c| {
+            store::finish_turn(c, &first.turn_id, "a", "failed", None, 9).unwrap()
+        });
+        fx.registry.kill_all(Duration::from_millis(10));
+        let error = resume(&fx.db, &fx.registry, &fx.dirs(), "a")
+            .err()
+            .expect("refused");
+        assert_eq!(error.code, "shutting-down");
+        assert_eq!(fx.queued(), [("two".into(), 0)]);
+        assert_eq!(fx.turns(), 1);
     }
 }

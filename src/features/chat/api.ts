@@ -69,6 +69,10 @@ export function stopTurn(agentId: string, turnId: string) {
   return invoke<void>("stop_turn", { agentId, turnId });
 }
 
+export function resumeQueue(agentId: string) {
+  return invoke<void>("resume_queue", { agentId });
+}
+
 export function listQueue(agentId: string) {
   return invoke<QueuedMessage[]>("list_queue", { agentId });
 }

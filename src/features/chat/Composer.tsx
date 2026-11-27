@@ -9,10 +9,12 @@ export function Composer({
   agentId,
   running,
   runningTurnId,
+  blockedReason,
 }: {
   agentId: string;
   running: boolean;
   runningTurnId: string | null;
+  blockedReason: string | null;
 }) {
   const client = useQueryClient();
   const [text, setText] = useState("");
@@ -28,7 +30,7 @@ export function Composer({
     },
   });
   const stop = useMutation({ mutationFn: (turnId: string) => stopTurn(agentId, turnId) });
-  const canSend = text.trim().length > 0 && !tooLong && !send.isPending;
+  const canSend = text.trim().length > 0 && !tooLong && !send.isPending && blockedReason === null;
 
   function submit() {
     if (canSend) send.mutate();
@@ -58,7 +60,8 @@ export function Composer({
           aria-label="Message"
           rows={2}
           value={text}
-          placeholder={running ? "Queue a message…" : "Message"}
+          placeholder={blockedReason ?? (running ? "Queue a message…" : "Message")}
+          disabled={blockedReason !== null}
           onChange={(event) => setText(event.target.value)}
           onKeyDown={onKeyDown}
           className="max-h-48 min-h-14 flex-1 resize-y rounded-md border border-border bg-background px-3 py-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
