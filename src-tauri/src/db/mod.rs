@@ -104,8 +104,10 @@ mod tests {
             c.execute_batch(
                 "INSERT INTO agents (id, name, color, provider, model, workspace_path, created_at, last_activity_at)
                  VALUES ('a', 'Ada', 'red', 'codex', 'm', '/w', 1, 1);
-                 INSERT INTO turns VALUES ('t', 'a', 'running', NULL, 1, NULL);
-                 INSERT INTO messages VALUES ('m', 'a', 't', 'user', 'hi', 1);
+                 INSERT INTO turns (id, agent_id, status, error, started_at, ended_at)
+                 VALUES ('t', 'a', 'running', NULL, 1, NULL);
+                 INSERT INTO messages (id, agent_id, turn_id, role, content, created_at)
+                 VALUES ('m', 'a', 't', 'user', 'hi', 1);
                  INSERT INTO steps VALUES ('s', 't', 0, 'tool', 'x', NULL, 'running', 1);
                  INSERT INTO queued_messages VALUES ('q', 'a', 'later', 0, 1);
                  INSERT INTO groups VALUES ('g', 'Team', '/g', 'a', 1, 1);
@@ -119,7 +121,7 @@ mod tests {
     fn fresh_database_migrates_to_the_latest_version_with_all_tables() {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(dir.path()).unwrap();
-        assert_eq!(schema_version(&db), 4);
+        assert_eq!(schema_version(&db), 5);
         for table in [
             "agents",
             "turns",
@@ -129,6 +131,8 @@ mod tests {
             "settings",
             "groups",
             "group_members",
+            "group_queue",
+            "agent_group_sessions",
         ] {
             assert_eq!(count(&db, table), 0, "{table}");
         }
@@ -155,7 +159,7 @@ mod tests {
             .unwrap();
         drop(connection);
         let db = Database::open(dir.path()).unwrap();
-        assert_eq!(schema_version(&db), 4);
+        assert_eq!(schema_version(&db), 5);
         assert_eq!(count(&db, "agents"), 1);
         assert_eq!(count(&db, "turns"), 1);
         assert_eq!(count(&db, "settings"), 0);
@@ -166,8 +170,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         drop(Database::open(dir.path()).unwrap());
         let db = Database::open(dir.path()).unwrap();
-        assert_eq!(schema_version(&db), 4);
-        assert_eq!(count(&db, "refinery_schema_history"), 4);
+        assert_eq!(schema_version(&db), 5);
+        assert_eq!(count(&db, "refinery_schema_history"), 5);
     }
 
     #[test]
@@ -176,7 +180,8 @@ mod tests {
         let db = Database::open(dir.path()).unwrap();
         let result = db.with_connection(|c| {
             c.execute(
-                "INSERT INTO turns VALUES ('t', 'missing', 'running', NULL, 1, NULL)",
+                "INSERT INTO turns (id, agent_id, status, error, started_at, ended_at)
+                 VALUES ('t', 'missing', 'running', NULL, 1, NULL)",
                 [],
             )
         });
@@ -255,7 +260,12 @@ mod tests {
             )
             .unwrap(),
             refinery::Migration::unapplied(
-                "V5__broken",
+                "V5__group_turns",
+                include_str!("../../migrations/V5__group_turns.sql"),
+            )
+            .unwrap(),
+            refinery::Migration::unapplied(
+                "V6__broken",
                 "CREATE TABLE probe (x INTEGER); INSERT INTO missing_table VALUES (1);",
             )
             .unwrap(),
@@ -269,7 +279,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         let probe_tables: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE name = 'probe'",
@@ -334,7 +344,12 @@ mod tests {
             )
             .unwrap(),
             refinery::Migration::unapplied(
-                "V5__rebuild_agents",
+                "V5__group_turns",
+                include_str!("../../migrations/V5__group_turns.sql"),
+            )
+            .unwrap(),
+            refinery::Migration::unapplied(
+                "V6__rebuild_agents",
                 "CREATE TABLE agents_new (
                    id TEXT PRIMARY KEY,
                    name TEXT NOT NULL COLLATE NOCASE UNIQUE,
@@ -357,7 +372,7 @@ mod tests {
         let db = Database {
             connection: Mutex::new(connection),
         };
-        assert_eq!(schema_version(&db), 5);
+        assert_eq!(schema_version(&db), 6);
         for table in [
             "agents",
             "turns",
@@ -424,7 +439,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             version_two_database(dir.path(), old);
             let db = Database::open(dir.path()).unwrap();
-            assert_eq!(schema_version(&db), 4);
+            assert_eq!(schema_version(&db), 5);
             assert_eq!(
                 setting(&db, "claude.auth-mode").as_deref(),
                 expected,
@@ -484,7 +499,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         version_three_database(dir.path());
         let db = Database::open(dir.path()).unwrap();
-        assert_eq!(schema_version(&db), 4);
+        assert_eq!(schema_version(&db), 5);
         for table in ["agents", "turns", "messages", "queued_messages", "settings"] {
             assert_eq!(count(&db, table), 1, "{table}");
         }
@@ -497,6 +512,162 @@ mod tests {
         });
         assert_eq!(mode, "api-key");
         assert_eq!(setting(&db, "other").as_deref(), Some("kept"));
+    }
+
+    fn version_four_database(dir: &Path) {
+        let mut connection = Connection::open(dir.join(DATABASE_FILE)).unwrap();
+        configure(&connection).unwrap();
+        let v4 = [
+            refinery::Migration::unapplied(
+                "V1__initial",
+                include_str!("../../migrations/V1__initial.sql"),
+            )
+            .unwrap(),
+            refinery::Migration::unapplied(
+                "V2__settings",
+                include_str!("../../migrations/V2__settings.sql"),
+            )
+            .unwrap(),
+            refinery::Migration::unapplied(
+                "V3__auth_mode",
+                include_str!("../../migrations/V3__auth_mode.sql"),
+            )
+            .unwrap(),
+            refinery::Migration::unapplied(
+                "V4__groups",
+                include_str!("../../migrations/V4__groups.sql"),
+            )
+            .unwrap(),
+        ];
+        migrate(&mut connection, Runner::new(&v4)).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO agents (id, name, color, provider, model, workspace_path, provider_session_id, created_at, last_activity_at, auth_mode)
+                 VALUES ('a', 'Ada', 'red', 'claude-code', 'm', '/a', 'session-a', 1, 1, 'api-key'),
+                        ('b', 'Bo', 'blue', 'claude-code', 'm', '/b', NULL, 1, 1, NULL);
+                 INSERT INTO turns VALUES ('t', 'a', 'completed', NULL, 1, 2);
+                 INSERT INTO messages VALUES ('m', 'a', 't', 'user', 'hi', 1);
+                 INSERT INTO steps VALUES ('s', 't', 0, 'tool', 'x', NULL, 'done', 1);
+                 INSERT INTO queued_messages VALUES ('q', 'a', 'later', 0, 1);
+                 INSERT INTO groups VALUES ('g', 'Team', '/g', 'a', 1, 1);
+                 INSERT INTO group_members VALUES ('g', 'a', 0, 1), ('g', 'b', 1, 1);
+                 INSERT INTO settings VALUES ('other', 'kept');",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn the_group_turns_migration_keeps_everything_of_a_version_four_database() {
+        let dir = tempfile::tempdir().unwrap();
+        version_four_database(dir.path());
+        let db = Database::open(dir.path()).unwrap();
+        assert_eq!(schema_version(&db), 5);
+        for table in [
+            "turns",
+            "messages",
+            "steps",
+            "queued_messages",
+            "groups",
+            "settings",
+        ] {
+            assert_eq!(count(&db, table), 1, "{table}");
+        }
+        assert_eq!(count(&db, "agents"), 2);
+        assert_eq!(count(&db, "group_members"), 2);
+        for table in ["group_queue", "agent_group_sessions"] {
+            assert_eq!(count(&db, table), 0, "{table}");
+        }
+        let (turn_group, message_group, author): (Option<String>, Option<String>, Option<String>) =
+            db.with_connection(|c| {
+                c.query_row(
+                    "SELECT t.group_id, m.group_id, m.author_agent_id
+                     FROM turns t JOIN messages m ON m.turn_id = t.id",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap()
+            });
+        assert_eq!((turn_group, message_group, author), (None, None, None));
+        let (session, mode): (String, String) = db.with_connection(|c| {
+            c.query_row(
+                "SELECT provider_session_id, auth_mode FROM agents WHERE id = 'a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        });
+        assert_eq!((session.as_str(), mode.as_str()), ("session-a", "api-key"));
+        assert_eq!(setting(&db, "other").as_deref(), Some("kept"));
+    }
+
+    fn seed_group_chat(db: &Database) {
+        db.with_connection(|c| {
+            c.execute_batch(
+                "INSERT INTO agents (id, name, color, provider, model, workspace_path, created_at, last_activity_at)
+                 VALUES ('a', 'Ada', 'red', 'claude-code', 'm', '/a', 1, 1),
+                        ('b', 'Bo', 'red', 'claude-code', 'm', '/b', 1, 1);
+                 INSERT INTO groups VALUES ('g', 'Team', '/g', 'a', 1, 1);
+                 INSERT INTO group_members VALUES ('g', 'a', 0, 1), ('g', 'b', 1, 1);
+                 INSERT INTO turns (id, agent_id, group_id, status, started_at)
+                 VALUES ('t', 'a', 'g', 'completed', 1);
+                 INSERT INTO messages (id, agent_id, turn_id, group_id, author_agent_id, role, content, created_at)
+                 VALUES ('m1', 'a', 't', 'g', NULL, 'user', 'hi', 1),
+                        ('m2', 'a', 't', 'g', 'a', 'assistant', 'hello', 2);
+                 INSERT INTO steps VALUES ('s', 't', 0, 'tool', 'x', NULL, 'done', 1);
+                 INSERT INTO group_queue (id, group_id, addressed_agent_id, content, position, created_at)
+                 VALUES ('q', 'g', 'a', 'later', 0, 1);
+                 INSERT INTO agent_group_sessions VALUES ('a', 'g', 'session', 2), ('b', 'g', NULL, 0);",
+            )
+            .unwrap()
+        });
+    }
+
+    #[test]
+    fn deleting_a_group_removes_its_turns_messages_steps_queue_and_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        seed_group_chat(&db);
+        db.with_connection(|c| c.execute("DELETE FROM groups WHERE id = 'g'", []).unwrap());
+        for table in [
+            "turns",
+            "messages",
+            "steps",
+            "group_queue",
+            "agent_group_sessions",
+            "group_members",
+        ] {
+            assert_eq!(count(&db, table), 0, "{table}");
+        }
+        assert_eq!(count(&db, "agents"), 2);
+    }
+
+    #[test]
+    fn deleting_an_agent_clears_its_authorship_and_removes_its_group_sessions_and_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        seed_group_chat(&db);
+        db.with_connection(|c| {
+            c.execute_batch(
+                "INSERT INTO messages (id, agent_id, turn_id, group_id, author_agent_id, role, content, created_at)
+                 VALUES ('m3', 'a', 't', 'g', 'b', 'assistant', 'from bo', 3);
+                 INSERT INTO group_queue (id, group_id, addressed_agent_id, content, position, created_at)
+                 VALUES ('q2', 'g', 'b', 'for bo', 1, 1);",
+            )
+            .unwrap();
+            c.execute("DELETE FROM agents WHERE id = 'b'", []).unwrap();
+        });
+        assert_eq!(count(&db, "messages"), 3);
+        let author: Option<String> = db.with_connection(|c| {
+            c.query_row(
+                "SELECT author_agent_id FROM messages WHERE id = 'm3'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        });
+        assert_eq!(author, None);
+        assert_eq!(count(&db, "agent_group_sessions"), 1);
+        assert_eq!(count(&db, "group_queue"), 1);
     }
 
     #[test]

@@ -1,24 +1,26 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { asAgentError } from "@/features/agents/api";
-import { resumeQueue } from "./api";
+import type { ChatScope } from "./scope";
 
 export function ResumeBar({
-  agentId,
+  scope,
   count,
   interrupted,
 }: {
-  agentId: string;
+  scope: ChatScope;
   count: number;
   interrupted: boolean;
 }) {
   const client = useQueryClient();
   const resume = useMutation({
-    mutationFn: () => resumeQueue(agentId),
+    mutationFn: () => scope.resume(),
     onSettled: () => {
-      void client.invalidateQueries({ queryKey: ["queue", agentId] });
-      void client.invalidateQueries({ queryKey: ["conversation", agentId] });
-      void client.invalidateQueries({ queryKey: ["agents"] });
+      void client.invalidateQueries({ queryKey: scope.queueKey });
+      void client.invalidateQueries({ queryKey: scope.conversationKey });
+      for (const queryKey of scope.refreshKeys) {
+        void client.invalidateQueries({ queryKey });
+      }
     },
   });
   const waiting =

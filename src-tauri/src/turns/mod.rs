@@ -1,11 +1,12 @@
 mod claude_code;
+mod group;
 mod redact;
 mod runner;
 mod store;
 
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -13,6 +14,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
+use crate::agents::instructions;
 use crate::agents::now_millis;
 use crate::api_key;
 use crate::auth;
@@ -23,6 +25,7 @@ use store::{BeginError, ConversationPage, QueuedMessage, Sent, StepView};
 
 pub const EVENT_NAME: &str = "turn-event";
 pub const QUEUE_EVENT_NAME: &str = "queue-changed";
+pub const GROUP_QUEUE_EVENT_NAME: &str = "group-queue-changed";
 pub const MESSAGE_MAX_CHARS: usize = 100_000;
 const EXIT_TERM_GRACE: Duration = Duration::from_secs(2);
 const EXIT_POLL: Duration = Duration::from_millis(25);
@@ -78,6 +81,16 @@ struct QueueChanged<'a> {
     agent_id: &'a str,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GroupQueueChanged<'a> {
+    group_id: &'a str,
+}
+
+fn emit_group_queue_changed(app: &AppHandle, group_id: &str) {
+    let _ = Emitter::emit(app, GROUP_QUEUE_EVENT_NAME, GroupQueueChanged { group_id });
+}
+
 fn emit_queue_changed(app: &AppHandle, agent_id: &str) {
     let _ = Emitter::emit(app, QUEUE_EVENT_NAME, QueueChanged { agent_id });
 }
@@ -120,6 +133,7 @@ pub enum TurnEvent {
 #[serde(rename_all = "camelCase")]
 pub struct TurnEnvelope {
     pub agent_id: String,
+    pub group_id: Option<String>,
     pub turn_id: String,
     #[serde(flatten)]
     pub event: TurnEvent,
@@ -305,6 +319,11 @@ pub fn stop_all_turns(app: &AppHandle) {
     }
 }
 
+pub struct GroupRun {
+    pub group_id: String,
+    pub system_prompt: String,
+}
+
 pub struct Launch {
     pub agent_id: String,
     pub turn_id: String,
@@ -318,6 +337,7 @@ pub struct Launch {
     pub environment: Vec<(OsString, OsString)>,
     pub stall_timeout: Duration,
     pub tool_stall_timeout: Duration,
+    pub group: Option<GroupRun>,
 }
 
 fn stall_timeout() -> Duration {
@@ -336,6 +356,7 @@ fn begin_error(error: BeginError) -> TurnError {
     match error {
         BeginError::NotFound => TurnError::new("not-found", "This agent no longer exists."),
         BeginError::Busy => TurnError::new("busy", "This agent is already working."),
+        BeginError::Refused { code, message } => TurnError::new(code, message),
         BeginError::Database(error) => TurnError::database(error),
     }
 }
@@ -394,6 +415,41 @@ fn launch_of(
         environment: std::env::vars_os().collect(),
         stall_timeout: stall_timeout(),
         tool_stall_timeout: TOOL_STALL_TIMEOUT,
+        group: None,
+    })
+}
+
+fn launch_of_group(
+    registry: &TurnRegistry,
+    dirs: &[PathBuf],
+    executable: PathBuf,
+    begun: group::GroupBegun,
+    started_at: i64,
+) -> Option<Launch> {
+    if !registry.begin(&begun.agent_id, &begun.begun.turn_id) {
+        return None;
+    }
+    let instructions = instructions::read(Path::new(&begun.begun.agent.workspace_path))
+        .map(|read| read.text)
+        .unwrap_or_default();
+    let system_prompt = group::system_prompt(&instructions, &group::briefing(&begun));
+    Some(Launch {
+        agent_id: begun.agent_id,
+        turn_id: begun.begun.turn_id,
+        executable,
+        search_dirs: dirs.to_vec(),
+        workspace: PathBuf::from(begun.folder),
+        model: begun.begun.agent.model,
+        session: begun.begun.session,
+        text: begun.input,
+        started_at,
+        environment: std::env::vars_os().collect(),
+        stall_timeout: stall_timeout(),
+        tool_stall_timeout: TOOL_STALL_TIMEOUT,
+        group: Some(GroupRun {
+            group_id: begun.group_id,
+            system_prompt,
+        }),
     })
 }
 
@@ -535,6 +591,138 @@ fn resume(
         .transpose()
 }
 
+fn prepare_group(
+    db: &Database,
+    registry: &TurnRegistry,
+    dirs: &[PathBuf],
+    group_id: &str,
+    text: &str,
+) -> Result<Prepared, TurnError> {
+    if registry.is_closing() {
+        return Err(TurnError::shutting_down());
+    }
+    validate(text)?;
+    let lead = db
+        .with_connection(|connection| group::lead_of(connection, group_id))
+        .map_err(group_begin_error)?;
+    let executable = executable_of(db, dirs, &lead)?;
+    let started_at = now_millis();
+    let sent = db
+        .with_connection(|connection| {
+            group::begin_or_queue(connection, group_id, &lead, text, started_at)
+        })
+        .map_err(group_begin_error)?;
+    match sent {
+        group::GroupSent::Started(begun) => {
+            launch_of_group(registry, dirs, executable, begun, started_at)
+                .map(Prepared::Started)
+                .ok_or_else(TurnError::shutting_down)
+        }
+        group::GroupSent::Queued { queued, started } => {
+            let launch = started
+                .map(|begun| {
+                    launch_of_group(registry, dirs, executable, begun, started_at)
+                        .ok_or_else(TurnError::shutting_down)
+                })
+                .transpose()?;
+            Ok(Prepared::Queued { queued, launch })
+        }
+    }
+}
+
+fn group_begin_error(error: BeginError) -> TurnError {
+    match error {
+        BeginError::NotFound => TurnError::new("not-found", "This group no longer exists."),
+        other => begin_error(other),
+    }
+}
+
+fn start_next_group(
+    db: &Database,
+    registry: &TurnRegistry,
+    dirs: &[PathBuf],
+    group_id: &str,
+) -> Option<Launch> {
+    if registry.is_closing() {
+        return None;
+    }
+    let head = db
+        .with_connection(|connection| group::head_agent(connection, group_id))
+        .ok()??;
+    let executable = executable_of(db, dirs, &head).ok()?;
+    let started_at = now_millis();
+    let begun = db
+        .with_connection(|connection| {
+            if registry.is_closing() {
+                Ok(None)
+            } else {
+                group::advance_queue(connection, group_id, started_at)
+            }
+        })
+        .ok()??;
+    launch_of_group(registry, dirs, executable, begun, started_at)
+}
+
+fn start_after(
+    db: &Database,
+    registry: &TurnRegistry,
+    dirs: &[PathBuf],
+    agent_id: &str,
+    group_id: Option<&str>,
+) -> Option<Launch> {
+    if let Some(launch) =
+        group_id.and_then(|group_id| start_next_group(db, registry, dirs, group_id))
+    {
+        return Some(launch);
+    }
+    if let Some(launch) = start_next(db, registry, dirs, agent_id) {
+        return Some(launch);
+    }
+    let waiting = db
+        .with_connection(|connection| group::queued_groups_for(connection, agent_id))
+        .unwrap_or_default();
+    waiting
+        .iter()
+        .find_map(|waiting_group| start_next_group(db, registry, dirs, waiting_group))
+}
+
+fn resume_group(
+    db: &Database,
+    registry: &TurnRegistry,
+    dirs: &[PathBuf],
+    group_id: &str,
+) -> Result<Option<Launch>, TurnError> {
+    if registry.is_closing() {
+        return Err(TurnError::shutting_down());
+    }
+    let head = db
+        .with_connection(|connection| group::head_agent(connection, group_id))
+        .map_err(TurnError::database)?;
+    let Some(head) = head else {
+        return Ok(None);
+    };
+    let executable = executable_of(db, dirs, &head)?;
+    let started_at = now_millis();
+    let begun = db
+        .with_connection(|connection| {
+            if registry.is_closing() {
+                Ok(None)
+            } else {
+                group::advance_queue(connection, group_id, started_at)
+            }
+        })
+        .or_else(|error| match error {
+            BeginError::Busy => Ok(None),
+            other => Err(group_begin_error(other)),
+        })?;
+    begun
+        .map(|begun| {
+            launch_of_group(registry, dirs, executable, begun, started_at)
+                .ok_or_else(TurnError::shutting_down)
+        })
+        .transpose()
+}
+
 pub fn sweep_interrupted(db: &Database) -> Result<usize, String> {
     db.with_connection(|connection| store::sweep_interrupted(connection, now_millis()))
         .map_err(|error| format!("could not recover running turns: {error}"))
@@ -561,13 +749,29 @@ async fn drive_one(app: &AppHandle, launch: Launch) -> bool {
     runner::run(&db, app, &registry, launch, key).await
 }
 
-async fn next_launch(app: &AppHandle, agent_id: String) -> Option<Launch> {
+async fn next_launch(
+    app: &AppHandle,
+    agent_id: String,
+    group_id: Option<String>,
+) -> Option<Launch> {
     let next_app = app.clone();
     let next = tauri::async_runtime::spawn_blocking(move || {
         let db = next_app.try_state::<Database>()?;
         let registry = next_app.try_state::<TurnRegistry>()?;
-        let launch = start_next(&db, &registry, &providers::search_dirs(), &agent_id);
+        let launch = start_after(
+            &db,
+            &registry,
+            &providers::search_dirs(),
+            &agent_id,
+            group_id.as_deref(),
+        );
         emit_queue_changed(&next_app, &agent_id);
+        if let Some(group_id) = &group_id {
+            emit_group_queue_changed(&next_app, group_id);
+        }
+        if let Some(started) = launch.as_ref().and_then(|launch| launch.group.as_ref()) {
+            emit_group_queue_changed(&next_app, &started.group_id);
+        }
         launch
     })
     .await;
@@ -578,12 +782,13 @@ async fn drive(app: AppHandle, first: Launch) {
     let mut current = Some(first);
     while let Some(launch) = current.take() {
         let agent_id = launch.agent_id.clone();
+        let group_id = launch.group.as_ref().map(|group| group.group_id.clone());
         let advance = drive_one(&app, launch).await;
         let closing = app
             .try_state::<TurnRegistry>()
             .is_none_or(|registry| registry.is_closing());
         if advance && !closing {
-            current = next_launch(&app, agent_id).await;
+            current = next_launch(&app, agent_id, group_id).await;
         }
     }
 }
@@ -733,6 +938,159 @@ pub async fn get_conversation(
             .ok_or_else(TurnError::unavailable)?;
         db.with_connection(|connection| {
             store::conversation(connection, &agent_id, before_turn_id.as_deref())
+        })
+        .map_err(TurnError::database)
+    })
+    .await
+    .map_err(TurnError::database)?
+}
+
+#[tauri::command]
+pub async fn send_group_message(
+    app: AppHandle,
+    group_id: String,
+    text: String,
+) -> Result<SendResult, TurnError> {
+    let prepare_app = app.clone();
+    let queue_group = group_id.clone();
+    let prepared = tauri::async_runtime::spawn_blocking(move || {
+        let db = prepare_app
+            .try_state::<Database>()
+            .ok_or_else(TurnError::unavailable)?;
+        let registry = prepare_app
+            .try_state::<TurnRegistry>()
+            .ok_or_else(TurnError::unavailable)?;
+        prepare_group(&db, &registry, &providers::search_dirs(), &group_id, &text)
+    })
+    .await
+    .map_err(TurnError::database)??;
+    match prepared {
+        Prepared::Started(launch) => {
+            let turn_id = launch.turn_id.clone();
+            tauri::async_runtime::spawn(drive(app, launch));
+            Ok(SendResult::Started { turn_id })
+        }
+        Prepared::Queued { queued, launch } => {
+            emit_group_queue_changed(&app, &queue_group);
+            if let Some(launch) = launch {
+                tauri::async_runtime::spawn(drive(app, launch));
+            }
+            Ok(SendResult::Queued {
+                queued_id: queued.id,
+            })
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn resume_group_queue(app: AppHandle, group_id: String) -> Result<(), TurnError> {
+    let resume_app = app.clone();
+    let queue_group = group_id.clone();
+    let launch = tauri::async_runtime::spawn_blocking(move || {
+        let db = resume_app
+            .try_state::<Database>()
+            .ok_or_else(TurnError::unavailable)?;
+        let registry = resume_app
+            .try_state::<TurnRegistry>()
+            .ok_or_else(TurnError::unavailable)?;
+        resume_group(&db, &registry, &providers::search_dirs(), &group_id)
+    })
+    .await
+    .map_err(TurnError::database)??;
+    if let Some(launch) = launch {
+        emit_group_queue_changed(&app, &queue_group);
+        tauri::async_runtime::spawn(drive(app, launch));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn stop_group_turn(app: AppHandle, group_id: String, turn_id: String) {
+    let stop_app = app.clone();
+    let agent_id = tauri::async_runtime::spawn_blocking(move || {
+        let db = stop_app.try_state::<Database>()?;
+        db.with_connection(|connection| group::running_turn_agent(connection, &group_id, &turn_id))
+            .ok()?
+            .map(|agent_id| (agent_id, turn_id))
+    })
+    .await
+    .ok()
+    .flatten();
+    if let Some((agent_id, turn_id)) = agent_id {
+        stop_turn(app, agent_id, turn_id).await;
+    }
+}
+
+#[tauri::command]
+pub async fn list_group_queue(
+    app: AppHandle,
+    group_id: String,
+) -> Result<Vec<QueuedMessage>, TurnError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let db = app
+            .try_state::<Database>()
+            .ok_or_else(TurnError::unavailable)?;
+        db.with_connection(|connection| group::list_queue(connection, &group_id))
+            .map_err(TurnError::database)
+    })
+    .await
+    .map_err(TurnError::database)?
+}
+
+#[tauri::command]
+pub async fn edit_group_queued(
+    app: AppHandle,
+    queued_id: String,
+    text: String,
+) -> Result<QueuedMessage, TurnError> {
+    let edit_app = app.clone();
+    let (group_id, queued) = tauri::async_runtime::spawn_blocking(move || {
+        let db = edit_app
+            .try_state::<Database>()
+            .ok_or_else(TurnError::unavailable)?;
+        validate(&text)?;
+        db.with_connection(|connection| group::edit_queued(connection, &queued_id, &text))
+            .map_err(TurnError::database)?
+            .ok_or_else(|| {
+                TurnError::new("not-found", "This message already started or was removed.")
+            })
+    })
+    .await
+    .map_err(TurnError::database)??;
+    emit_group_queue_changed(&app, &group_id);
+    Ok(queued)
+}
+
+#[tauri::command]
+pub async fn remove_group_queued(app: AppHandle, queued_id: String) -> Result<(), TurnError> {
+    let remove_app = app.clone();
+    let removed = tauri::async_runtime::spawn_blocking(move || {
+        let db = remove_app
+            .try_state::<Database>()
+            .ok_or_else(TurnError::unavailable)?;
+        db.with_connection(|connection| group::remove_queued(connection, &queued_id))
+            .map_err(TurnError::database)
+    })
+    .await
+    .map_err(TurnError::database)??;
+    if let Some(group_id) = removed {
+        emit_group_queue_changed(&app, &group_id);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_group_conversation(
+    app: AppHandle,
+    group_id: String,
+    before_turn_id: Option<String>,
+) -> Result<ConversationPage, TurnError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let db = app
+            .try_state::<Database>()
+            .ok_or_else(TurnError::unavailable)?;
+        db.with_connection(|connection| {
+            store::group_conversation(connection, &group_id, before_turn_id.as_deref())
         })
         .map_err(TurnError::database)
     })
@@ -1000,6 +1358,7 @@ mod tests {
     fn events_serialise_with_a_kebab_kind_and_camel_case_fields() {
         let envelope = TurnEnvelope {
             agent_id: "a".into(),
+            group_id: None,
             turn_id: "t".into(),
             event: TurnEvent::TextDelta {
                 item_id: "i".into(),
@@ -1008,10 +1367,11 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_value(&envelope).unwrap(),
-            serde_json::json!({"agentId":"a","turnId":"t","kind":"text-delta","itemId":"i","text":"x"})
+            serde_json::json!({"agentId":"a","groupId":null,"turnId":"t","kind":"text-delta","itemId":"i","text":"x"})
         );
         let ended = TurnEnvelope {
             agent_id: "a".into(),
+            group_id: Some("g".into()),
             turn_id: "t".into(),
             event: TurnEvent::Ended {
                 status: "failed".into(),
@@ -1021,6 +1381,10 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&ended).unwrap()["kind"],
             serde_json::json!("ended")
+        );
+        assert_eq!(
+            serde_json::to_value(&ended).unwrap()["groupId"],
+            serde_json::json!("g")
         );
     }
 

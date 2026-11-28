@@ -1,5 +1,6 @@
 import { useLayoutEffect, useRef } from "react";
 import { Button } from "@/components/ui/button";
+import type { GroupMember } from "@/features/groups/api";
 import type { Turn } from "./api";
 import { TurnView } from "./TurnView";
 
@@ -11,12 +12,14 @@ export function Transcript({
   loadingOlder,
   loaded,
   onLoadOlder,
+  members,
 }: {
   turns: Turn[];
   hasMore: boolean;
   loadingOlder: boolean;
   loaded: boolean;
   onLoadOlder: () => void;
+  members?: GroupMember[];
 }) {
   const scroller = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
@@ -64,7 +67,7 @@ export function Transcript({
           <p className="py-24 text-center text-muted-foreground">No messages yet.</p>
         )}
         {turns.map((turn) => (
-          <TurnView key={turn.id} turn={turn} />
+          <TurnView key={turn.id} turn={turn} members={members} />
         ))}
       </div>
     </div>

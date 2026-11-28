@@ -1,5 +1,7 @@
 import { Check, ChevronDown, ChevronRight, LoaderCircle, Square, X } from "lucide-react";
 import { useState } from "react";
+import { AgentAvatar } from "@/features/agents/AgentAvatar";
+import type { GroupMember } from "@/features/groups/api";
 import { cn } from "@/lib/utils";
 import type { Step, StepStatus, TextItem, Turn } from "./api";
 import { Markdown } from "./Markdown";
@@ -59,20 +61,20 @@ function Steps({ steps }: { steps: Step[] }) {
   );
 }
 
-export function TurnView({ turn }: { turn: Turn }) {
+const FORMER_MEMBER: Pick<GroupMember, "name" | "color"> = {
+  name: "Former member",
+  color: "slate",
+};
+
+export function TurnView({ turn, members }: { turn: Turn; members?: GroupMember[] }) {
   const notices = turn.items.filter((item): item is TextItem => item.type === "notice");
   const steps = turn.items.filter((item): item is Step => item.type === "step");
   const texts = turn.items.filter((item): item is TextItem => item.type === "text");
-  return (
-    <article className="flex flex-col gap-2">
-      <div className="ml-auto max-w-[80%] rounded-2xl bg-primary px-4 py-2 whitespace-pre-wrap break-words text-primary-foreground">
-        {turn.userMessage}
-      </div>
-      {notices.map((item) => (
-        <p key={item.id} className="my-1 text-center text-xs text-muted-foreground">
-          {item.text}
-        </p>
-      ))}
+  const author = members
+    ? (members.find((member) => member.agentId === turn.agentId) ?? FORMER_MEMBER)
+    : null;
+  const reply = (
+    <>
       {steps.length > 0 && <Steps steps={steps} />}
       {texts.map((item) => (
         <Markdown key={item.id} text={item.text} />
@@ -86,6 +88,29 @@ export function TurnView({ turn }: { turn: Turn }) {
       {turn.status === "stopped" && <p className="text-sm text-muted-foreground">Stopped</p>}
       {turn.status === "interrupted" && (
         <p className="text-sm text-muted-foreground">This reply was interrupted.</p>
+      )}
+    </>
+  );
+  return (
+    <article className="flex flex-col gap-2">
+      <div className="ml-auto max-w-[80%] rounded-2xl bg-primary px-4 py-2 whitespace-pre-wrap break-words text-primary-foreground">
+        {turn.userMessage}
+      </div>
+      {notices.map((item) => (
+        <p key={item.id} className="my-1 text-center text-xs text-muted-foreground">
+          {item.text}
+        </p>
+      ))}
+      {author ? (
+        <div className="flex gap-3">
+          <AgentAvatar name={author.name} color={author.color} className="size-8" />
+          <div className="flex min-w-0 flex-1 flex-col gap-2">
+            <span className="text-sm font-medium">{author.name}</span>
+            {reply}
+          </div>
+        </div>
+      ) : (
+        reply
       )}
     </article>
   );

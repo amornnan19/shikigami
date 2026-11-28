@@ -3,15 +3,16 @@ import { ArrowUp, Square } from "lucide-react";
 import { type KeyboardEvent, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { asAgentError } from "@/features/agents/api";
-import { MESSAGE_MAX_CHARS, sendMessage, stopTurn } from "./api";
+import { MESSAGE_MAX_CHARS } from "./api";
+import type { ChatScope } from "./scope";
 
 export function Composer({
-  agentId,
+  scope,
   running,
   runningTurnId,
   blockedReason,
 }: {
-  agentId: string;
+  scope: ChatScope;
   running: boolean;
   runningTurnId: string | null;
   blockedReason: string | null;
@@ -21,15 +22,17 @@ export function Composer({
   const length = Array.from(text).length;
   const tooLong = length > MESSAGE_MAX_CHARS;
   const send = useMutation({
-    mutationFn: () => sendMessage(agentId, text),
+    mutationFn: () => scope.send(text),
     onSuccess: () => {
       setText("");
-      void client.invalidateQueries({ queryKey: ["conversation", agentId] });
-      void client.invalidateQueries({ queryKey: ["queue", agentId] });
-      void client.invalidateQueries({ queryKey: ["agents"] });
+      void client.invalidateQueries({ queryKey: scope.conversationKey });
+      void client.invalidateQueries({ queryKey: scope.queueKey });
+      for (const queryKey of scope.refreshKeys) {
+        void client.invalidateQueries({ queryKey });
+      }
     },
   });
-  const stop = useMutation({ mutationFn: (turnId: string) => stopTurn(agentId, turnId) });
+  const stop = useMutation({ mutationFn: (turnId: string) => scope.stop(turnId) });
   const canSend = text.trim().length > 0 && !tooLong && !send.isPending && blockedReason === null;
 
   function submit() {

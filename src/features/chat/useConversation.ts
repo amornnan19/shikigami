@@ -1,20 +1,34 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useState } from "react";
-import { type Conversation, getConversation, listQueue, onQueueChanged, onTurnEvent } from "./api";
+import {
+  type Conversation,
+  onGroupQueueChanged,
+  onQueueChanged,
+  onTurnEvent,
+  type TurnEvent,
+} from "./api";
 import { applyEvent, mergeNewest, prependOlder } from "./conversation";
+import {
+  agentConversationKey,
+  agentQueueKey,
+  type ChatScope,
+  groupConversationKey,
+  groupQueueKey,
+} from "./scope";
 
-const key = (agentId: string) => ["conversation", agentId];
-const queueKey = (agentId: string) => ["queue", agentId];
+const eventKey = (event: TurnEvent) =>
+  event.groupId ? groupConversationKey(event.groupId) : agentConversationKey(event.agentId);
 
 export function useTurnEvents() {
   const client = useQueryClient();
   useEffect(() => {
     const stop = onTurnEvent((event) => {
       if (event.kind === "started" || event.kind === "ended") {
-        void client.invalidateQueries({ queryKey: key(event.agentId) });
+        void client.invalidateQueries({ queryKey: eventKey(event) });
         void client.invalidateQueries({ queryKey: ["agents"] });
+        if (event.groupId) void client.invalidateQueries({ queryKey: ["groups"] });
       }
-      client.setQueryData<Conversation>(key(event.agentId), (data) =>
+      client.setQueryData<Conversation>(eventKey(event), (data) =>
         data ? applyEvent(data, event) : data,
       );
     });
@@ -24,7 +38,15 @@ export function useTurnEvents() {
   }, [client]);
   useEffect(() => {
     const stop = onQueueChanged((agentId) => {
-      void client.invalidateQueries({ queryKey: queueKey(agentId) });
+      void client.invalidateQueries({ queryKey: agentQueueKey(agentId) });
+    });
+    return () => {
+      void stop.then((unlisten) => unlisten());
+    };
+  }, [client]);
+  useEffect(() => {
+    const stop = onGroupQueueChanged((groupId) => {
+      void client.invalidateQueries({ queryKey: groupQueueKey(groupId) });
     });
     return () => {
       void stop.then((unlisten) => unlisten());
@@ -32,18 +54,19 @@ export function useTurnEvents() {
   }, [client]);
 }
 
-export function useQueue(agentId: string) {
-  return useQuery({ queryKey: queueKey(agentId), queryFn: () => listQueue(agentId), retry: false });
+export function useQueue(scope: ChatScope) {
+  return useQuery({ queryKey: scope.queueKey, queryFn: scope.loadQueue, retry: false });
 }
 
-export function useConversation(agentId: string) {
+export function useConversation(scope: ChatScope) {
   const client = useQueryClient();
   const [loadingOlder, setLoadingOlder] = useState(false);
+  const { conversationKey, load } = scope;
   const query = useQuery({
-    queryKey: key(agentId),
+    queryKey: conversationKey,
     queryFn: async () => {
-      const fresh = await getConversation(agentId);
-      return mergeNewest(client.getQueryData<Conversation>(key(agentId)), fresh);
+      const fresh = await load();
+      return mergeNewest(client.getQueryData<Conversation>(conversationKey), fresh);
     },
     retry: false,
   });
@@ -53,14 +76,14 @@ export function useConversation(agentId: string) {
     if (!oldestId) return;
     setLoadingOlder(true);
     try {
-      const older = await getConversation(agentId, oldestId);
-      client.setQueryData<Conversation>(key(agentId), (data) =>
+      const older = await load(oldestId);
+      client.setQueryData<Conversation>(conversationKey, (data) =>
         data ? prependOlder(data, older) : data,
       );
     } finally {
       setLoadingOlder(false);
     }
-  }, [agentId, client, oldestId]);
+  }, [client, conversationKey, load, oldestId]);
 
   return { query, loadOlder, loadingOlder };
 }

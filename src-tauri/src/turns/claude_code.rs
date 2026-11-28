@@ -23,7 +23,7 @@ const ISOLATION_FLAGS: [&str; 6] = [
     "--permission-prompts",
 ];
 
-pub fn arguments(model: &str, session: &Session) -> Vec<String> {
+pub fn arguments(model: &str, session: &Session, system_prompt: Option<&str>) -> Vec<String> {
     let mut args: Vec<String> = [
         "-p",
         "--output-format",
@@ -49,6 +49,10 @@ pub fn arguments(model: &str, session: &Session) -> Vec<String> {
             args.push("--resume".to_owned());
             args.push(id.clone());
         }
+    }
+    if let Some(prompt) = system_prompt {
+        args.push("--append-system-prompt".to_owned());
+        args.push(prompt.to_owned());
     }
     args
 }
@@ -406,7 +410,7 @@ mod tests {
 
     #[test]
     fn arguments_pass_the_isolation_flags_the_model_and_the_session() {
-        let first = arguments("default", &Session::New("abc".into()));
+        let first = arguments("default", &Session::New("abc".into()), None);
         assert_eq!(
             first,
             [
@@ -426,7 +430,7 @@ mod tests {
                 "abc"
             ]
         );
-        let later = arguments("claude-haiku-5-5", &Session::Resume("abc".into()));
+        let later = arguments("claude-haiku-5-5", &Session::Resume("abc".into()), None);
         assert_eq!(
             &later[12..],
             ["--model", "claude-haiku-5-5", "--resume", "abc"]
@@ -437,10 +441,39 @@ mod tests {
     fn every_argument_list_keeps_the_isolation_flags_and_no_widening_value() {
         for model in ["default", "haiku"] {
             for session in [Session::New("abc".into()), Session::Resume("abc".into())] {
-                let args = arguments(model, &session);
-                assert_isolated(&args);
+                for prompt in [None, Some("be brief")] {
+                    let args = arguments(model, &session, prompt);
+                    assert_isolated(&args);
+                }
             }
         }
+    }
+
+    #[test]
+    fn a_system_prompt_is_appended_as_one_argument_after_the_session() {
+        let args = arguments(
+            "haiku",
+            &Session::Resume("abc".into()),
+            Some("line one\nline two"),
+        );
+        assert_eq!(
+            &args[12..],
+            [
+                "--model",
+                "haiku",
+                "--resume",
+                "abc",
+                "--append-system-prompt",
+                "line one\nline two"
+            ]
+        );
+        assert_eq!(
+            args.iter()
+                .filter(|arg| *arg == "--setting-sources")
+                .count(),
+            1
+        );
+        assert_eq!(args[6], "project");
     }
 
     #[test]

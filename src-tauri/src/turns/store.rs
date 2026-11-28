@@ -22,6 +22,7 @@ pub struct Begun {
 pub enum BeginError {
     NotFound,
     Busy,
+    Refused { code: &'static str, message: String },
     Database(rusqlite::Error),
 }
 
@@ -53,6 +54,7 @@ pub enum ItemView {
 #[serde(rename_all = "camelCase")]
 pub struct TurnView {
     pub id: String,
+    pub agent_id: String,
     pub status: String,
     pub error: Option<String>,
     pub started_at: i64,
@@ -331,6 +333,36 @@ pub fn set_session(
     Ok(())
 }
 
+pub struct NewMessage<'a> {
+    pub id: &'a str,
+    pub agent_id: &'a str,
+    pub turn_id: &'a str,
+    pub group_id: Option<&'a str>,
+    pub role: &'a str,
+    pub content: &'a str,
+    pub created_at: i64,
+}
+
+pub fn insert_message_in(connection: &Connection, message: &NewMessage) -> rusqlite::Result<()> {
+    let author = message.group_id.and(Some(message.agent_id));
+    connection.execute(
+        "INSERT INTO messages (id, agent_id, turn_id, group_id, author_agent_id, role, content, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            message.id,
+            message.agent_id,
+            message.turn_id,
+            message.group_id,
+            author,
+            message.role,
+            message.content,
+            message.created_at
+        ],
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
 pub fn insert_message(
     connection: &Connection,
     id: &str,
@@ -340,12 +372,18 @@ pub fn insert_message(
     content: &str,
     created_at: i64,
 ) -> rusqlite::Result<()> {
-    connection.execute(
-        "INSERT INTO messages (id, agent_id, turn_id, role, content, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![id, agent_id, turn_id, role, content, created_at],
-    )?;
-    Ok(())
+    insert_message_in(
+        connection,
+        &NewMessage {
+            id,
+            agent_id,
+            turn_id,
+            group_id: None,
+            role,
+            content,
+            created_at,
+        },
+    )
 }
 
 pub fn update_message(connection: &Connection, id: &str, content: &str) -> rusqlite::Result<()> {
@@ -402,19 +440,31 @@ pub fn finish_turn(
     now: i64,
 ) -> rusqlite::Result<()> {
     let transaction = connection.unchecked_transaction()?;
-    transaction.execute(
+    finish_turn_rows(&transaction, turn_id, agent_id, status, error, now)?;
+    transaction.commit()
+}
+
+pub fn finish_turn_rows(
+    connection: &Connection,
+    turn_id: &str,
+    agent_id: &str,
+    status: &str,
+    error: Option<&str>,
+    now: i64,
+) -> rusqlite::Result<()> {
+    connection.execute(
         "UPDATE steps SET status = 'stopped' WHERE turn_id = ?1 AND status = 'running'",
         [turn_id],
     )?;
-    transaction.execute(
+    connection.execute(
         "UPDATE turns SET status = ?2, error = ?3, ended_at = ?4 WHERE id = ?1",
         params![turn_id, status, error, now],
     )?;
-    transaction.execute(
+    connection.execute(
         "UPDATE agents SET last_activity_at = ?2 WHERE id = ?1",
         params![agent_id, now],
     )?;
-    transaction.commit()
+    Ok(())
 }
 
 pub fn sweep_interrupted(connection: &Connection, now: i64) -> rusqlite::Result<usize> {
@@ -435,6 +485,7 @@ pub fn sweep_interrupted(connection: &Connection, now: i64) -> rusqlite::Result<
 
 struct TurnRow {
     id: String,
+    agent_id: String,
     status: String,
     error: Option<String>,
     started_at: i64,
@@ -489,27 +540,32 @@ fn load_items(connection: &Connection, turn_id: &str) -> rusqlite::Result<(Strin
     ))
 }
 
-pub fn conversation(
+const AGENT_CHAT: &str = "agent_id = ?1 AND group_id IS NULL";
+const GROUP_CHAT: &str = "group_id = ?1";
+
+fn page(
     connection: &Connection,
-    agent_id: &str,
+    filter: &str,
+    scope_id: &str,
     before_turn_id: Option<&str>,
 ) -> rusqlite::Result<ConversationPage> {
-    let mut statement = connection.prepare(
-        "SELECT id, status, error, started_at, ended_at FROM turns
-         WHERE agent_id = ?1
+    let mut statement = connection.prepare(&format!(
+        "SELECT id, agent_id, status, error, started_at, ended_at FROM turns
+         WHERE {filter}
            AND (?2 IS NULL OR rowid < (SELECT rowid FROM turns WHERE id = ?2))
-         ORDER BY rowid DESC LIMIT ?3",
-    )?;
+         ORDER BY rowid DESC LIMIT ?3"
+    ))?;
     let mut rows: Vec<TurnRow> = statement
         .query_map(
-            params![agent_id, before_turn_id, (PAGE_SIZE + 1) as i64],
+            params![scope_id, before_turn_id, (PAGE_SIZE + 1) as i64],
             |row| {
                 Ok(TurnRow {
                     id: row.get(0)?,
-                    status: row.get(1)?,
-                    error: row.get(2)?,
-                    started_at: row.get(3)?,
-                    ended_at: row.get(4)?,
+                    agent_id: row.get(1)?,
+                    status: row.get(2)?,
+                    error: row.get(3)?,
+                    started_at: row.get(4)?,
+                    ended_at: row.get(5)?,
                 })
             },
         )?
@@ -523,6 +579,7 @@ pub fn conversation(
             let (user_message, items) = load_items(connection, &row.id)?;
             Ok(TurnView {
                 id: row.id,
+                agent_id: row.agent_id,
                 status: row.status,
                 error: row.error,
                 started_at: row.started_at,
@@ -533,6 +590,22 @@ pub fn conversation(
         })
         .collect::<rusqlite::Result<_>>()?;
     Ok(ConversationPage { turns, has_more })
+}
+
+pub fn conversation(
+    connection: &Connection,
+    agent_id: &str,
+    before_turn_id: Option<&str>,
+) -> rusqlite::Result<ConversationPage> {
+    page(connection, AGENT_CHAT, agent_id, before_turn_id)
+}
+
+pub fn group_conversation(
+    connection: &Connection,
+    group_id: &str,
+    before_turn_id: Option<&str>,
+) -> rusqlite::Result<ConversationPage> {
+    page(connection, GROUP_CHAT, group_id, before_turn_id)
 }
 
 #[cfg(test)]

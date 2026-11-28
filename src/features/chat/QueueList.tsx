@@ -3,14 +3,15 @@ import { X } from "lucide-react";
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { asAgentError } from "@/features/agents/api";
-import { editQueued, MESSAGE_MAX_CHARS, type QueuedMessage, removeQueued } from "./api";
+import { MESSAGE_MAX_CHARS, type QueuedMessage } from "./api";
+import type { ChatScope } from "./scope";
 
-function QueueRow({ message, agentId }: { message: QueuedMessage; agentId: string }) {
+function QueueRow({ message, scope }: { message: QueuedMessage; scope: ChatScope }) {
   const client = useQueryClient();
   const [draft, setDraft] = useState<string | null>(null);
-  const refresh = () => client.invalidateQueries({ queryKey: ["queue", agentId] });
+  const refresh = () => client.invalidateQueries({ queryKey: scope.queueKey });
   const save = useMutation({
-    mutationFn: (text: string) => editQueued(message.id, text),
+    mutationFn: (text: string) => scope.editQueued(message.id, text),
     onSuccess: () => {
       setDraft(null);
       void refresh();
@@ -18,7 +19,7 @@ function QueueRow({ message, agentId }: { message: QueuedMessage; agentId: strin
     onError: () => void refresh(),
   });
   const remove = useMutation({
-    mutationFn: () => removeQueued(message.id),
+    mutationFn: () => scope.removeQueued(message.id),
     onSuccess: () => void refresh(),
   });
   const valid =
@@ -72,7 +73,7 @@ function QueueRow({ message, agentId }: { message: QueuedMessage; agentId: strin
   );
 }
 
-export function QueueList({ agentId, messages }: { agentId: string; messages: QueuedMessage[] }) {
+export function QueueList({ scope, messages }: { scope: ChatScope; messages: QueuedMessage[] }) {
   if (messages.length === 0) return null;
   return (
     <section
@@ -82,7 +83,7 @@ export function QueueList({ agentId, messages }: { agentId: string; messages: Qu
       <h3 className="mb-2 text-xs font-medium text-muted-foreground">Queued ({messages.length})</h3>
       <ul className="flex flex-col gap-2">
         {messages.map((message) => (
-          <QueueRow key={message.id} message={message} agentId={agentId} />
+          <QueueRow key={message.id} message={message} scope={scope} />
         ))}
       </ul>
     </section>

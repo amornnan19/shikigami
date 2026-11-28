@@ -1,7 +1,13 @@
 import { Settings, TriangleAlert } from "lucide-react";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { Button } from "@/components/ui/button";
 import type { Agent } from "@/features/agents/api";
+import { Composer } from "@/features/chat/Composer";
+import { QueueList } from "@/features/chat/QueueList";
+import { ResumeBar } from "@/features/chat/ResumeBar";
+import { groupScope } from "@/features/chat/scope";
+import { Transcript } from "@/features/chat/Transcript";
+import { useConversation, useQueue } from "@/features/chat/useConversation";
 import type { Group } from "./api";
 import { GroupAvatars } from "./GroupAvatars";
 import { GroupSettingsDialog } from "./GroupSettingsDialog";
@@ -19,6 +25,15 @@ export function GroupView({
 }) {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const lead = group.members.find((member) => member.agentId === group.leadAgentId);
+  const scope = useMemo(() => groupScope(group.id), [group.id]);
+  const { query, loadOlder, loadingOlder } = useConversation(scope);
+  const queue = useQueue(scope);
+  const turns = query.data?.turns ?? [];
+  const last = turns.at(-1);
+  const runningTurnId = last?.status === "running" ? last.id : null;
+  const running = runningTurnId !== null;
+  const blockedReason = group.attention?.message ?? null;
+  const waiting = queue.data?.length ?? 0;
   return (
     <section aria-label="Group" className="flex h-screen min-w-0 flex-1 flex-col">
       <header className="flex items-center gap-3 border-b border-border px-6 py-4">
@@ -61,9 +76,29 @@ export function GroupView({
           {notice}
         </p>
       )}
-      <div className="flex-1 overflow-y-auto px-6 py-4">
-        <p className="py-24 text-center text-muted-foreground">No messages yet.</p>
-      </div>
+      {query.isError && (
+        <p role="alert" className="px-6 py-3 text-sm text-red-600">
+          Could not load the conversation.
+        </p>
+      )}
+      <Transcript
+        turns={turns}
+        hasMore={query.data?.hasMore ?? false}
+        loadingOlder={loadingOlder}
+        loaded={query.isSuccess}
+        onLoadOlder={loadOlder}
+        members={group.members}
+      />
+      <QueueList scope={scope} messages={queue.data ?? []} />
+      {waiting > 0 && !running && blockedReason === null && (
+        <ResumeBar scope={scope} count={waiting} interrupted={last?.status === "interrupted"} />
+      )}
+      <Composer
+        scope={scope}
+        running={running}
+        runningTurnId={runningTurnId}
+        blockedReason={blockedReason}
+      />
       <GroupSettingsDialog
         group={group}
         agents={agents}

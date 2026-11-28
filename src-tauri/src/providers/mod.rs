@@ -204,8 +204,26 @@ esac"#,
         unsafe { libc::kill(pid, 0) == 0 }
     }
 
-    fn read_pid(path: &Path) -> i32 {
-        fs::read_to_string(path).unwrap().trim().parse().unwrap()
+    const KILL_PROBE_LIMIT: Duration = Duration::from_secs(4);
+    const LOAD_SLACK: Duration = Duration::from_secs(10);
+
+    fn read_pid(path: &Path) -> Option<i32> {
+        fs::read_to_string(path).ok()?.trim().parse().ok()
+    }
+
+    async fn wait_for_pid(path: &Path) -> i32 {
+        let deadline = Instant::now() + LOAD_SLACK;
+        loop {
+            if let Some(pid) = read_pid(path) {
+                return pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{} was not written",
+                path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     #[tokio::test]
@@ -223,11 +241,15 @@ esac"#,
             ),
         );
         let started = Instant::now();
-        let status = detect(&claude_code::SPEC, &dirs(&dir), Duration::from_millis(1500)).await;
-        assert!(started.elapsed() < Duration::from_secs(10));
+        let status = detect(&claude_code::SPEC, &dirs(&dir), KILL_PROBE_LIMIT).await;
+        assert!(started.elapsed() >= KILL_PROBE_LIMIT);
+        assert!(started.elapsed() < KILL_PROBE_LIMIT + LOAD_SLACK);
         assert_eq!(status.version, None);
-        let pids = [read_pid(&shell_pid), read_pid(&child_pid)];
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let pids = [
+            wait_for_pid(&shell_pid).await,
+            wait_for_pid(&child_pid).await,
+        ];
+        let deadline = Instant::now() + LOAD_SLACK;
         while pids.iter().any(|pid| process_exists(*pid)) && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
