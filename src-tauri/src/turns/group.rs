@@ -9,7 +9,7 @@ use crate::providers::CLAUDE_CODE_ID;
 
 mod hand_offs;
 
-pub use hand_offs::Notice;
+pub use hand_offs::{drop_for_departed, settle_interrupted, Notice};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AccessLevel(u8);
@@ -96,10 +96,10 @@ pub struct Origin {
     pub from_agent_id: Option<String>,
     pub root: Option<String>,
     pub hop: i64,
-    pub return_to: Option<String>,
     pub parent_turn_id: Option<String>,
+    pub owes_turn_id: Option<String>,
     pub access: AccessLevel,
-    pub truncated: bool,
+    pub notice: Option<String>,
 }
 
 impl Origin {
@@ -109,10 +109,10 @@ impl Origin {
             from_agent_id: None,
             root: Some(root.to_owned()),
             hop: 0,
-            return_to: None,
             parent_turn_id: None,
+            owes_turn_id: None,
             access: access_level_of(addressed),
-            truncated,
+            notice: truncated.then(|| TRUNCATED_NOTICE.to_owned()),
         }
     }
 }
@@ -239,7 +239,7 @@ fn unseen_lines(
     group_id: &str,
     agent_id: &str,
     after_rowid: i64,
-    exclude_root: Option<&str>,
+    exclude_same: Option<(&str, &str)>,
 ) -> rusqlite::Result<Vec<String>> {
     let mut statement = connection.prepare(
         "SELECT m.role, m.content, a.name, t.kind FROM messages m
@@ -250,11 +250,17 @@ fn unseen_lines(
            AND m.content <> ''
            AND NOT (m.role = 'user' AND t.kind = 'continuation')
            AND NOT (?4 IS NOT NULL AND m.role = 'user' AND t.kind = 'user'
-                    AND COALESCE(t.root_message_id = ?4, 0))
+                    AND COALESCE(t.root_message_id = ?4, 0) AND m.content = ?5)
          ORDER BY m.seq",
     )?;
     let rows = statement.query_map(
-        params![group_id, agent_id, after_rowid, exclude_root],
+        params![
+            group_id,
+            agent_id,
+            after_rowid,
+            exclude_same.map(|(root, _)| root),
+            exclude_same.map(|(_, text)| text)
+        ],
         |row| {
             let role: String = row.get(0)?;
             let content: String = row.get(1)?;
@@ -314,12 +320,33 @@ fn begin_in(
         .root
         .as_deref()
         .filter(|_| origin.kind == EntryKind::User);
-    let unseen = unseen_lines(transaction, group_id, addressed, last_seen, user_root)?;
+    let stored_text: Option<String> = match user_root {
+        Some(root) => transaction
+            .query_row(
+                "SELECT m.content FROM messages m JOIN turns t ON t.id = m.turn_id
+                 WHERE t.group_id = ?1 AND t.root_message_id = ?2 AND t.kind = 'user'
+                   AND m.role = 'user'
+                 ORDER BY m.seq LIMIT 1",
+                params![group_id, root],
+                |row| row.get(0),
+            )
+            .optional()?,
+        None => None,
+    };
+    let same_text = stored_text.as_deref() == Some(text);
+    let exclude = user_root.filter(|_| same_text);
+    let unseen = unseen_lines(
+        transaction,
+        group_id,
+        addressed,
+        last_seen,
+        exclude.map(|root| (root, text)),
+    )?;
     let access = access_for_hand_off(origin.access, addressed);
     let turn_id = uuid::Uuid::now_v7().to_string();
     transaction.execute(
         "INSERT INTO turns (id, agent_id, group_id, status, started_at, root_message_id, hop, kind,
-                            from_agent_id, return_to, parent_turn_id, access)
+                            from_agent_id, parent_turn_id, owes_turn_id, access)
          VALUES (?1, ?2, ?3, 'running', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             turn_id,
@@ -330,21 +357,12 @@ fn begin_in(
             origin.hop,
             origin.kind.as_str(),
             origin.from_agent_id,
-            origin.return_to,
             origin.parent_turn_id,
+            origin.owes_turn_id,
             access.value()
         ],
     )?;
-    let message_stored: bool = match user_root {
-        Some(root) => transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM messages m JOIN turns t ON t.id = m.turn_id
-                           WHERE t.group_id = ?1 AND t.root_message_id = ?2 AND t.kind = 'user'
-                             AND m.role = 'user' AND t.id <> ?3)",
-            params![group_id, root, turn_id],
-            |row| row.get(0),
-        )?,
-        None => false,
-    };
+    let message_stored = same_text;
     if !message_stored {
         let author = (origin.kind == EntryKind::HandOff)
             .then_some(origin.from_agent_id.as_deref())
@@ -363,7 +381,7 @@ fn begin_in(
             ],
         )?;
     }
-    if origin.truncated {
+    if let Some(notice) = &origin.notice {
         transaction.execute(
             "INSERT INTO messages (id, agent_id, turn_id, group_id, author_agent_id, role, content, created_at)
              VALUES (?1, ?2, ?3, ?4, ?2, 'notice', ?5, ?6)",
@@ -372,7 +390,7 @@ fn begin_in(
                 addressed,
                 turn_id,
                 group_id,
-                TRUNCATED_NOTICE,
+                notice,
                 now
             ],
         )?;
@@ -442,7 +460,7 @@ fn enqueue_at(
     let id = uuid::Uuid::now_v7().to_string();
     connection.execute(
         "INSERT INTO group_queue (id, group_id, addressed_agent_id, content, from_agent_id, root_message_id, hop, kind,
-                                 return_to, parent_turn_id, access, truncated, position, created_at)
+                                 parent_turn_id, owes_turn_id, access, notice, position, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             id,
@@ -453,10 +471,10 @@ fn enqueue_at(
             origin.root,
             origin.hop,
             origin.kind.as_str(),
-            origin.return_to,
             origin.parent_turn_id,
+            origin.owes_turn_id,
             origin.access.value(),
-            origin.truncated,
+            origin.notice,
             position,
             now
         ],
@@ -554,7 +572,7 @@ fn advance_in(
     let head: Option<(String, String, String, Origin)> = transaction
         .query_row(
             "SELECT id, addressed_agent_id, content, kind, from_agent_id, root_message_id, hop,
-                    return_to, parent_turn_id, access, truncated
+                    parent_turn_id, owes_turn_id, access, notice
              FROM group_queue WHERE group_id = ?1
              ORDER BY position LIMIT 1",
             [group_id],
@@ -568,10 +586,10 @@ fn advance_in(
                         from_agent_id: row.get(4)?,
                         root: row.get(5)?,
                         hop: row.get(6)?,
-                        return_to: row.get(7)?,
-                        parent_turn_id: row.get(8)?,
+                        parent_turn_id: row.get(7)?,
+                        owes_turn_id: row.get(8)?,
                         access: AccessLevel::from_value(row.get(9)?),
-                        truncated: row.get(10)?,
+                        notice: row.get(10)?,
                     },
                 ))
             },
@@ -733,6 +751,7 @@ pub fn finish_turn(connection: &Connection, finish: &Finish) -> rusqlite::Result
     let notices = match status {
         "completed" => hand_offs::queue_after(&transaction, turn_id, now)?,
         "stopped" => hand_offs::drop_after_stop(&transaction, turn_id, now)?,
+        "failed" => hand_offs::unfinished_after(&transaction, turn_id, now)?,
         _ => Vec::new(),
     };
     transaction.commit()?;
