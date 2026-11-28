@@ -40,6 +40,7 @@ const TOO_OLD_MESSAGE: &str =
     "This Claude Code version is too old to run safely. Update it, then press Resume.";
 const VERSION_UNREADABLE_MESSAGE: &str =
     "Could not check the Claude Code version. Press Resume to try again.";
+const SIGN_IN_REJECTED: &str = "Claude Code could not sign in.";
 const SESSION_MISSING: &str = "No conversation found";
 
 const RESUME_NOTICE: &str =
@@ -188,6 +189,7 @@ struct Attempt {
     api_error_status: Option<u64>,
     compacted: bool,
     init_checked: bool,
+    auth_rejected: bool,
     settings_ignored: bool,
     failure: Option<String>,
     stderr: StderrSummary,
@@ -201,6 +203,9 @@ impl Attempt {
     }
 
     fn sign_in_failed(&self) -> bool {
+        if self.auth_rejected {
+            return true;
+        }
         match &self.result {
             Some((_, text)) => claude_code::is_sign_in_failure(text, self.api_error_status),
             None => self.stderr.sign_in,
@@ -301,11 +306,13 @@ fn shell_quoted(path: &Path) -> String {
 
 fn key_files(temp_dir: &Path, key: &str) -> io::Result<(TempFile, TempFile)> {
     fs::create_dir_all(temp_dir)?;
+    sandbox::exclude_from_backups(temp_dir);
     let id = uuid::Uuid::new_v4().simple();
     let key_path = temp_dir.join(format!("key-{id}"));
     let helper_path = temp_dir.join(format!("key-helper-{id}.sh"));
     let key_file = TempFile::create_at(key_path.clone(), 0o600, key)?;
-    let script = format!("#!/bin/sh\nexec /bin/cat {}\n", shell_quoted(&key_path));
+    let quoted = shell_quoted(&key_path);
+    let script = format!("#!/bin/sh\n/bin/cat {quoted} && /bin/rm -f {quoted}\n");
     let helper = TempFile::create_at(helper_path, 0o700, &script)?;
     Ok((key_file, helper))
 }
@@ -573,6 +580,10 @@ impl Runner<'_> {
 
     fn handle(&mut self, parsed: Parsed, attempt: &mut Attempt) {
         match parsed {
+            Parsed::AuthRejected => {
+                attempt.auth_rejected = true;
+                self.registry.kill(&self.agent_id, &self.turn_id);
+            }
             Parsed::Tools(tools) => {
                 let first = !attempt.init_checked;
                 attempt.init_checked = true;
@@ -737,7 +748,9 @@ impl Runner<'_> {
             .process_group(0)
             .kill_on_drop(true);
         if matches!(key, ApiKey::Present(_)) {
-            command.env(sandbox::SCRUB_VARIABLE, "1");
+            command
+                .env(sandbox::SCRUB_VARIABLE, "1")
+                .env(sandbox::HELPER_TTL_VARIABLE, sandbox::HELPER_TTL_MS);
         }
         Some(command)
     }
@@ -897,11 +910,12 @@ impl Runner<'_> {
                     }
                     for parsed in parser.line(&line) {
                         self.handle(parsed, &mut attempt);
-                        if attempt.settings_ignored {
+                        if attempt.settings_ignored || attempt.auth_rejected {
                             break;
                         }
                     }
-                    if attempt.result.is_some() || attempt.settings_ignored {
+                    if attempt.result.is_some() || attempt.settings_ignored || attempt.auth_rejected
+                    {
                         break;
                     }
                 }
@@ -945,6 +959,9 @@ fn failure_of(attempt: &Attempt) -> String {
     }
     if attempt.sandbox_unavailable() {
         return sandbox::UNAVAILABLE_MESSAGE.to_owned();
+    }
+    if attempt.auth_rejected {
+        return SIGN_IN_REJECTED.to_owned();
     }
     match &attempt.result {
         Some((_, text)) if !text.trim().is_empty() => text.clone(),
@@ -1285,7 +1302,7 @@ mod tests {
     fn recording(world: &World, rest: &str) -> String {
         let records = world.records().display();
         format!(
-            "n=$(ls \"{records}\" | grep -c '^args' || true)\nfor a in \"$@\"; do echo \"$a\"; done > \"{records}/args.$n\"\nprev=\"\"; for a in \"$@\"; do if [ \"$prev\" = \"--settings\" ]; then cp \"$a\" \"{records}/settings.$n\"; stat -f %Lp \"$a\" > \"{records}/settings-mode.$n\"; fi; if [ \"$prev\" = \"--append-system-prompt-file\" ]; then cp \"$a\" \"{records}/prompt.$n\"; echo \"$a\" > \"{records}/promptpath.$n\"; fi; prev=\"$a\"; done\nhelper=$(sed -n 's/.*\"apiKeyHelper\":\"\\([^\"]*\\)\".*/\\1/p' \"{records}/settings.$n\" 2>/dev/null | sed \"s/^'//; s/'$//\")\nif [ -n \"$helper\" ]; then HELPER_KEY=$(\"$helper\"); printf '%s' \"$HELPER_KEY\" > \"{records}/helperkey.$n\"; echo \"$helper\" > \"{records}/helperpath.$n\"; stat -f %Lp \"$helper\" > \"{records}/helpermode.$n\"; keyfile=$(sed -n \"s/.*cat '\\(.*\\)'$/\\1/p\" \"$helper\"); echo \"$keyfile\" > \"{records}/keypath.$n\"; stat -f %Lp \"$keyfile\" > \"{records}/keymode.$n\"; fi\ncat > \"{records}/stdin.$n\"\nprintf '%s' \"$ANTHROPIC_API_KEY\" > \"{records}/key.$n\"\nprintf '%s' \"$ANTHROPIC_AUTH_TOKEN\" > \"{records}/token.$n\"\nprintf '%s' \"$ANTHROPIC_BASE_URL\" > \"{records}/base.$n\"\nprintf '%s' \"$LC_KEPT\" > \"{records}/kept.$n\"\n{rest}"
+            "n=$(ls \"{records}\" | grep -c '^args' || true)\nfor a in \"$@\"; do echo \"$a\"; done > \"{records}/args.$n\"\nprev=\"\"; for a in \"$@\"; do if [ \"$prev\" = \"--settings\" ]; then cp \"$a\" \"{records}/settings.$n\"; stat -f %Lp \"$a\" > \"{records}/settings-mode.$n\"; fi; if [ \"$prev\" = \"--append-system-prompt-file\" ]; then cp \"$a\" \"{records}/prompt.$n\"; echo \"$a\" > \"{records}/promptpath.$n\"; fi; prev=\"$a\"; done\nhelper=$(sed -n 's/.*\"apiKeyHelper\":\"\\([^\"]*\\)\".*/\\1/p' \"{records}/settings.$n\" 2>/dev/null | sed \"s/^'//; s/'$//\")\nif [ -n \"$helper\" ]; then keyfile=$(sed -n \"s/^\\/bin\\/cat '\\(.*\\)' && .*$/\\1/p\" \"$helper\"); echo \"$keyfile\" > \"{records}/keypath.$n\"; stat -f %Lp \"$keyfile\" > \"{records}/keymode.$n\"; stat -f %Lp \"$helper\" > \"{records}/helpermode.$n\"; echo \"$helper\" > \"{records}/helperpath.$n\"; HELPER_KEY=$(\"$helper\"); printf '%s' \"$HELPER_KEY\" > \"{records}/helperkey.$n\"; [ -e \"$keyfile\" ] && echo kept > \"{records}/keykept.$n\"; \"$helper\" > \"{records}/helperagain.$n\" 2>/dev/null; echo $? > \"{records}/helperagain-status.$n\"; fi\ncat > \"{records}/stdin.$n\"\nprintf '%s' \"$ANTHROPIC_API_KEY\" > \"{records}/key.$n\"\nprintf '%s' \"$ANTHROPIC_AUTH_TOKEN\" > \"{records}/token.$n\"\nprintf '%s' \"$ANTHROPIC_BASE_URL\" > \"{records}/base.$n\"\nprintf '%s' \"$LC_KEPT\" > \"{records}/kept.$n\"\n{rest}"
         )
     }
 
@@ -1513,6 +1530,13 @@ mod tests {
             assert_eq!(
                 line,
                 scrubbed.then_some("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1")
+            );
+            let ttl = text
+                .lines()
+                .find(|line| line.starts_with("CLAUDE_CODE_API_KEY_HELPER_TTL_MS="));
+            assert_eq!(
+                ttl,
+                scrubbed.then_some("CLAUDE_CODE_API_KEY_HELPER_TTL_MS=2147483647")
             );
             let settings: serde_json::Value =
                 serde_json::from_str(&read(&world, "settings.0")).unwrap();
@@ -3176,6 +3200,9 @@ mod tests {
         assert!(helper_name.starts_with("key-helper-") && helper_name.ends_with(".sh"));
         assert!(key_name.starts_with("key-") && !key_name.starts_with("key-helper-"));
         assert_eq!(read(&world, "keymode.0").trim(), "600");
+        assert!(!has_record(&world, "keykept.0"));
+        assert_eq!(read(&world, "helperagain.0"), "");
+        assert_ne!(read(&world, "helperagain-status.0").trim(), "0");
         assert_eq!(read(&world, "helpermode.0").trim(), "700");
         assert_eq!(read(&world, "helperkey.0"), "sk-ant-saved-0000");
         assert!(!read(&world, "settings.0").contains("sk-ant-saved-0000"));
@@ -3187,6 +3214,129 @@ mod tests {
         world.send("two", ApiKey::Subscription).await;
         let later: serde_json::Value = serde_json::from_str(&read(&world, "settings.1")).unwrap();
         assert!(later.get("apiKeyHelper").is_none());
+    }
+
+    #[tokio::test]
+    async fn the_key_files_exist_while_the_cli_runs_and_are_removed_when_it_never_reads_them() {
+        let world = World::new();
+        let fixture = world.fixture("basic.jsonl", BASIC);
+        let tmp = world.data.path().join("tmp");
+        world.install(&format!(
+            "ls \"{}\" > \"{}/listing\"\ncat \"{}\"",
+            tmp.display(),
+            world.records().display(),
+            fixture.display()
+        ));
+        world
+            .send(
+                "one",
+                ApiKey::Present(SecretString::new("sk-ant-saved-0000")),
+            )
+            .await;
+        let listing = read(&world, "listing");
+        assert!(listing.lines().any(|name| name.starts_with("key-helper-")));
+        assert!(listing
+            .lines()
+            .any(|name| name.starts_with("key-") && !name.starts_with("key-helper-")));
+        assert_eq!(fs::read_dir(&tmp).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_data_temp_folder_is_excluded_from_backups_when_the_key_files_are_made() {
+        let world = World::new();
+        let fixture = world.fixture("basic.jsonl", BASIC);
+        world.install(&format!("cat \"{}\"", fixture.display()));
+        world
+            .send(
+                "one",
+                ApiKey::Present(SecretString::new("sk-ant-saved-0000")),
+            )
+            .await;
+        assert_eq!(
+            sandbox::backup_exclusion(&world.data.path().join("tmp")).as_deref(),
+            Some("com.apple.backupd")
+        );
+    }
+
+    fn retry_line(fields: &str) -> String {
+        format!("{{\"type\":\"system\",\"subtype\":\"api_retry\",\"attempt\":1,\"max_retries\":10,{fields}}}")
+    }
+
+    #[tokio::test]
+    async fn a_rejected_sign_in_ends_the_turn_at_once_as_a_sign_in_failure_that_holds_the_agent() {
+        let cases = [
+            (
+                "\"error_status\":401,\"error\":\"authentication_failed\"",
+                true,
+            ),
+            ("\"error_status\":403,\"error\":\"unknown\"", true),
+            ("\"error\":\"authentication_failed\"", false),
+        ];
+        for (fields, api_key) in cases {
+            let world = World::new();
+            let marker = world.records().join("kept-running");
+            world.install(&recording(
+                &world,
+                &format!(
+                    "{{ echo '{}'; echo '{}'; echo '{}'; }}\nsleep 2\ntouch '{}'",
+                    init_line("[\"Read\",\"Edit\",\"Write\"]"),
+                    retry_line(fields),
+                    "{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"content\":[{\"type\":\"text\",\"text\":\"late reply\"}]}}",
+                    marker.display()
+                ),
+            ));
+            let key = if api_key {
+                ApiKey::Present(SecretString::new("sk-ant-saved-0000"))
+            } else {
+                ApiKey::Subscription
+            };
+            let launch = world.launch("hi");
+            let end = run(&world.db, &world.sink, &world.registry, launch, key).await;
+            assert_eq!(end, RunEnd::AgentFailed, "{fields}");
+            assert!(only_turn(&world).items.is_empty(), "{fields}");
+            let guidance = if api_key {
+                SIGN_IN_API_KEY
+            } else {
+                SIGN_IN_SUBSCRIPTION
+            };
+            assert_eq!(
+                only_turn(&world).error.as_deref(),
+                Some(format!("Claude Code could not sign in. {guidance}").as_str()),
+                "{fields}"
+            );
+            tokio::time::sleep(Duration::from_millis(2300)).await;
+            assert!(!marker.exists(), "{fields}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retry_for_another_reason_does_not_stop_the_turn() {
+        let world = World::new();
+        let end = run_script(
+            &world,
+            &format!(
+                "echo '{}'\necho '{}'\necho '{RESULT_LINE}'",
+                init_line("[\"Read\",\"Edit\",\"Write\"]"),
+                retry_line("\"error_status\":529,\"error\":\"overloaded\"")
+            ),
+        )
+        .await;
+        assert_eq!(end, RunEnd::Finished);
+        assert_eq!(only_turn(&world).status, "completed");
+    }
+
+    #[tokio::test]
+    async fn a_helper_script_failure_result_is_a_sign_in_failure() {
+        let world = World::new();
+        let end = run_script(
+            &world,
+            &format!(
+                "echo '{}'\necho '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,\"result\":\"Your apiKeyHelper script is failing · re-authenticate\"}}'\nexit 1",
+                init_line("[\"Read\",\"Edit\",\"Write\"]")
+            ),
+        )
+        .await;
+        assert_eq!(end, RunEnd::AgentFailed);
     }
 
     #[tokio::test]
