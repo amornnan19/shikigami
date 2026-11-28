@@ -1,4 +1,12 @@
-import { chmodSync, copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  copyFileSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -19,6 +27,16 @@ export function fakeClaudeSessionId(): string {
   return JSON.parse(init).session_id;
 }
 
+export function scriptFakeReply(call: number, text: string) {
+  const reply = JSON.stringify(text);
+  const script = readFileSync(join(fakeProviderDir, fixtureNames[0] ?? ""), "utf8")
+    .replaceAll('"text":"po"', `"text":${reply}`)
+    .replaceAll('"text":"ng"', '"text":""')
+    .replaceAll('"text":"pong"', `"text":${reply}`)
+    .replaceAll('"result":"pong"', `"result":${reply}`);
+  writeFileSync(join(fakeProviderDir, `reply.${call}.jsonl`), script);
+}
+
 export function setFakeClaudeVersion(version: string) {
   writeFileSync(fakeClaudeVersionFile, `${version}\n`);
 }
@@ -31,6 +49,9 @@ export function prepareFakeProviders() {
   }
   for (const name of fixtureNames) {
     copyFileSync(join(fixtureDir, name), join(fakeProviderDir, name));
+  }
+  for (const name of readdirSync(fakeProviderDir)) {
+    if (name.startsWith("reply.")) rmSync(join(fakeProviderDir, name));
   }
   const fakeClaude = join(fakeProviderDir, "claude");
   writeFileSync(
@@ -65,6 +86,14 @@ case "$1" in
     pwd -P >> "$dir/cwd.log"
     printf '%s\\n----\\n' "$message" >> "$dir/stdin.log"
     if [ -n "$prompt" ]; then printf '%s\\n----\\n' "$prompt" >> "$dir/prompt.log"; fi
+    call=$(wc -l < "$dir/invocations.log" | tr -d ' ')
+    if [ -f "$dir/reply.$call.jsonl" ]; then
+      while IFS= read -r line; do
+        printf '%s\\n' "$line"
+        sleep 0.03
+      done < "$dir/reply.$call.jsonl"
+      exit 0
+    fi
     case "$message" in
       *STALL*)
         head -n 4 "$dir/claude-stream-basic.jsonl"

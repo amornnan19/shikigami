@@ -503,19 +503,23 @@ impl Runner<'_> {
         let (turn_id, agent_id) = (self.turn_id.clone(), self.agent_id.clone());
         let group_id = self.group_id.clone();
         let restore_seen = self.input_unread.then_some(self.previous_seen);
+        let mut notices = Vec::new();
         self.save(|connection| match &group_id {
-            Some(group_id) => group::finish_turn(
-                connection,
-                &group::Finish {
-                    turn_id: &turn_id,
-                    agent_id: &agent_id,
-                    group_id,
-                    status,
-                    error: error.as_deref(),
-                    restore_seen,
-                    now,
-                },
-            ),
+            Some(group_id) => {
+                notices = group::finish_turn(
+                    connection,
+                    &group::Finish {
+                        turn_id: &turn_id,
+                        agent_id: &agent_id,
+                        group_id,
+                        status,
+                        error: error.as_deref(),
+                        restore_seen,
+                        now,
+                    },
+                )?;
+                Ok(())
+            }
             None => store::finish_turn(
                 connection,
                 &turn_id,
@@ -525,6 +529,12 @@ impl Runner<'_> {
                 now,
             ),
         });
+        for notice in notices {
+            self.emit(TurnEvent::Notice {
+                item_id: notice.id,
+                text: notice.text,
+            });
+        }
         self.emit(TurnEvent::Ended {
             status: status.to_owned(),
             error,
@@ -586,18 +596,11 @@ impl Runner<'_> {
             }
             None => false,
         };
-        let group_flags = instructions
-            .as_ref()
-            .map(|file| claude_code::GroupFlags {
-                instructions_file: file.path(),
-                snapshot_off,
-            })
-            .or_else(|| {
-                launch.group.as_ref().map(|_| claude_code::GroupFlags {
-                    instructions_file: None,
-                    snapshot_off,
-                })
-            });
+        let group_flags = launch.group.as_ref().map(|group| claude_code::GroupFlags {
+            instructions_file: instructions.as_ref().and_then(InstructionsFile::path),
+            snapshot_off,
+            access: group.access,
+        });
         let Some(mut command) = self.command(launch, session, key, group_flags.as_ref()) else {
             attempt.failure = Some("Could not start Claude Code.".to_owned());
             return attempt;

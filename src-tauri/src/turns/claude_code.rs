@@ -3,6 +3,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
+use super::group::AccessLevel;
 use super::redact::Redactor;
 
 pub const DETAIL_LIMIT: usize = 4096;
@@ -27,6 +28,7 @@ const ISOLATION_FLAGS: [&str; 6] = [
 pub struct GroupFlags<'a> {
     pub instructions_file: Option<&'a Path>,
     pub snapshot_off: bool,
+    pub access: AccessLevel,
 }
 
 pub fn arguments(model: &str, session: &Session, group: Option<&GroupFlags>) -> Vec<String> {
@@ -59,6 +61,9 @@ pub fn arguments(model: &str, session: &Session, group: Option<&GroupFlags>) -> 
     if let Some(group) = group {
         if let Some(at) = args.iter().position(|arg| arg == "--setting-sources") {
             args[at + 1] = String::new();
+        }
+        if let Some(at) = args.iter().position(|arg| arg == "--permission-mode") {
+            args[at + 1] = group.access.permission_mode().to_owned();
         }
         if let Some(file) = group.instructions_file {
             args.push("--append-system-prompt-file".to_owned());
@@ -464,6 +469,7 @@ mod tests {
                     Some(GroupFlags {
                         instructions_file: Some(file),
                         snapshot_off: true,
+                        access: AccessLevel::STANDARD,
                     }),
                 ] {
                     let args = arguments(model, &session, group.as_ref());
@@ -482,6 +488,7 @@ mod tests {
             Some(&GroupFlags {
                 instructions_file: Some(file),
                 snapshot_off: true,
+                access: AccessLevel::STANDARD,
             }),
         );
         assert_eq!(args[5], "--setting-sources");
@@ -505,6 +512,7 @@ mod tests {
             Some(&GroupFlags {
                 instructions_file: None,
                 snapshot_off: false,
+                access: AccessLevel::STANDARD,
             }),
         );
         assert_eq!(&bare[12..], ["--model", "haiku", "--resume", "abc"]);

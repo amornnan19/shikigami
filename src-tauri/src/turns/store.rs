@@ -59,6 +59,8 @@ pub struct TurnView {
     pub error: Option<String>,
     pub started_at: i64,
     pub ended_at: Option<i64>,
+    pub kind: String,
+    pub from_agent_id: Option<String>,
     pub user_message: String,
     pub items: Vec<ItemView>,
 }
@@ -490,6 +492,8 @@ struct TurnRow {
     error: Option<String>,
     started_at: i64,
     ended_at: Option<i64>,
+    kind: String,
+    from_agent_id: Option<String>,
 }
 
 fn load_items(connection: &Connection, turn_id: &str) -> rusqlite::Result<(String, Vec<ItemView>)> {
@@ -550,7 +554,7 @@ fn page(
     before_turn_id: Option<&str>,
 ) -> rusqlite::Result<ConversationPage> {
     let mut statement = connection.prepare(&format!(
-        "SELECT id, agent_id, status, error, started_at, ended_at FROM turns
+        "SELECT id, agent_id, status, error, started_at, ended_at, kind, from_agent_id FROM turns
          WHERE {filter}
            AND (?2 IS NULL OR rowid < (SELECT rowid FROM turns WHERE id = ?2))
          ORDER BY rowid DESC LIMIT ?3"
@@ -566,6 +570,8 @@ fn page(
                     error: row.get(3)?,
                     started_at: row.get(4)?,
                     ended_at: row.get(5)?,
+                    kind: row.get(6)?,
+                    from_agent_id: row.get(7)?,
                 })
             },
         )?
@@ -584,6 +590,8 @@ fn page(
                 error: row.error,
                 started_at: row.started_at,
                 ended_at: row.ended_at,
+                kind: row.kind,
+                from_agent_id: row.from_agent_id,
                 user_message,
                 items,
             })
