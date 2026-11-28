@@ -118,6 +118,7 @@ pub enum TurnEvent {
         step_id: String,
         status: String,
         detail: Option<String>,
+        result: Option<String>,
     },
     Notice {
         item_id: String,

@@ -50,7 +50,7 @@ export function applyEvent(data: Conversation, event: TurnEvent): Conversation {
         ...turn,
         items: turn.items.map((item) =>
           item.type === "step" && item.id === event.stepId
-            ? { ...item, status: event.status, detail: event.detail }
+            ? { ...item, status: event.status, detail: event.detail, result: event.result }
             : item,
         ),
       }));

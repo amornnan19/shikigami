@@ -47,7 +47,13 @@ describe("applyEvent", () => {
       status: "running",
     };
     const started = apply(base, { kind: "step-started", step });
-    const ended = apply(started, { kind: "step-ended", stepId: "s", status: "done", detail: "x" });
+    const ended = apply(started, {
+      kind: "step-ended",
+      stepId: "s",
+      status: "done",
+      detail: "x",
+      result: null,
+    });
     expect(ended.turns[0]?.items[0]).toMatchObject({ status: "done", detail: "x" });
     const open = apply(started, { kind: "ended", status: "failed", error: "boom" });
     expect(open.turns[0]).toMatchObject({ status: "failed", error: "boom" });

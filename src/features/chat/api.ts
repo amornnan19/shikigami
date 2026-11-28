@@ -15,6 +15,8 @@ export interface Step {
   title: string;
   detail: string | null;
   status: StepStatus;
+  task: string | null;
+  result: string | null;
 }
 
 export interface TextItem {
@@ -54,7 +56,13 @@ export type TurnEvent = { agentId: string; groupId: string | null; turnId: strin
   | { kind: "text-delta"; itemId: string; text: string }
   | { kind: "text-set"; itemId: string; text: string }
   | { kind: "step-started"; step: Omit<Step, "type"> }
-  | { kind: "step-ended"; stepId: string; status: StepStatus; detail: string | null }
+  | {
+      kind: "step-ended";
+      stepId: string;
+      status: StepStatus;
+      detail: string | null;
+      result: string | null;
+    }
   | { kind: "notice"; itemId: string; text: string }
   | { kind: "ended"; status: TurnStatus; error: string | null }
 );

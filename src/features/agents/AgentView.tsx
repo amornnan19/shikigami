@@ -35,18 +35,18 @@ export function AgentView({
 
   return (
     <section aria-label="Agent" className="flex h-screen min-w-0 flex-1 flex-col">
-      <header
-        data-figure-scope=""
-        className="flex items-center gap-3 border-b border-border px-6 py-4"
-      >
-        <span data-figure-anchor="" className="shrink-0">
-          <AgentAvatar name={agent.name} color={agent.color} className="size-9" />
+      <header className="flex items-center gap-3 border-b border-border px-6 py-4">
+        <span data-figure-anchor="" className="relative shrink-0">
+          <FigureTray
+            steps={(last?.items ?? []).filter((item): item is Step => item.type === "step")}
+            color={agent.color}
+            anchor={36}
+          />
+          <span className="relative z-10 block">
+            <AgentAvatar name={agent.name} color={agent.color} className="size-9" />
+          </span>
         </span>
         <h2 className="truncate text-lg font-semibold">{agent.name}</h2>
-        <FigureTray
-          steps={(last?.items ?? []).filter((item): item is Step => item.type === "step")}
-          color={agent.color}
-        />
         <span className="text-sm text-muted-foreground">{agent.model}</span>
         <span className="rounded-md bg-muted px-2 py-0.5 text-xs text-muted-foreground">
           {AUTH_MODE_LABELS[agent.effectiveAuthMode]}
@@ -74,6 +74,7 @@ export function AgentView({
         loadingOlder={loadingOlder}
         loaded={query.isSuccess}
         onLoadOlder={loadOlder}
+        color={agent.color}
       />
       <QueueList scope={scope} messages={queue.data ?? []} />
       {waiting > 0 && !running && blockedReason === null && (

@@ -1,14 +1,18 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Step, Turn } from "@/features/chat/api";
 import {
   advanceFigures,
   buildTree,
   exitMs,
+  FigureTimeline,
   figuresOut,
   figuresPerAgent,
   groupStatusLabel,
+  inBackground,
+  stepsSummary,
   subagentLabel,
   type TrayFigure,
+  withEffectiveStatus,
 } from "./subagents";
 
 function step(id: string, extra: Partial<Step> = {}): Step {
@@ -20,6 +24,8 @@ function step(id: string, extra: Partial<Step> = {}): Step {
     title: id,
     detail: null,
     status: "running",
+    task: null,
+    result: null,
     ...extra,
   };
 }
@@ -151,7 +157,7 @@ describe("figures", () => {
 
   it("uses the animation length of the phase to leave", () => {
     expect(exitMs("folding")).toBe(350);
-    expect(exitMs("dissolving")).toBe(500);
+    expect(exitMs("dissolving")).toBe(650);
   });
 });
 
@@ -183,5 +189,108 @@ describe("group status and the room count", () => {
         turn("t3", "c", "completed", [agentStep("w", "running")]),
       ]),
     ).toEqual({ a: 2 });
+  });
+});
+
+describe("effective status", () => {
+  it("keeps a finished subagent running while any step below it runs", () => {
+    const steps = [
+      agentStep("outer", "done"),
+      agentStep("inner", "done", { parentStepId: "outer" }),
+      step("leaf", { parentStepId: "inner" }),
+      agentStep("other", "done"),
+    ];
+    expect(withEffectiveStatus(steps).map((candidate) => candidate.status)).toEqual([
+      "running",
+      "running",
+      "running",
+      "done",
+    ]);
+    expect(figuresOut(steps)).toBe(2);
+  });
+
+  it("does not turn a plain tool step into a running one", () => {
+    const steps = [step("t", { status: "done" }), step("c", { parentStepId: "t" })];
+    expect(withEffectiveStatus(steps)[0]?.status).toBe("done");
+  });
+
+  it("calls a running subagent that already has its launch result in the background", () => {
+    expect(inBackground(agentStep("a", "running", { result: "launched" }))).toBe(true);
+    expect(inBackground(agentStep("a", "running"))).toBe(false);
+    expect(inBackground(agentStep("a", "done", { result: "x" }))).toBe(false);
+    expect(groupStatusLabel("running", true)).toBe("In background");
+  });
+});
+
+describe("stepsSummary", () => {
+  it("counts subagents apart from the other steps", () => {
+    expect(
+      stepsSummary([agentStep("a", "done"), agentStep("b", "done"), step("c"), step("d")]),
+    ).toBe("2 subagents · 2 steps");
+    expect(stepsSummary([agentStep("a", "done")])).toBe("1 subagent");
+    expect(stepsSummary([step("a")])).toBe("1 step");
+    expect(stepsSummary([step("a"), step("b")])).toBe("2 steps");
+  });
+});
+
+describe("FigureTimeline", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("folds a finished figure back before removing it", () => {
+    const seen: TrayFigure[][] = [];
+    const timeline = new FigureTimeline((figures) => seen.push(figures));
+    timeline.update([agentStep("a", "running")]);
+    expect(seen.at(-1)?.map((figure) => figure.phase)).toEqual(["working"]);
+    timeline.update([agentStep("a", "done")]);
+    expect(seen.at(-1)?.map((figure) => figure.phase)).toEqual(["folding"]);
+    vi.advanceTimersByTime(349);
+    expect(seen.at(-1)?.map((figure) => figure.phase)).toEqual(["folding"]);
+    vi.advanceTimersByTime(2);
+    expect(seen.at(-1)).toEqual([]);
+    timeline.dispose();
+  });
+
+  it("holds a failed figure for the red tint and the dissolve", () => {
+    const seen: TrayFigure[][] = [];
+    const timeline = new FigureTimeline((figures) => seen.push(figures));
+    timeline.update([agentStep("a", "running")]);
+    timeline.update([agentStep("a", "failed")]);
+    expect(seen.at(-1)?.map((figure) => figure.phase)).toEqual(["dissolving"]);
+    vi.advanceTimersByTime(649);
+    expect(seen.at(-1)).toHaveLength(1);
+    vi.advanceTimersByTime(2);
+    expect(seen.at(-1)).toEqual([]);
+    timeline.dispose();
+  });
+
+  it("does not restart the wait of a figure that is already leaving", () => {
+    const seen: TrayFigure[][] = [];
+    const timeline = new FigureTimeline((figures) => seen.push(figures));
+    timeline.update([agentStep("a", "running"), agentStep("b", "running")]);
+    timeline.update([agentStep("a", "done"), agentStep("b", "running")]);
+    vi.advanceTimersByTime(300);
+    timeline.update([agentStep("a", "done"), agentStep("b", "running")]);
+    vi.advanceTimersByTime(60);
+    expect(seen.at(-1)?.map((figure) => figure.id)).toEqual(["b"]);
+    timeline.dispose();
+  });
+
+  it("clears every timer on dispose and reports nothing afterwards", () => {
+    const onChange = vi.fn();
+    const timeline = new FigureTimeline(onChange);
+    timeline.update([agentStep("a", "running")]);
+    timeline.update([agentStep("a", "done")]);
+    expect(vi.getTimerCount()).toBe(1);
+    const calls = onChange.mock.calls.length;
+    timeline.dispose();
+    expect(vi.getTimerCount()).toBe(0);
+    vi.advanceTimersByTime(1000);
+    timeline.update([agentStep("b", "running")]);
+    expect(onChange.mock.calls.length).toBe(calls);
   });
 });

@@ -20,7 +20,8 @@ export function subagentStream(holdSeconds: number): (object | string)[] {
     toolUse("m1", "agent-a", "Agent", {
       subagent_type: "Explore",
       description: "Scan the notes",
-      prompt: "Read notes.txt and summarise it.",
+      prompt:
+        "Read notes.txt and summarise it. Keep the summary short, name every heading you find, list any open questions, and say which section looks the least finished so the next person knows where to start. Do not edit any file. Check the notes for dates and owners as well, and compare the wording of the opening paragraph with the closing one, because the two were written by different people and may disagree. Quote anything that looks contradictory, and finish with a one line verdict on whether the notes are ready to share.",
     }),
     toolUse("m2", "agent-b", "Agent", {
       subagent_type: "Plan",

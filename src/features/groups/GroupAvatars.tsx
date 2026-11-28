@@ -1,4 +1,6 @@
 import { AgentAvatar } from "@/features/agents/AgentAvatar";
+import { tintClass } from "@/features/agents/colors";
+import { PaperFigure } from "@/features/shikigami/PaperFigure";
 import { cn } from "@/lib/utils";
 import type { GroupMember } from "./api";
 
@@ -34,8 +36,14 @@ export function GroupAvatars({
                 aria-label={label}
                 title={label}
                 data-figure-count={member.agentId}
-                className="absolute -right-1 -bottom-1 flex min-w-4 items-center justify-center rounded-full bg-foreground px-1 text-[10px] leading-4 font-medium text-background ring-2 ring-background"
+                className={cn(
+                  "absolute -top-2 -right-1 flex items-center gap-px rounded-full bg-background px-1 text-[10px] leading-4 font-semibold ring-1 ring-border",
+                  tintClass(member.color),
+                )}
               >
+                <span aria-hidden="true" className="block h-3 w-2">
+                  <PaperFigure tintClass={tintClass(member.color)} />
+                </span>
                 {out}
               </span>
             )}
