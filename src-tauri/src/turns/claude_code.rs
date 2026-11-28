@@ -9,6 +9,10 @@ use super::redact::Redactor;
 pub const DETAIL_LIMIT: usize = 4096;
 const TITLE_LIMIT: usize = 120;
 const TITLE_FIELDS: [&str; 4] = ["file_path", "pattern", "command", "url"];
+const SUBAGENT_TOOLS: [&str; 2] = ["Agent", "Task"];
+const SUBAGENT_DEFAULT_TYPE: &str = "general-purpose";
+const SUBAGENT_TYPE_LIMIT: usize = 60;
+const SUBAGENT_LABEL_LIMIT: usize = 80;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Session {
@@ -80,6 +84,7 @@ pub fn arguments(model: &str, session: &Session, group: Option<&GroupFlags>) -> 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepStart {
     pub id: String,
+    pub parent_step_id: Option<String>,
     pub kind: String,
     pub title: String,
     pub input: String,
@@ -144,6 +149,7 @@ pub struct StreamParser {
     streamed: HashMap<(String, u64), String>,
     messages: HashMap<String, MessageTexts>,
     steps: HashMap<String, String>,
+    step_ids: HashMap<String, String>,
 }
 
 fn new_id() -> String {
@@ -177,6 +183,46 @@ fn title_of(kind: &str, input: &Value) -> String {
     }
 }
 
+fn first_chars(text: &str, limit: usize) -> String {
+    text.chars().take(limit).collect()
+}
+
+fn subagent_label(input: &Value) -> (String, String) {
+    let field = |name: &str| {
+        input
+            .get(name)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    let kind = first_chars(
+        field("subagent_type").unwrap_or(SUBAGENT_DEFAULT_TYPE),
+        SUBAGENT_TYPE_LIMIT,
+    );
+    let task = field("description")
+        .or_else(|| field("prompt"))
+        .map(|text| first_chars(text, SUBAGENT_LABEL_LIMIT))
+        .unwrap_or_default();
+    (kind, task)
+}
+
+fn subagent_input(kind: &str, task: &str, input: &Value) -> String {
+    let quoted = |text: &str| Value::String(text.to_owned()).to_string();
+    let prompt = input
+        .get("prompt")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    truncate(
+        &format!(
+            "{{\"subagent_type\":{},\"description\":{},\"prompt\":{}}}",
+            quoted(kind),
+            quoted(task),
+            quoted(prompt)
+        ),
+        DETAIL_LIMIT,
+    )
+}
+
 fn result_text(content: &Value) -> String {
     match content {
         Value::String(text) => text.clone(),
@@ -201,16 +247,21 @@ impl StreamParser {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             return Vec::new();
         };
-        if !value.get("parent_tool_use_id").is_none_or(Value::is_null) {
-            return Vec::new();
-        }
-        match value.get("type").and_then(Value::as_str) {
-            Some("system") => Self::system(&value),
-            Some("stream_event") => self.stream_event(&value),
-            Some("assistant") => self.assistant(&value),
-            Some("user") => self.user(&value),
-            Some("result") => Self::result(&value),
-            _ => Vec::new(),
+        match value.get("parent_tool_use_id") {
+            None | Some(Value::Null) => match value.get("type").and_then(Value::as_str) {
+                Some("system") => Self::system(&value),
+                Some("stream_event") => self.stream_event(&value),
+                Some("assistant") => self.assistant(&value, None),
+                Some("user") => self.user(&value),
+                Some("result") => Self::result(&value),
+                _ => Vec::new(),
+            },
+            Some(Value::String(parent)) => match value.get("type").and_then(Value::as_str) {
+                Some("assistant") => self.assistant(&value, Some(parent)),
+                Some("user") => self.user(&value),
+                _ => Vec::new(),
+            },
+            Some(_) => Vec::new(),
         }
     }
 
@@ -287,7 +338,14 @@ impl StreamParser {
         id
     }
 
-    fn assistant(&mut self, value: &Value) -> Vec<Parsed> {
+    fn assistant(&mut self, value: &Value, parent: Option<&str>) -> Vec<Parsed> {
+        let parent_step_id = match parent {
+            Some(tool_use_id) => match self.step_ids.get(tool_use_id) {
+                Some(id) => Some(id.clone()),
+                None => return Vec::new(),
+            },
+            None => None,
+        };
         let Some(message) = value.get("message") else {
             return Vec::new();
         };
@@ -302,6 +360,8 @@ impl StreamParser {
         let mut parsed = Vec::new();
         for block in blocks {
             match block.get("type").and_then(Value::as_str) {
+                Some("tool_use") => parsed.extend(self.tool_use(block, parent_step_id.clone())),
+                _ if parent_step_id.is_some() => {}
                 Some("text") => {
                     let text = block
                         .get("text")
@@ -309,7 +369,6 @@ impl StreamParser {
                         .unwrap_or_default();
                     parsed.extend(self.final_text(&message_id, text));
                 }
-                Some("tool_use") => parsed.extend(self.tool_use(block)),
                 _ => {}
             }
         }
@@ -335,7 +394,7 @@ impl StreamParser {
         })
     }
 
-    fn tool_use(&mut self, block: &Value) -> Option<Parsed> {
+    fn tool_use(&mut self, block: &Value, parent_step_id: Option<String>) -> Option<Parsed> {
         let tool_use_id = block.get("id").and_then(Value::as_str)?;
         if self.steps.contains_key(tool_use_id) {
             return None;
@@ -346,11 +405,24 @@ impl StreamParser {
             .redact_value(block.get("input").unwrap_or(&Value::Null));
         let id = new_id();
         self.steps.insert(tool_use_id.to_owned(), id.clone());
+        self.step_ids.insert(tool_use_id.to_owned(), id.clone());
+        let (title, input) = if SUBAGENT_TOOLS.contains(&kind) {
+            let (subagent, task) = subagent_label(&input);
+            let json = subagent_input(&subagent, &task, &input);
+            let title = if task.is_empty() { subagent } else { task };
+            (title, json)
+        } else {
+            (
+                title_of(kind, &input),
+                truncate(&input.to_string(), DETAIL_LIMIT),
+            )
+        };
         Some(Parsed::StepStarted(StepStart {
             id,
+            parent_step_id,
             kind: kind.to_owned(),
-            title: title_of(kind, &input),
-            input: truncate(&input.to_string(), DETAIL_LIMIT),
+            title,
+            input,
         }))
     }
 
@@ -440,6 +512,7 @@ pub fn assert_isolated(args: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secrets::SecretString;
 
     const BASIC: &str = include_str!("../../tests/fixtures/claude-stream-basic.jsonl");
     const DENIED: &str = include_str!("../../tests/fixtures/claude-stream-denied.jsonl");
@@ -635,6 +708,130 @@ mod tests {
         assert!(ended.iter().all(|(_, failed, _)| *failed));
         assert!(ended[0].2.contains("command not found"));
         assert!(ended[1].2.contains("denied"));
+    }
+
+    fn lines(values: &[serde_json::Value]) -> Vec<String> {
+        values.iter().map(ToString::to_string).collect()
+    }
+
+    fn parse_values(parser: &mut StreamParser, values: &[serde_json::Value]) -> Vec<Parsed> {
+        lines(values)
+            .iter()
+            .flat_map(|line| parser.line(line))
+            .collect()
+    }
+
+    fn subagent_stream() -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!({"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"toolu_agent","name":"Agent","input":{"subagent_type":"Explore","description":"Look around","prompt":"List the files"}}]}}),
+            serde_json::json!({"type":"user","parent_tool_use_id":"toolu_agent","message":{"content":[{"type":"text","text":"List the files"}]}}),
+            serde_json::json!({"type":"assistant","parent_tool_use_id":"toolu_agent","message":{"id":"m2","content":[{"type":"text","text":"on it"},{"type":"tool_use","id":"toolu_inner","name":"Bash","input":{"command":"ls"}}]}}),
+            serde_json::json!({"type":"user","parent_tool_use_id":"toolu_agent","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_inner","content":"a.txt","is_error":false}]}}),
+            serde_json::json!({"type":"stream_event","parent_tool_use_id":"toolu_agent","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"inner words"}}}),
+            serde_json::json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_agent","content":[{"type":"text","text":"found a.txt"}],"is_error":false}]}}),
+        ]
+    }
+
+    #[test]
+    fn a_subagent_step_carries_its_type_and_task_and_inner_steps_point_at_it() {
+        let mut parser = StreamParser::default();
+        let parsed = parse_values(&mut parser, &subagent_stream());
+        let started = started_steps(&parsed);
+        assert_eq!(started.len(), 2);
+        assert_eq!(started[0].kind, "Agent");
+        assert_eq!(started[0].parent_step_id, None);
+        assert_eq!(started[0].title, "Look around");
+        assert!(started[0].input.starts_with(
+            r#"{"subagent_type":"Explore","description":"Look around","prompt":"List the files"}"#
+        ));
+        assert_eq!(started[1].kind, "Bash");
+        assert_eq!(
+            started[1].parent_step_id.as_deref(),
+            Some(started[0].id.as_str())
+        );
+        let ended = ended_steps(&parsed);
+        assert_eq!(ended.len(), 2);
+        assert_eq!(ended[0].0, &started[1].id);
+        assert_eq!(ended[0].2, "a.txt");
+        assert_eq!(ended[1].0, &started[0].id);
+        assert_eq!(ended[1].2, "found a.txt");
+        assert!(parsed
+            .iter()
+            .all(|event| !matches!(event, Parsed::TextDelta { .. } | Parsed::TextSet { .. })));
+    }
+
+    #[test]
+    fn a_subagent_without_a_description_or_type_is_labelled_from_the_prompt() {
+        let long = "p".repeat(200);
+        let parsed = StreamParser::default().line(
+            &serde_json::json!({"type":"assistant","message":{"id":"m","content":[{"type":"tool_use","id":"t","name":"Task","input":{"prompt":long}}]}})
+                .to_string(),
+        );
+        let [Parsed::StepStarted(step)] = &parsed[..] else {
+            panic!("{parsed:?}");
+        };
+        assert_eq!(step.title, "p".repeat(SUBAGENT_LABEL_LIMIT));
+        assert!(step.input.starts_with(&format!(
+            r#"{{"subagent_type":"general-purpose","description":"{}","prompt":"#,
+            "p".repeat(SUBAGENT_LABEL_LIMIT)
+        )));
+    }
+
+    #[test]
+    fn a_nested_subagent_nests_under_the_subagent_that_started_it() {
+        let mut parser = StreamParser::default();
+        let parsed = parse_values(
+            &mut parser,
+            &[
+                serde_json::json!({"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"outer","name":"Agent","input":{"description":"outer"}}]}}),
+                serde_json::json!({"type":"assistant","parent_tool_use_id":"outer","message":{"id":"m2","content":[{"type":"tool_use","id":"middle","name":"Task","input":{"description":"middle"}}]}}),
+                serde_json::json!({"type":"assistant","parent_tool_use_id":"middle","message":{"id":"m3","content":[{"type":"tool_use","id":"leaf","name":"Read","input":{"file_path":"/a"}}]}}),
+            ],
+        );
+        let started = started_steps(&parsed);
+        assert_eq!(started.len(), 3);
+        assert_eq!(
+            started[1].parent_step_id.as_deref(),
+            Some(started[0].id.as_str())
+        );
+        assert_eq!(
+            started[2].parent_step_id.as_deref(),
+            Some(started[1].id.as_str())
+        );
+    }
+
+    #[test]
+    fn inner_events_of_an_unknown_subagent_are_ignored_and_a_finished_one_still_adopts_steps() {
+        let mut parser = StreamParser::default();
+        let orphan = serde_json::json!({"type":"assistant","parent_tool_use_id":"nope","message":{"id":"m","content":[{"type":"tool_use","id":"x","name":"Bash","input":{"command":"ls"}}]}});
+        assert!(parser.line(&orphan.to_string()).is_empty());
+        let mut stream = subagent_stream();
+        let late = serde_json::json!({"type":"assistant","parent_tool_use_id":"toolu_agent","message":{"id":"m9","content":[{"type":"tool_use","id":"late","name":"Bash","input":{"command":"pwd"}}]}});
+        stream.push(late);
+        let parsed = parse_values(&mut parser, &stream);
+        let started = started_steps(&parsed);
+        assert_eq!(started.len(), 3);
+        assert_eq!(
+            started[2].parent_step_id.as_deref(),
+            Some(started[0].id.as_str())
+        );
+    }
+
+    #[test]
+    fn a_key_in_a_subagent_prompt_and_in_inner_steps_is_redacted() {
+        let mut parser = StreamParser::new(Redactor::for_key(Some(&SecretString::new(
+            "sk-ant-api03-SECRETSECRETSECRET",
+        ))));
+        let parsed = parse_values(
+            &mut parser,
+            &[
+                serde_json::json!({"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"a","name":"Agent","input":{"description":"use sk-ant-api03-SECRETSECRETSECRET","prompt":"key sk-ant-api03-SECRETSECRETSECRET"}}]}}),
+                serde_json::json!({"type":"assistant","parent_tool_use_id":"a","message":{"id":"m2","content":[{"type":"tool_use","id":"b","name":"Bash","input":{"command":"echo sk-ant-api03-SECRETSECRETSECRET"}}]}}),
+                serde_json::json!({"type":"user","parent_tool_use_id":"a","message":{"content":[{"type":"tool_result","tool_use_id":"b","content":"out sk-ant-api03-SECRETSECRETSECRET","is_error":false}]}}),
+            ],
+        );
+        assert!(!format!("{parsed:?}").contains("SECRETSECRET"));
+        assert!(format!("{parsed:?}").contains("[redacted]"));
     }
 
     #[test]

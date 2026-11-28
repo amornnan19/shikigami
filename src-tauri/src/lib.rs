@@ -110,6 +110,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::app_status,
+            commands::reduce_motion_override,
             auth::get_claude_auth,
             auth::set_claude_auth_mode,
             api_key::api_key_status,

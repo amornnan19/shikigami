@@ -427,6 +427,7 @@ impl Runner<'_> {
     fn start_step(&mut self, step: StepStart) {
         let view = StepView {
             id: step.id.clone(),
+            parent_step_id: step.parent_step_id,
             kind: step.kind,
             title: step.title,
             detail: Some(step.input.clone()),
@@ -1680,6 +1681,66 @@ mod tests {
         );
         assert_eq!(text, "the key is [redacted]");
         assert_eq!(turn.error.as_deref(), Some("failed with [redacted]"));
+    }
+
+    #[tokio::test]
+    async fn subagent_steps_are_saved_and_emitted_under_the_step_that_started_them_redacted_and_bounded(
+    ) {
+        let world = World::new();
+        let big = "z".repeat(claude_code::DETAIL_LIMIT * 3);
+        let lines = stream_lines(&[
+            serde_json::json!({"type":"system","subtype":"init","session_id":"s1"}),
+            serde_json::json!({"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"agent1","name":"Agent","input":{"subagent_type":"Explore","description":"Look around","prompt":format!("find {SAVED_KEY}")}}]}}),
+            serde_json::json!({"type":"assistant","parent_tool_use_id":"agent1","message":{"id":"m2","content":[{"type":"tool_use","id":"inner1","name":"Bash","input":{"command":format!("echo {SAVED_KEY}")}},{"type":"tool_use","id":"inner2","name":"Read","input":{"file_path":"/a"}}]}}),
+            serde_json::json!({"type":"user","parent_tool_use_id":"agent1","message":{"content":[{"type":"tool_result","tool_use_id":"inner1","content":format!("out {SAVED_KEY} sk-ant-another-token-0123456789"),"is_error":false},{"type":"tool_result","tool_use_id":"inner2","content":big,"is_error":true}]}}),
+            serde_json::json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"agent1","content":"all done","is_error":false}]}}),
+            serde_json::json!({"type":"assistant","message":{"id":"m3","content":[{"type":"text","text":"finished"}]}}),
+            serde_json::json!({"type":"result","is_error":false,"result":"ok"}),
+        ]);
+        let fixture = world.fixture("subagent.jsonl", &lines);
+        world.install(&recording(
+            &world,
+            &format!("cat \"{}\"", fixture.display()),
+        ));
+        world
+            .send("hi", ApiKey::Present(SecretString::new(SAVED_KEY)))
+            .await;
+        let turn = only_turn(&world);
+        assert_eq!(turn.status, "completed");
+        let steps: Vec<&StepView> = turn
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ItemView::Step(step) => Some(step),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0].kind, "Agent");
+        assert_eq!(steps[0].parent_step_id, None);
+        assert_eq!(steps[0].status, "done");
+        assert!(steps[0].detail.as_deref().unwrap().contains("all done"));
+        assert_eq!(steps[1].kind, "Bash");
+        assert_eq!(steps[1].title, "echo [redacted]");
+        assert_eq!(
+            steps[1].parent_step_id.as_deref(),
+            Some(steps[0].id.as_str())
+        );
+        assert_eq!(steps[2].kind, "Read");
+        assert_eq!(steps[2].status, "failed");
+        assert_eq!(
+            steps[2].parent_step_id.as_deref(),
+            Some(steps[0].id.as_str())
+        );
+        assert!(steps[2].detail.as_deref().unwrap().len() < claude_code::DETAIL_LIMIT * 2 + 64);
+        let stored = serde_json::to_string(&turn).unwrap();
+        assert!(!stored.contains("SAVEDSAVED") && !stored.contains("another-token"));
+        let emitted = everything_emitted(&world);
+        assert!(!emitted.contains("SAVEDSAVED") && !emitted.contains("another-token"));
+        assert!(emitted.contains(&format!("\"parentStepId\":\"{}\"", steps[0].id)));
+        let kinds = world.sink.kinds();
+        assert_eq!(kinds.iter().filter(|k| *k == "step-started").count(), 3);
+        assert_eq!(kinds.iter().filter(|k| *k == "step-ended").count(), 3);
     }
 
     #[tokio::test]

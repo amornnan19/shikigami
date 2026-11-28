@@ -1,6 +1,7 @@
 import { Settings } from "lucide-react";
 import { useMemo, useState } from "react";
 import { Button } from "@/components/ui/button";
+import type { Step } from "@/features/chat/api";
 import { Composer } from "@/features/chat/Composer";
 import { QueueList } from "@/features/chat/QueueList";
 import { ResumeBar } from "@/features/chat/ResumeBar";
@@ -8,6 +9,7 @@ import { agentScope } from "@/features/chat/scope";
 import { Transcript } from "@/features/chat/Transcript";
 import { useConversation, useQueue } from "@/features/chat/useConversation";
 import { AUTH_MODE_LABELS } from "@/features/providers/api";
+import { FigureTray } from "@/features/shikigami/FigureTray";
 import { AgentAvatar } from "./AgentAvatar";
 import { AgentSettingsDialog } from "./AgentSettingsDialog";
 import { AttentionBanner, isBlocked } from "./AttentionBanner";
@@ -33,9 +35,18 @@ export function AgentView({
 
   return (
     <section aria-label="Agent" className="flex h-screen min-w-0 flex-1 flex-col">
-      <header className="flex items-center gap-3 border-b border-border px-6 py-4">
-        <AgentAvatar name={agent.name} color={agent.color} className="size-9" />
+      <header
+        data-figure-scope=""
+        className="flex items-center gap-3 border-b border-border px-6 py-4"
+      >
+        <span data-figure-anchor="" className="shrink-0">
+          <AgentAvatar name={agent.name} color={agent.color} className="size-9" />
+        </span>
         <h2 className="truncate text-lg font-semibold">{agent.name}</h2>
+        <FigureTray
+          steps={(last?.items ?? []).filter((item): item is Step => item.type === "step")}
+          color={agent.color}
+        />
         <span className="text-sm text-muted-foreground">{agent.model}</span>
         <span className="rounded-md bg-muted px-2 py-0.5 text-xs text-muted-foreground">
           {AUTH_MODE_LABELS[agent.effectiveAuthMode]}

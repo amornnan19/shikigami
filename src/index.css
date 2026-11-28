@@ -59,3 +59,75 @@
     @apply bg-background text-foreground;
   }
 }
+
+@keyframes paper-fold-out {
+  from {
+    opacity: 0;
+    transform: perspective(160px) translateX(var(--from-x)) scale(0.2) rotateY(90deg);
+  }
+  to {
+    opacity: 0.75;
+    transform: perspective(160px) translateX(0) scale(1) rotateY(0deg);
+  }
+}
+
+@keyframes paper-float {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  25% {
+    transform: translateY(-2px);
+  }
+  75% {
+    transform: translateY(2px);
+  }
+}
+
+@keyframes paper-fold-back {
+  from {
+    opacity: 0.75;
+    transform: perspective(160px) translateX(0) scale(1) rotateY(0deg);
+  }
+  to {
+    opacity: 0;
+    transform: perspective(160px) translateX(var(--from-x)) scale(0.2) rotateY(90deg);
+  }
+}
+
+@keyframes paper-dissolve {
+  from {
+    opacity: 0.75;
+    filter: blur(0);
+  }
+  to {
+    opacity: 0;
+    filter: blur(2px);
+  }
+}
+
+.paper-figure {
+  opacity: 0.75;
+}
+
+.paper-figure-working {
+  animation:
+    paper-fold-out 450ms ease-out,
+    paper-float 3s ease-in-out 450ms infinite;
+}
+
+.paper-figure-folding {
+  animation: paper-fold-back 350ms ease-in forwards;
+}
+
+.paper-figure-dissolving {
+  animation: paper-dissolve 500ms ease-out forwards;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .paper-figure-working,
+  .paper-figure-folding,
+  .paper-figure-dissolving {
+    animation: none;
+  }
+}
