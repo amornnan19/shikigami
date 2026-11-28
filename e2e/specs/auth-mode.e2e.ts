@@ -1,7 +1,7 @@
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { $, browser, expect } from "@wdio/globals";
-import { fakeClaudeEnv, fakeClaudeSignedOut } from "../fake-providers";
+import { fakeClaudeEnv, fakeClaudeKeyLog, fakeClaudeSignedOut } from "../fake-providers";
 import { dataRoot } from "../wdio.shared";
 
 const artifacts = join(import.meta.dirname, "..", "artifacts");
@@ -70,6 +70,19 @@ describe("sign-in choice", () => {
     await selectAgent("Pinned");
     await expect($(agentHeader)).toHaveText(expect.stringContaining("API key"));
     await browser.saveScreenshot(join(artifacts, "auth-mode-pinned-api-key.png"));
+  });
+
+  it("hands the saved key to the CLI through the helper and never through its environment", async () => {
+    await showClaudeSection();
+    await selectAgent("Pinned");
+    await $('textarea[aria-label="Message"]').setValue("key check");
+    await browser.keys("Enter");
+    await expect($('section[aria-label="Agent"]')).toHaveText(expect.stringContaining("pong"), {
+      wait: 20000,
+    });
+    const lines = readFileSync(fakeClaudeKeyLog, "utf8").trim().split("\n");
+    expect(lines.at(-1)).toBe(`env=none helper=${fakeKey}`);
+    await browser.saveScreenshot(join(artifacts, "auth-mode-key-helper.png"));
   });
 
   it("fails a turn at once with no saved key in API key mode", async () => {
