@@ -211,11 +211,50 @@ fn the_suggestion_is_the_next_free_default_path_and_creates_nothing() {
 }
 
 #[test]
-fn a_failed_create_leaves_no_default_folder() {
+fn a_default_folder_that_is_refused_is_removed_and_nothing_else_is() {
+    let fx = Fixture::new();
+    let a = fx.agent("Ada");
+    let b = fx.agent("Bo");
+    let workspace = fx.workspaces.path().join("ada");
+    fs::write(workspace.join("notes.txt"), "x").unwrap();
+    let config = GroupsConfig {
+        root: Ok(workspace.join("groups")),
+        home: None,
+    };
+    let result = create(
+        &fx.db,
+        &config,
+        fx.data.path(),
+        fx.input("Team", &[&a, &b], &a, None),
+    );
+    let message = result.expect_err("expected a refusal");
+    assert_eq!(message.code, "folder-refused");
+    assert!(message.message.contains("inside an agent's workspace"));
+    assert!(!workspace.join("groups").join("team").exists());
+    assert!(workspace.join("groups").is_dir());
+    assert!(workspace.join("notes.txt").is_file());
+    assert_eq!(fx.groups().len(), 0);
+}
+
+#[test]
+fn a_default_folder_is_removed_when_the_group_cannot_be_saved() {
     let fx = Fixture::new();
     let a = fx.agent("Ada");
     let b = fx.agent("Bo");
     let root = fx.config().root.unwrap();
+    fs::create_dir_all(root.join("other")).unwrap();
+    fx.db.with_connection(|c| {
+        c.execute_batch(
+            "CREATE TRIGGER refuse_members BEFORE INSERT ON group_members
+             BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+        )
+        .unwrap()
+    });
+    let result = fx.create(fx.input("Team", &[&a, &b], &a, None));
+    assert_eq!(code(result), "database-failed");
+    assert!(!root.join("team").exists());
+    assert!(root.join("other").is_dir());
+    assert_eq!(fx.groups().len(), 0);
     assert_eq!(
         code(fx.create(fx.input("Team", &[&a, "missing"], &a, None))),
         "member-not-found"
@@ -319,14 +358,81 @@ fn a_symlink_to_a_workspace_is_refused() {
 }
 
 #[test]
-fn a_workspace_whose_folder_is_missing_still_protects_its_path() {
+fn a_missing_workspace_behind_a_symlinked_prefix_still_protects_its_path() {
     let fx = Fixture::new();
     let a = fx.agent("Ada");
-    let gone = fx.projects.path().join("gone");
-    let b = fx.agent_at("Bo", &gone);
-    fs::create_dir(&gone).unwrap();
-    let message = refusal_message(fx.create(fx.input("Team", &[&a, &b], &a, Some(&gone))));
-    assert!(message.contains("is an agent's workspace"), "{message}");
+    let real = fx.project("real");
+    let link = fx.projects.path().join("link");
+    symlink(&real, &link).unwrap();
+    let missing = link.join("gone");
+    let b = fx.agent_at("Bo", &missing);
+    assert!(!missing.exists());
+    let message = refusal_message(fx.create(fx.input("Team", &[&a, &b], &a, Some(&real))));
+    assert!(
+        message.contains("contains an agent's workspace"),
+        "{message}"
+    );
+    assert!(folder::resolved(&missing).ends_with("real/gone"));
+}
+
+#[test]
+fn a_firmlinked_alias_of_the_home_folder_is_refused() {
+    let fx = Fixture::new();
+    let a = fx.agent("Ada");
+    let b = fx.agent("Bo");
+    let data_volume = Path::new("/System/Volumes/Data");
+    assert!(data_volume.is_dir());
+    let alias = data_volume.join(
+        fs::canonicalize(fx.home.path())
+            .unwrap()
+            .strip_prefix("/")
+            .unwrap(),
+    );
+    assert!(alias.is_dir());
+    assert_ne!(
+        fs::canonicalize(&alias).unwrap(),
+        fs::canonicalize(fx.home.path()).unwrap()
+    );
+    let message = refusal_message(fx.create(fx.input("Team", &[&a, &b], &a, Some(&alias))));
+    assert!(message.contains("home folder"), "{message}");
+}
+
+#[test]
+fn firmlinked_aliases_of_the_data_folder_and_a_workspace_are_refused_by_relation() {
+    let fx = Fixture::new();
+    let a = fx.agent("Ada");
+    let b = fx.agent("Bo");
+    let alias = |path: &Path| {
+        Path::new("/System/Volumes/Data")
+            .join(fs::canonicalize(path).unwrap().strip_prefix("/").unwrap())
+    };
+    let inner = fx.workspaces.path().join("ada").join("src");
+    fs::create_dir(&inner).unwrap();
+    let try_folder = |path: &Path| fx.create(fx.input("Team", &[&a, &b], &a, Some(path)));
+    assert!(refusal_message(try_folder(&alias(fx.data.path())))
+        .contains("It is Shikigami's data folder"));
+    assert!(refusal_message(try_folder(&alias(&inner))).contains("inside an agent's workspace"));
+    assert!(refusal_message(try_folder(&alias(fx.workspaces.path())))
+        .contains("contains an agent's workspace"));
+    assert!(
+        refusal_message(try_folder(&alias(&fx.workspaces.path().join("ada"))))
+            .contains("is an agent's workspace")
+    );
+}
+
+#[test]
+fn a_mount_point_counts_as_a_disk_root() {
+    let fx = Fixture::new();
+    let a = fx.agent("Ada");
+    let b = fx.agent("Bo");
+    let message = refusal_message(fx.create(fx.input(
+        "Team",
+        &[&a, &b],
+        &a,
+        Some(Path::new("/System/Volumes/Data")),
+    )));
+    assert!(message.contains("root of a disk"), "{message}");
+    assert!(fx.groups().is_empty());
 }
 
 #[test]

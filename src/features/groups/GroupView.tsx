@@ -18,6 +18,7 @@ export function GroupView({
   onDeleted: () => void;
 }) {
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const lead = group.members.find((member) => member.agentId === group.leadAgentId);
   return (
     <section aria-label="Group" className="flex h-screen min-w-0 flex-1 flex-col">
       <header className="flex items-center gap-3 border-b border-border px-6 py-4">
@@ -29,6 +30,9 @@ export function GroupView({
             className="truncate font-mono text-xs text-muted-foreground"
           >
             {group.folderPath}
+          </span>
+          <span id="group-header-lead" className="text-xs text-muted-foreground">
+            {lead ? `Lead: ${lead.name}` : "No lead"}
           </span>
         </div>
         <Button

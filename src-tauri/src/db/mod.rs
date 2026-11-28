@@ -107,7 +107,9 @@ mod tests {
                  INSERT INTO turns VALUES ('t', 'a', 'running', NULL, 1, NULL);
                  INSERT INTO messages VALUES ('m', 'a', 't', 'user', 'hi', 1);
                  INSERT INTO steps VALUES ('s', 't', 0, 'tool', 'x', NULL, 'running', 1);
-                 INSERT INTO queued_messages VALUES ('q', 'a', 'later', 0, 1);",
+                 INSERT INTO queued_messages VALUES ('q', 'a', 'later', 0, 1);
+                 INSERT INTO groups VALUES ('g', 'Team', '/g', 'a', 1, 1);
+                 INSERT INTO group_members VALUES ('g', 'a', 0, 1);",
             )
             .unwrap()
         })
@@ -203,9 +205,16 @@ mod tests {
         let db = Database::open(dir.path()).unwrap();
         seed_agent_tree(&db);
         db.with_connection(|c| c.execute("DELETE FROM agents WHERE id = 'a'", []).unwrap());
-        for table in ["turns", "messages", "steps", "queued_messages"] {
+        for table in [
+            "turns",
+            "messages",
+            "steps",
+            "queued_messages",
+            "group_members",
+        ] {
             assert_eq!(count(&db, table), 0, "{table}");
         }
+        assert_eq!(count(&db, "groups"), 1);
     }
 
     #[test]
@@ -349,7 +358,15 @@ mod tests {
             connection: Mutex::new(connection),
         };
         assert_eq!(schema_version(&db), 5);
-        for table in ["agents", "turns", "messages", "steps", "queued_messages"] {
+        for table in [
+            "agents",
+            "turns",
+            "messages",
+            "steps",
+            "queued_messages",
+            "groups",
+            "group_members",
+        ] {
             assert_eq!(count(&db, table), 1, "{table}");
         }
         let foreign_keys: i64 = db.with_connection(|c| {

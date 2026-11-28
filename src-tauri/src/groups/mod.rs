@@ -244,17 +244,13 @@ fn folder_base(name: &str) -> String {
     }
 }
 
-fn recorded_folders(
-    connection: &rusqlite::Connection,
-    workspaces: &[String],
-) -> Result<Vec<PathBuf>, GroupError> {
-    let groups = store::group_folders(connection, None)?;
-    Ok(workspaces
+fn recorded_folders(workspaces: &[String], groups: &[(String, String)]) -> Vec<PathBuf> {
+    workspaces
         .iter()
         .cloned()
-        .chain(groups.into_iter().map(|(_, path)| path))
+        .chain(groups.iter().map(|(_, path)| path.clone()))
         .map(PathBuf::from)
-        .collect())
+        .collect()
 }
 
 fn guard<'a>(
@@ -270,17 +266,17 @@ fn guard<'a>(
 }
 
 fn default_folder(
-    connection: &rusqlite::Connection,
     config: &GroupsConfig,
     data_dir: &Path,
     name: &str,
     workspaces: &[String],
+    groups: &[(String, String)],
 ) -> Result<PathBuf, GroupError> {
     let root = config
         .root
         .as_ref()
         .map_err(|message| GroupError::new("folder-failed", message.clone()))?;
-    let recorded = recorded_folders(connection, workspaces)?;
+    let recorded = recorded_folders(workspaces, groups);
     let created = workspace::create_folder_named(root, &folder_base(name), &recorded)
         .map_err(GroupError::folder)?;
     match folder::check(
@@ -302,7 +298,8 @@ fn suggest(db: &Database, config: &GroupsConfig, name: &str) -> Result<String, G
         .map_err(|message| GroupError::new("folder-failed", message.clone()))?;
     let recorded = db.with_connection(|connection| {
         let workspaces = store::agent_workspaces(connection)?;
-        recorded_folders(connection, &workspaces)
+        let groups = store::group_folders(connection, None)?;
+        Ok::<_, GroupError>(recorded_folders(&workspaces, &groups))
     })?;
     let base = folder_base(name);
     let mut attempt = 1u32;
@@ -329,17 +326,18 @@ fn create(
         let members = check_members(connection, input.member_ids)?;
         check_lead(&members, &input.lead_agent_id)?;
         let workspaces = store::agent_workspaces(connection)?;
+        let groups = store::group_folders(connection, None)?;
         let (folder, made_here) = match input.folder_path.as_deref() {
             Some(raw) => (
                 folder::check(raw, &guard(config, data_dir, &workspaces))?,
                 false,
             ),
             None => (
-                default_folder(connection, config, data_dir, &name, &workspaces)?,
+                default_folder(config, data_dir, &name, &workspaces, &groups)?,
                 true,
             ),
         };
-        let shared_folder_with = store::group_folders(connection, None)?
+        let shared_folder_with = groups
             .into_iter()
             .filter(|(_, path)| folder::resolved(path) == folder)
             .map(|(name, _)| name)
