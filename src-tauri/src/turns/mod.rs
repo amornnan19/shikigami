@@ -416,6 +416,7 @@ pub struct Launch {
     pub model: String,
     pub session: claude_code::Session,
     pub text: String,
+    pub instructions: String,
     pub started_at: i64,
     pub environment: Vec<(OsString, OsString)>,
     pub stall_timeout: Duration,
@@ -486,6 +487,9 @@ fn launch_of(
     if !registry.begin(agent_id, &begun.turn_id) {
         return None;
     }
+    let instructions = instructions::read(Path::new(&begun.agent.workspace_path))
+        .map(|read| read.text)
+        .unwrap_or_default();
     Some(Launch {
         agent_id: agent_id.to_owned(),
         turn_id: begun.turn_id,
@@ -495,6 +499,7 @@ fn launch_of(
         model: begun.agent.model,
         session: begun.session,
         text,
+        instructions,
         started_at,
         environment: std::env::vars_os().collect(),
         stall_timeout: stall_timeout(),
@@ -550,6 +555,7 @@ fn launch_of_group(
         model: begun.begun.agent.model,
         session: begun.begun.session,
         text,
+        instructions: String::new(),
         started_at,
         environment: std::env::vars_os().collect(),
         stall_timeout: stall_timeout(),
@@ -1588,6 +1594,24 @@ mod tests {
             .with_connection(|c| c.query_row("SELECT COUNT(*) FROM turns", [], |r| r.get(0)))
             .unwrap();
         assert_eq!(turns, 1);
+    }
+
+    #[test]
+    fn a_one_to_one_launch_carries_the_workspace_instructions_text() {
+        let fx = Fixture::new("claude-code");
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("CLAUDE.md"), "Ada rules\n").unwrap();
+        fx.db
+            .with_connection(|c| {
+                c.execute(
+                    "UPDATE agents SET workspace_path = ?1",
+                    [workspace.path().to_string_lossy()],
+                )
+            })
+            .unwrap();
+        let launch = fx.send("a", "hi").unwrap();
+        assert_eq!(launch.instructions, "Ada rules\n");
+        assert!(launch.group.is_none());
     }
 
     #[test]

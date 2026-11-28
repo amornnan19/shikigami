@@ -86,7 +86,6 @@ case "$1" in
     done
     echo "$safe" >> "$dir/invocations.log"
     case "$safe " in
-      *" --setting-sources project --strict-mcp-config --permission-mode manual --permission-prompts none "*) ;;
       *" --setting-sources  --strict-mcp-config --permission-mode manual --permission-prompts none "*) ;;
       *) echo "Claude Code was not started isolated." >&2; exit 2 ;;
     esac

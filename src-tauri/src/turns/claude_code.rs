@@ -22,20 +22,24 @@ pub enum Session {
 
 const ISOLATION_FLAGS: [&str; 6] = [
     "--setting-sources",
-    "project",
+    "",
     "--strict-mcp-config",
     "--permission-mode",
     "manual",
     "--permission-prompts",
 ];
 
-pub struct GroupFlags<'a> {
-    pub instructions_file: Option<&'a Path>,
+pub struct GroupFlags {
     pub snapshot_off: bool,
     pub access: AccessLevel,
 }
 
-pub fn arguments(model: &str, session: &Session, group: Option<&GroupFlags>) -> Vec<String> {
+pub fn arguments(
+    model: &str,
+    session: &Session,
+    group: Option<&GroupFlags>,
+    instructions_file: Option<&Path>,
+) -> Vec<String> {
     let mut args: Vec<String> = [
         "-p",
         "--output-format",
@@ -62,16 +66,13 @@ pub fn arguments(model: &str, session: &Session, group: Option<&GroupFlags>) -> 
             args.push(id.clone());
         }
     }
+    if let Some(file) = instructions_file {
+        args.push("--append-system-prompt-file".to_owned());
+        args.push(file.to_string_lossy().into_owned());
+    }
     if let Some(group) = group {
-        if let Some(at) = args.iter().position(|arg| arg == "--setting-sources") {
-            args[at + 1] = String::new();
-        }
         if let Some(at) = args.iter().position(|arg| arg == "--permission-mode") {
             args[at + 1] = group.access.permission_mode().to_owned();
-        }
-        if let Some(file) = group.instructions_file {
-            args.push("--append-system-prompt-file".to_owned());
-            args.push(file.to_string_lossy().into_owned());
         }
         if group.snapshot_off {
             args.push("--system-prompt-snapshot".to_owned());
@@ -522,7 +523,7 @@ impl StreamParser {
 #[cfg(test)]
 const ISOLATION: [&str; 7] = [
     "--setting-sources",
-    "project",
+    "",
     "--strict-mcp-config",
     "--permission-mode",
     "manual",
@@ -537,7 +538,7 @@ pub fn assert_isolated(args: &[String]) {
         .position(|arg| arg == "--setting-sources")
         .expect("--setting-sources missing");
     assert_eq!(args[at], ISOLATION[0]);
-    assert!(args[at + 1] == "project" || args[at + 1].is_empty());
+    assert!(args[at + 1].is_empty());
     assert_eq!(args[at + 2..at + ISOLATION.len()], ISOLATION[2..]);
     for forbidden in ["bypassPermissions", "acceptEdits", "auto", "dontAsk"] {
         assert!(!args.iter().any(|arg| arg == forbidden), "{forbidden}");
@@ -587,7 +588,7 @@ mod tests {
 
     #[test]
     fn arguments_pass_the_isolation_flags_the_model_and_the_session() {
-        let first = arguments("default", &Session::New("abc".into()), None);
+        let first = arguments("default", &Session::New("abc".into()), None, None);
         assert_eq!(
             first,
             [
@@ -597,7 +598,7 @@ mod tests {
                 "--verbose",
                 "--include-partial-messages",
                 "--setting-sources",
-                "project",
+                "",
                 "--strict-mcp-config",
                 "--permission-mode",
                 "manual",
@@ -607,7 +608,12 @@ mod tests {
                 "abc"
             ]
         );
-        let later = arguments("claude-haiku-5-5", &Session::Resume("abc".into()), None);
+        let later = arguments(
+            "claude-haiku-5-5",
+            &Session::Resume("abc".into()),
+            None,
+            None,
+        );
         assert_eq!(
             &later[12..],
             ["--model", "claude-haiku-5-5", "--resume", "abc"]
@@ -622,29 +628,30 @@ mod tests {
                 for group in [
                     None,
                     Some(GroupFlags {
-                        instructions_file: Some(file),
                         snapshot_off: true,
                         access: AccessLevel::STANDARD,
                     }),
                 ] {
-                    let args = arguments(model, &session, group.as_ref());
-                    assert_isolated(&args);
+                    for instructions in [None, Some(file)] {
+                        let args = arguments(model, &session, group.as_ref(), instructions);
+                        assert_isolated(&args);
+                    }
                 }
             }
         }
     }
 
     #[test]
-    fn a_group_turn_loads_no_setting_sources_and_takes_its_instructions_from_a_file() {
+    fn every_turn_loads_no_setting_sources_and_takes_its_instructions_from_a_file() {
         let file = Path::new("/data/tmp/instructions.md");
         let args = arguments(
             "haiku",
             &Session::Resume("abc".into()),
             Some(&GroupFlags {
-                instructions_file: Some(file),
                 snapshot_off: true,
                 access: AccessLevel::STANDARD,
             }),
+            Some(file),
         );
         assert_eq!(args[5], "--setting-sources");
         assert_eq!(args[6], "");
@@ -665,15 +672,26 @@ mod tests {
             "haiku",
             &Session::Resume("abc".into()),
             Some(&GroupFlags {
-                instructions_file: None,
                 snapshot_off: false,
                 access: AccessLevel::STANDARD,
             }),
+            None,
         );
         assert_eq!(&bare[12..], ["--model", "haiku", "--resume", "abc"]);
         assert_eq!(bare[6], "");
-        let plain = arguments("haiku", &Session::Resume("abc".into()), None);
-        assert_eq!(plain[6], "project");
+        let plain = arguments("haiku", &Session::Resume("abc".into()), None, Some(file));
+        assert_eq!(plain[6], "");
+        assert_eq!(
+            &plain[12..],
+            [
+                "--model",
+                "haiku",
+                "--resume",
+                "abc",
+                "--append-system-prompt-file",
+                "/data/tmp/instructions.md"
+            ]
+        );
     }
 
     #[test]

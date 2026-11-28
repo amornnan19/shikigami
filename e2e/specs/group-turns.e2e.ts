@@ -134,7 +134,9 @@ describe("turns in a group chat", () => {
     expect(lines).toHaveLength(3);
     expect(lines[2]).toContain("--session-id");
     expect(lines[2]).not.toContain("--resume");
-    expect(records(fakeClaudePrompts)).toHaveLength(2);
+    const prompts = records(fakeClaudePrompts);
+    expect(prompts).toHaveLength(3);
+    expect(prompts[2]).toBe(prompts[0]);
     expect(records(fakeClaudeCwds).at(-1)?.trim()).not.toBe(realpathSync(pickedFolder));
     await browser.saveScreenshot(join(artifacts, "group-turns-private-chat.png"));
   });

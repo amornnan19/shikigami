@@ -235,7 +235,7 @@ impl Fixture {
         let fixture = self.records.path().join("basic.jsonl");
         fs::write(&fixture, BASIC).unwrap();
         let script = format!(
-            "#!/bin/sh\ncase \"$1\" in --help) [ -f \"{records}/help-delay\" ] && sleep 2; echo '  --system-prompt-snapshot <on|off>'; exit 0;; esac\nn=$(ls \"{records}\" | grep -c '^args' || true)\nfor a in \"$@\"; do printf '%s\\0' \"$a\"; done > \"{records}/args.$n\"\nprev=\"\"; for a in \"$@\"; do if [ \"$prev\" = --append-system-prompt-file ]; then cp \"$a\" \"{records}/prompt.$n\"; stat -f %Lp \"$a\" > \"{records}/mode.$n\"; echo \"$a\" > \"{records}/promptpath.$n\"; fi; prev=\"$a\"; done\nprev=\"\"; for a in \"$@\"; do if [ \"$prev\" = --settings ]; then cp \"$a\" \"{records}/settings.$n\"; fi; prev=\"$a\"; done\ncat > \"{records}/stdin.$n\"\npwd > \"{records}/pwd.$n\"\n{body}\ncat \"{}\"\n",
+            "#!/bin/sh\ncase \"$1\" in --version) echo '2.1.332 (Claude Code)'; exit 0;; esac\ncase \"$1\" in --help) [ -f \"{records}/help-delay\" ] && sleep 2; echo '  --system-prompt-snapshot <on|off>'; exit 0;; esac\nn=$(ls \"{records}\" | grep -c '^args' || true)\nfor a in \"$@\"; do printf '%s\\0' \"$a\"; done > \"{records}/args.$n\"\nprev=\"\"; for a in \"$@\"; do if [ \"$prev\" = --append-system-prompt-file ]; then cp \"$a\" \"{records}/prompt.$n\"; stat -f %Lp \"$a\" > \"{records}/mode.$n\"; echo \"$a\" > \"{records}/promptpath.$n\"; fi; prev=\"$a\"; done\nprev=\"\"; for a in \"$@\"; do if [ \"$prev\" = --settings ]; then cp \"$a\" \"{records}/settings.$n\"; fi; prev=\"$a\"; done\ncat > \"{records}/stdin.$n\"\npwd > \"{records}/pwd.$n\"\n{body}\ncat \"{}\"\n",
             fixture.display()
         );
         let claude = self.bin.path().join("claude");

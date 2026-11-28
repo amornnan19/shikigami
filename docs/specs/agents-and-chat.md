@@ -129,10 +129,11 @@ conversation across app restarts. This is the core every later milestone builds 
 - M1 has no sandbox yet; that is M2. Shikigami must not pass any flag that skips the provider's
   own approvals or widens its permissions. M1 has no approval prompt of its own, so an action that
   needs approval is denied and shows as a failed step.
-- Every turn runs Claude Code isolated from the user's own Claude Code configuration: only the
-  project's settings, no user-level hooks, plugins or MCP servers, and manual permission mode with
-  no permission prompts (`--setting-sources project --strict-mcp-config --permission-mode manual
-  --permission-prompts none`).
+- Every turn runs Claude Code isolated from the user's own Claude Code configuration: no settings
+  files are loaded (Shikigami passes the workspace instructions and the sandbox settings itself), no
+  user-level hooks, plugins or MCP servers, and manual permission mode (`--setting-sources ""
+  --strict-mcp-config --permission-mode manual`). Since M2 every turn also runs in a sandbox; see
+  `sandbox-and-approval.md`.
 - Shikigami does not change the user's provider configuration files.
 
 ## Acceptance checks
