@@ -1,4 +1,5 @@
 use std::env;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -22,14 +23,46 @@ impl ProbeOutput {
     }
 }
 
+const ALLOWED_VARIABLES: [&str; 7] = ["HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "TERM"];
+const ALLOWED_PREFIX: &str = "LC_";
+
+pub fn is_allowed_variable(name: &OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| ALLOWED_VARIABLES.contains(&name) || name.starts_with(ALLOWED_PREFIX))
+}
+
 pub async fn run(
     path: &Path,
     args: &[&str],
     search_dirs: &[PathBuf],
     limit: Duration,
 ) -> Option<ProbeOutput> {
+    run_with(path, args, search_dirs, limit, false).await
+}
+
+pub async fn run_allowlisted(
+    path: &Path,
+    args: &[&str],
+    search_dirs: &[PathBuf],
+    limit: Duration,
+) -> Option<ProbeOutput> {
+    run_with(path, args, search_dirs, limit, true).await
+}
+
+async fn run_with(
+    path: &Path,
+    args: &[&str],
+    search_dirs: &[PathBuf],
+    limit: Duration,
+    allowlisted: bool,
+) -> Option<ProbeOutput> {
     let search_path = env::join_paths(search_dirs).ok()?;
     let mut command = Command::new(path);
+    if allowlisted {
+        command
+            .env_clear()
+            .envs(std::env::vars_os().filter(|(name, _)| is_allowed_variable(name)));
+    }
     command
         .args(args)
         .env("PATH", search_path)

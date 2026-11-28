@@ -5,6 +5,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use super::claude_code::Session;
 use super::store::{self, BeginError, Begun, QueuedMessage};
 use crate::groups::{self, Member};
+use crate::providers::CLAUDE_CODE_ID;
 
 pub struct GroupBegun {
     pub begun: Begun,
@@ -16,6 +17,7 @@ pub struct GroupBegun {
     pub lead_agent_id: Option<String>,
     pub input: String,
     pub previous_seen: i64,
+    pub stored_context_hash: Option<String>,
 }
 
 pub enum GroupSent {
@@ -75,16 +77,16 @@ fn session_of(
     connection: &Connection,
     agent_id: &str,
     group_id: &str,
-) -> rusqlite::Result<(Session, i64)> {
+) -> rusqlite::Result<(Session, i64, Option<String>)> {
     connection.execute(
         "INSERT OR IGNORE INTO agent_group_sessions (agent_id, group_id) VALUES (?1, ?2)",
         params![agent_id, group_id],
     )?;
-    let (stored, last_seen): (Option<String>, i64) = connection.query_row(
-        "SELECT provider_session_id, last_seen_seq FROM agent_group_sessions
+    let (stored, last_seen, hash): (Option<String>, i64, Option<String>) = connection.query_row(
+        "SELECT provider_session_id, last_seen_seq, context_hash FROM agent_group_sessions
          WHERE agent_id = ?1 AND group_id = ?2",
         params![agent_id, group_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
     let session = match stored {
         Some(id) => Session::Resume(id),
@@ -98,7 +100,7 @@ fn session_of(
             Session::New(id)
         }
     };
-    Ok((session, last_seen))
+    Ok((session, last_seen, hash))
 }
 
 fn unseen_lines(
@@ -145,11 +147,27 @@ fn begin_in(
     now: i64,
 ) -> Result<GroupBegun, BeginError> {
     let facts = facts(transaction, group_id)?;
+    if !facts
+        .members
+        .iter()
+        .any(|member| member.agent_id == addressed)
+    {
+        return Err(BeginError::Refused {
+            code: "not-member",
+            message: "This agent is no longer in the group.".to_owned(),
+        });
+    }
     let agent = store::agent(transaction, addressed)?.ok_or(BeginError::NotFound)?;
+    if agent.provider != CLAUDE_CODE_ID {
+        return Err(BeginError::Refused {
+            code: "provider-unavailable",
+            message: "This agent's provider is not available.".to_owned(),
+        });
+    }
     if busy(transaction, group_id, addressed)? {
         return Err(BeginError::Busy);
     }
-    let (session, last_seen) = session_of(transaction, addressed, group_id)?;
+    let (session, last_seen, stored_context_hash) = session_of(transaction, addressed, group_id)?;
     let unseen = unseen_lines(transaction, group_id, addressed, last_seen)?;
     let turn_id = uuid::Uuid::now_v7().to_string();
     transaction.execute(
@@ -201,6 +219,7 @@ fn begin_in(
         lead_agent_id: facts.lead_agent_id,
         input: compose_input(&unseen, text),
         previous_seen: last_seen,
+        stored_context_hash,
     })
 }
 
@@ -233,12 +252,13 @@ fn enqueue(
 pub fn begin_or_queue(
     connection: &Connection,
     group_id: &str,
-    addressed: &str,
     text: &str,
     now: i64,
 ) -> Result<GroupSent, BeginError> {
     let transaction = connection.unchecked_transaction()?;
     facts(&transaction, group_id)?;
+    let addressed = lead_of(&transaction, group_id)?;
+    let addressed = addressed.as_str();
     let backlog: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM group_queue WHERE group_id = ?1)",
         [group_id],
@@ -286,9 +306,26 @@ fn advance_in(
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
-    let Some((queued_id, addressed, text)) = head else {
+    let Some((queued_id, mut addressed, text)) = head else {
         return Ok(None);
     };
+    let member: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM group_members WHERE group_id = ?1 AND agent_id = ?2)",
+        params![group_id, addressed],
+        |row| row.get(0),
+    )?;
+    if !member {
+        let lead = groups::store::find_row(transaction, group_id)?
+            .and_then(|row| row.lead_agent_id)
+            .filter(|lead| *lead != addressed);
+        match lead {
+            Some(lead) => addressed = lead,
+            None => {
+                transaction.execute("DELETE FROM group_queue WHERE id = ?1", [&queued_id])?;
+                return Ok(None);
+            }
+        }
+    }
     if busy(transaction, group_id, &addressed)? {
         return Ok(None);
     }
@@ -442,7 +479,7 @@ pub fn running_turn_agent(
 
 pub const FOLDER_INSTRUCTIONS_MAX_BYTES: u64 = 64 * 1024;
 
-pub const MESSAGES_HEADER: &str = "\n\nMessages:\n";
+pub const MESSAGES_HEADER: &str = "Messages:\n";
 
 pub fn briefing(begun: &GroupBegun) -> String {
     let agent_id = begun.agent_id.as_str();
@@ -472,14 +509,49 @@ pub fn briefing(begun: &GroupBegun) -> String {
     )
 }
 
-pub fn turn_input(begun: &GroupBegun, folder_instructions: &str) -> String {
+pub fn context_block(begun: &GroupBegun, folder_instructions: &str) -> String {
     let mut context = briefing(begun);
     let folder_text = folder_instructions.trim();
     if !folder_text.is_empty() {
         context.push_str("\n\nInstructions from the group folder's CLAUDE.md:\n");
         context.push_str(folder_text);
     }
-    format!("{context}{MESSAGES_HEADER}{}", begun.input)
+    context
+}
+
+pub fn context_hash(context: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in context.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+pub fn set_context_hash(
+    connection: &Connection,
+    agent_id: &str,
+    group_id: &str,
+    hash: &str,
+) -> rusqlite::Result<()> {
+    connection.execute(
+        "UPDATE agent_group_sessions SET context_hash = ?3 WHERE agent_id = ?1 AND group_id = ?2",
+        params![agent_id, group_id, hash],
+    )?;
+    Ok(())
+}
+
+pub fn restore_seen(
+    connection: &Connection,
+    agent_id: &str,
+    group_id: &str,
+    previous: i64,
+) -> rusqlite::Result<()> {
+    connection.execute(
+        "UPDATE agent_group_sessions SET last_seen_seq = ?3 WHERE agent_id = ?1 AND group_id = ?2",
+        params![agent_id, group_id, previous],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]

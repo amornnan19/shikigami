@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::env;
-use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -23,7 +22,7 @@ use crate::agents::now_millis;
 use crate::api_key::ApiKeyError;
 use crate::auth::AuthMode;
 use crate::db::Database;
-use crate::providers;
+use crate::providers::{self, is_allowed_variable};
 use crate::secrets::SecretString;
 
 const LINE_LIMIT: usize = 1024 * 1024;
@@ -32,8 +31,6 @@ const STDERR_LINE_LIMIT: usize = 4096;
 const TEXT_WRITE_INTERVAL: Duration = Duration::from_millis(500);
 const EXIT_GRACE: Duration = Duration::from_secs(5);
 const STDERR_GRACE: Duration = Duration::from_secs(2);
-const ALLOWED_VARIABLES: [&str; 7] = ["HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "TERM"];
-const ALLOWED_PREFIX: &str = "LC_";
 const SNAPSHOT_FLAG: &str = "--system-prompt-snapshot";
 const SESSION_MISSING: &str = "No conversation found";
 
@@ -81,11 +78,6 @@ impl ApiKey {
             Self::Unresolved => Some("Could not read the sign-in setting.".to_owned()),
         }
     }
-}
-
-fn is_allowed_variable(name: &OsStr) -> bool {
-    name.to_str()
-        .is_some_and(|name| ALLOWED_VARIABLES.contains(&name) || name.starts_with(ALLOWED_PREFIX))
 }
 
 enum Line {
@@ -205,6 +197,8 @@ struct Runner<'a> {
     save_failed: bool,
     input_unread: bool,
     previous_seen: i64,
+    context_hash: Option<String>,
+    hash_stored: bool,
 }
 
 struct InstructionsFile(Option<PathBuf>);
@@ -448,6 +442,7 @@ impl Runner<'_> {
         match parsed {
             Parsed::Session(id) => {
                 attempt.saw_init = true;
+                self.store_context_hash();
                 if id != self.stored_session {
                     self.store_session(Some(&id));
                     self.stored_session = id;
@@ -463,6 +458,27 @@ impl Runner<'_> {
             } => self.end_step(step_id, failed, output),
             Parsed::Result { is_error, text } => attempt.result = Some((is_error, text)),
         }
+    }
+
+    fn store_context_hash(&mut self) {
+        let (Some(group_id), Some(hash)) = (self.group_id.clone(), self.context_hash.clone())
+        else {
+            return;
+        };
+        if self.hash_stored {
+            return;
+        }
+        self.hash_stored = true;
+        let agent_id = self.agent_id.clone();
+        self.save(|connection| group::set_context_hash(connection, &agent_id, &group_id, &hash));
+    }
+
+    fn restore_seen(&mut self) {
+        let Some(group_id) = self.group_id.clone() else {
+            return;
+        };
+        let (agent_id, previous) = (self.agent_id.clone(), self.previous_seen);
+        self.save(|connection| group::restore_seen(connection, &agent_id, &group_id, previous));
     }
 
     fn store_session(&mut self, session_id: Option<&str>) {
@@ -586,6 +602,9 @@ impl Runner<'_> {
             attempt.failure = Some("Could not start Claude Code.".to_owned());
             return attempt;
         };
+        if self.registry.is_closing() {
+            return attempt;
+        }
         let Ok(mut child) = command.spawn() else {
             attempt.failure = Some("Could not start Claude Code.".to_owned());
             return attempt;
@@ -608,7 +627,10 @@ impl Runner<'_> {
             self.registry.clear_group(&self.agent_id, &self.turn_id);
             return attempt;
         };
-        let message = launch.text.clone();
+        let message = match &launch.group {
+            Some(group) => group.stdin(session),
+            None => launch.text.clone(),
+        };
         tokio::spawn(async move {
             let _ = stdin.write_all(message.as_bytes()).await;
             let _ = stdin.shutdown().await;
@@ -692,17 +714,32 @@ fn failure_of(attempt: &Attempt) -> String {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunEnd {
+    Finished,
+    ChatFailed,
+    AgentFailed,
+    Closing,
+}
+
+impl RunEnd {
+    #[cfg(test)]
+    pub fn advances(self) -> bool {
+        self == Self::Finished
+    }
+}
+
 pub async fn run(
     db: &Database,
     sink: &dyn EventSink,
     registry: &TurnRegistry,
     launch: Launch,
     key: ApiKey,
-) -> bool {
+) -> RunEnd {
     let (agent_id, turn_id) = (launch.agent_id.clone(), launch.turn_id.clone());
-    let advance = run_turn(db, sink, registry, launch, key).await;
+    let end = run_turn(db, sink, registry, launch, key).await;
     registry.clear(&agent_id, &turn_id);
-    advance
+    end
 }
 
 async fn run_turn(
@@ -711,7 +748,7 @@ async fn run_turn(
     registry: &TurnRegistry,
     launch: Launch,
     key: ApiKey,
-) -> bool {
+) -> RunEnd {
     let stored_session = match &launch.session {
         Session::New(id) | Session::Resume(id) => id.clone(),
     };
@@ -731,8 +768,20 @@ async fn run_turn(
         save_failed: false,
         input_unread: false,
         previous_seen: launch.group.as_ref().map_or(0, |group| group.previous_seen),
+        context_hash: launch
+            .group
+            .as_ref()
+            .map(|group| group.context_hash.clone()),
+        hash_stored: false,
     };
     runner.emit(TurnEvent::Started);
+    if let Some(notice) = launch
+        .group
+        .as_ref()
+        .and_then(|group| group.folder_notice.as_deref())
+    {
+        runner.add_notice(notice);
+    }
     if !launch.workspace.is_dir() {
         runner.input_unread = true;
         let missing = if launch.group.is_some() {
@@ -741,12 +790,12 @@ async fn run_turn(
             "The workspace folder is missing."
         };
         runner.finish("failed", Some(missing.to_owned()));
-        return false;
+        return RunEnd::ChatFailed;
     }
     if let Some(refusal) = key.refusal() {
         runner.input_unread = true;
         runner.finish("failed", Some(refusal));
-        return false;
+        return RunEnd::AgentFailed;
     }
     let mut session = launch.session.clone();
     let mut attempt = runner.attempt(&launch, &session, &key).await;
@@ -762,7 +811,10 @@ async fn run_turn(
     }
     if registry.is_closing() {
         runner.flush_texts();
-        return false;
+        if !attempt.saw_init {
+            runner.restore_seen();
+        }
+        return RunEnd::Closing;
     }
     runner.input_unread = !attempt.saw_init;
     if matches!(session, Session::New(_)) && !attempt.saw_init {
@@ -770,13 +822,17 @@ async fn run_turn(
     }
     if attempt.succeeded() {
         runner.finish("completed", None);
-        true
+        RunEnd::Finished
     } else if registry.stop_requested(&launch.agent_id, &launch.turn_id) {
         runner.finish("stopped", None);
-        true
+        RunEnd::Finished
     } else {
         runner.finish("failed", Some(failure_of(&attempt)));
-        attempt.spawned
+        if attempt.spawned {
+            RunEnd::Finished
+        } else {
+            RunEnd::AgentFailed
+        }
     }
 }
 
@@ -1187,7 +1243,7 @@ mod tests {
             ApiKey::from_read(AuthMode::ApiKey, Ok(None)),
         )
         .await;
-        assert!(!advance);
+        assert!(!advance.advances());
         let turn = only_turn(&world);
         assert_eq!(turn.status, "failed");
         assert_eq!(
@@ -1671,7 +1727,7 @@ mod tests {
         ])
     }
 
-    async fn run_and_stop(world: &World, grace: Duration) -> (bool, Duration) {
+    async fn run_and_stop(world: &World, grace: Duration) -> (RunEnd, Duration) {
         let launch = world.launch("go");
         let turn_id = launch.turn_id.clone();
         assert!(world.registry.begin("a", &turn_id));
@@ -1714,7 +1770,7 @@ mod tests {
         install_streaming_then(&world, "", "sleep 30");
         let grace = Duration::from_secs(2);
         let (advance, elapsed) = run_and_stop(&world, grace).await;
-        assert!(advance);
+        assert!(advance.advances());
         assert!(elapsed < grace + LOAD_SLACK);
         let turn = only_turn(&world);
         assert_eq!(turn.status, "stopped");
@@ -1781,7 +1837,7 @@ mod tests {
         )
         .await
         .expect("a stopped turn must end");
-        assert!(advance);
+        assert!(advance.advances());
         assert!(started.elapsed() < LOAD_SLACK);
         let turn = only_turn(&world);
         assert_eq!(turn.status, "stopped");
@@ -1807,7 +1863,7 @@ mod tests {
             ApiKey::Subscription,
         )
         .await;
-        assert!(advance);
+        assert!(advance.advances());
         assert_eq!(only_turn(&world).status, "completed");
     }
 
@@ -1825,7 +1881,7 @@ mod tests {
             ApiKey::Subscription,
         )
         .await;
-        assert!(!advance);
+        assert!(!advance.advances());
         assert!(!has_record(&world, "args.0"));
         assert_eq!(only_turn(&world).status, "running");
         assert!(!world.sink.kinds().iter().any(|kind| kind == "ended"));
@@ -1859,7 +1915,7 @@ mod tests {
         })
         .await
         .expect("the killed turn must end");
-        assert!(!advance);
+        assert!(!advance.advances());
         assert_eq!(only_turn(&world).status, "running");
         assert!(!world.sink.kinds().iter().any(|kind| kind == "ended"));
     }
@@ -1882,7 +1938,7 @@ mod tests {
             ApiKey::Subscription,
         )
         .await;
-        assert!(!advance);
+        assert_eq!(advance, RunEnd::ChatFailed);
         fs::create_dir_all(world.workspace.path()).unwrap();
         let unreadable = world.launch("two");
         let advance = run(
@@ -1893,7 +1949,7 @@ mod tests {
             ApiKey::Unreadable(None),
         )
         .await;
-        assert!(!advance);
+        assert_eq!(advance, RunEnd::AgentFailed);
         fs::remove_file(world.bin.path().join("claude")).unwrap();
         let no_provider = world.launch("three");
         let advance = run(
@@ -1904,7 +1960,7 @@ mod tests {
             ApiKey::Subscription,
         )
         .await;
-        assert!(!advance);
+        assert_eq!(advance, RunEnd::AgentFailed);
         let turns = world.turns();
         assert_eq!(turns.len(), 3);
         assert!(turns.iter().all(|turn| turn.status == "failed"));
@@ -1927,7 +1983,7 @@ mod tests {
             ApiKey::Subscription,
         )
         .await;
-        assert!(advance);
+        assert!(advance.advances());
         world.install("echo broke >&2\nexit 1");
         let launch = world.launch("bad");
         let advance = run(
@@ -1938,7 +1994,7 @@ mod tests {
             ApiKey::Subscription,
         )
         .await;
-        assert!(advance);
+        assert!(advance.advances());
         let statuses: Vec<_> = world.turns().into_iter().map(|turn| turn.status).collect();
         assert_eq!(statuses, ["completed", "failed"]);
     }
@@ -1991,7 +2047,7 @@ mod tests {
     const LOAD_SLACK: Duration = Duration::from_secs(5);
     const TIMER_SKEW: Duration = Duration::from_millis(50);
 
-    async fn run_with_stall(world: &World, idle: Duration, tool: Duration) -> bool {
+    async fn run_with_stall(world: &World, idle: Duration, tool: Duration) -> RunEnd {
         let mut launch = world.launch("go");
         launch.stall_timeout = idle;
         launch.tool_stall_timeout = tool;
@@ -2063,7 +2119,7 @@ mod tests {
         let started = Instant::now();
         let advance = run_with_stall(&world, SHORT_STALL, LONG_STALL).await;
         assert!(started.elapsed() < Duration::from_secs(8));
-        assert!(advance);
+        assert!(advance.advances());
         let turn = only_turn(&world);
         assert_eq!(turn.status, "failed");
         assert_eq!(
@@ -2088,7 +2144,7 @@ mod tests {
         let advance = run_with_stall(&world, SHORT_STALL, SHORT_TOOL_STALL).await;
         assert!(started.elapsed() + TIMER_SKEW >= SHORT_TOOL_STALL);
         assert!(started.elapsed() < Duration::from_secs(10));
-        assert!(advance);
+        assert!(advance.advances());
         let turn = only_turn(&world);
         assert_eq!(turn.status, "failed");
         assert_eq!(

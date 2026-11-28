@@ -121,7 +121,7 @@ mod tests {
     fn fresh_database_migrates_to_the_latest_version_with_all_tables() {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(dir.path()).unwrap();
-        assert_eq!(schema_version(&db), 6);
+        assert_eq!(schema_version(&db), 7);
         for table in [
             "agents",
             "turns",
@@ -159,7 +159,7 @@ mod tests {
             .unwrap();
         drop(connection);
         let db = Database::open(dir.path()).unwrap();
-        assert_eq!(schema_version(&db), 6);
+        assert_eq!(schema_version(&db), 7);
         assert_eq!(count(&db, "agents"), 1);
         assert_eq!(count(&db, "turns"), 1);
         assert_eq!(count(&db, "settings"), 0);
@@ -170,8 +170,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         drop(Database::open(dir.path()).unwrap());
         let db = Database::open(dir.path()).unwrap();
-        assert_eq!(schema_version(&db), 6);
-        assert_eq!(count(&db, "refinery_schema_history"), 6);
+        assert_eq!(schema_version(&db), 7);
+        assert_eq!(count(&db, "refinery_schema_history"), 7);
     }
 
     #[test]
@@ -274,7 +274,12 @@ mod tests {
             )
             .unwrap(),
             refinery::Migration::unapplied(
-                "V7__broken",
+                "V7__group_context",
+                include_str!("../../migrations/V7__group_context.sql"),
+            )
+            .unwrap(),
+            refinery::Migration::unapplied(
+                "V8__broken",
                 "CREATE TABLE probe (x INTEGER); INSERT INTO missing_table VALUES (1);",
             )
             .unwrap(),
@@ -288,7 +293,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         let probe_tables: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE name = 'probe'",
@@ -363,7 +368,12 @@ mod tests {
             )
             .unwrap(),
             refinery::Migration::unapplied(
-                "V7__rebuild_agents",
+                "V7__group_context",
+                include_str!("../../migrations/V7__group_context.sql"),
+            )
+            .unwrap(),
+            refinery::Migration::unapplied(
+                "V8__rebuild_agents",
                 "CREATE TABLE agents_new (
                    id TEXT PRIMARY KEY,
                    name TEXT NOT NULL COLLATE NOCASE UNIQUE,
@@ -386,7 +396,7 @@ mod tests {
         let db = Database {
             connection: Mutex::new(connection),
         };
-        assert_eq!(schema_version(&db), 7);
+        assert_eq!(schema_version(&db), 8);
         for table in [
             "agents",
             "turns",
@@ -453,7 +463,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             version_two_database(dir.path(), old);
             let db = Database::open(dir.path()).unwrap();
-            assert_eq!(schema_version(&db), 6);
+            assert_eq!(schema_version(&db), 7);
             assert_eq!(
                 setting(&db, "claude.auth-mode").as_deref(),
                 expected,
@@ -513,7 +523,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         version_three_database(dir.path());
         let db = Database::open(dir.path()).unwrap();
-        assert_eq!(schema_version(&db), 6);
+        assert_eq!(schema_version(&db), 7);
         for table in ["agents", "turns", "messages", "queued_messages", "settings"] {
             assert_eq!(count(&db, table), 1, "{table}");
         }
@@ -575,7 +585,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         version_four_database(dir.path());
         let db = Database::open(dir.path()).unwrap();
-        assert_eq!(schema_version(&db), 6);
+        assert_eq!(schema_version(&db), 7);
         for table in [
             "turns",
             "messages",
@@ -630,7 +640,7 @@ mod tests {
                  INSERT INTO steps VALUES ('s', 't', 0, 'tool', 'x', NULL, 'done', 1);
                  INSERT INTO group_queue (id, group_id, addressed_agent_id, content, position, created_at)
                  VALUES ('q', 'g', 'a', 'later', 0, 1);
-                 INSERT INTO agent_group_sessions VALUES ('a', 'g', 'session', 2), ('b', 'g', NULL, 0);",
+                 INSERT INTO agent_group_sessions (agent_id, group_id, provider_session_id, last_seen_seq) VALUES ('a', 'g', 'session', 2), ('b', 'g', NULL, 0);",
             )
             .unwrap()
         });
@@ -715,7 +725,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         version_five_database(dir.path());
         let db = Database::open(dir.path()).unwrap();
-        assert_eq!(schema_version(&db), 6);
+        assert_eq!(schema_version(&db), 7);
         for (table, rows) in [
             ("agents", 2),
             ("turns", 3),
@@ -837,6 +847,15 @@ mod tests {
             });
         assert_eq!((turn_agent, message_agent, author), (None, None, None));
         assert_eq!(count(&db, "messages"), 5);
+        let unhashed: i64 = db.with_connection(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM agent_group_sessions WHERE context_hash IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        });
+        assert_eq!(unhashed, 1);
         let indexes: i64 = db.with_connection(|c| {
             c.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name IN
