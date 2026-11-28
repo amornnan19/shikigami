@@ -3729,6 +3729,7 @@ dependencies = [
 name = "shikigami"
 version = "0.12.1"
 dependencies = [
+ "jiff 1.0.3",
  "keyring",
  "libc",
  "refinery",
