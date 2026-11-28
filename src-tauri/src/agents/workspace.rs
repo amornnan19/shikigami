@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 const FOLDER_MAX: usize = 40;
 const FALLBACK_FOLDER: &str = "agent";
 
-pub fn folder_name(name: &str) -> String {
+pub fn slug(name: &str) -> String {
     let mut slug = String::new();
     for ch in name.to_lowercase().chars() {
         let ch = if ch.is_whitespace() || ch == '_' {
@@ -22,11 +22,15 @@ pub fn folder_name(name: &str) -> String {
         slug.push(ch);
     }
     let slug: String = slug.trim_matches('-').chars().take(FOLDER_MAX).collect();
-    let slug = slug.trim_matches('-');
+    slug.trim_matches('-').to_string()
+}
+
+pub fn folder_name(name: &str) -> String {
+    let slug = slug(name);
     if slug.is_empty() {
         FALLBACK_FOLDER.to_string()
     } else {
-        slug.to_string()
+        slug
     }
 }
 
@@ -39,16 +43,22 @@ pub fn instruction_text(name: &str) -> String {
 }
 
 pub fn create_folder(root: &Path, name: &str, recorded: &[PathBuf]) -> io::Result<PathBuf> {
+    create_folder_named(root, &folder_name(name), recorded)
+}
+
+pub fn numbered(root: &Path, base: &str, attempt: u32) -> PathBuf {
+    if attempt == 1 {
+        root.join(base)
+    } else {
+        root.join(format!("{base}-{attempt}"))
+    }
+}
+
+pub fn create_folder_named(root: &Path, base: &str, recorded: &[PathBuf]) -> io::Result<PathBuf> {
     fs::create_dir_all(root)?;
-    let base = folder_name(name);
     let mut attempt = 1u32;
     loop {
-        let candidate = if attempt == 1 {
-            base.clone()
-        } else {
-            format!("{base}-{attempt}")
-        };
-        let path = root.join(candidate);
+        let path = numbered(root, base, attempt);
         if recorded.contains(&path) {
             attempt += 1;
             continue;

@@ -101,6 +101,16 @@ The desktop shell (Tauri 2), the UI framework (React with TypeScript, Vite) and 
   the folder named by `SHIKIGAMI_E2E_TRASH_DIR`, and refuse to run without it, so tests never fill
   the user's Trash.
 
+### Choosing a group folder: tauri-plugin-dialog
+
+- Options: `tauri-plugin-dialog` 2.8.4; a hand-written `NSOpenPanel` call; `osascript` with Finder.
+- Chosen: `tauri-plugin-dialog` 2.8.4 (exact pin), used from Rust only.
+- Why: it opens the native macOS folder picker (through `rfd`) and returns the path to the Rust
+  command, so the UI never gets a file-system permission and the Rust side checks the folder before
+  it saves it. The plugin has no capability entry, so the UI cannot call its own commands. Test
+  builds (the `e2e` feature) do not open the picker: `SHIKIGAMI_E2E_PICK_FOLDER` names the folder
+  the command returns. Version 3 is an alpha and is not used.
+
 ## Licenses
 
 | Dependency | License |
@@ -133,6 +143,8 @@ The desktop shell (Tauri 2), the UI framework (React with TypeScript, Vite) and 
 | `zeroize` 1.9.2 (wipes the key from memory on drop) | Apache-2.0 or MIT |
 | `react-markdown` 10.1.0 and `remark-gfm` 4.0.1 (render agent replies as Markdown) | MIT |
 | `trash` 5.4.0 (moves a deleted agent's folder to the macOS Trash) | MIT |
+| `tauri-plugin-dialog` 2.8.4 (native folder picker for a group chat's folder) | MIT or Apache-2.0 |
+| `rfd` 0.17.2 and `tauri-plugin-fs` 2.7.1 (pulled in by `tauri-plugin-dialog`) | Apache-2.0 or MIT (`rfd`), MIT (`tauri-plugin-fs`) |
 | `uuid` feature `v4` (random session ids for Claude Code; same crate as before) | MIT or Apache-2.0 |
 
 All listed licenses are permissive and compatible with PolyForm Noncommercial 1.0.0. Their notices

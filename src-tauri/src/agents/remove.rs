@@ -143,6 +143,7 @@ fn delete_row(connection: &Connection, agent_id: &str) -> Result<(String, bool),
     let shared = others
         .iter()
         .any(|other| overlaps(&target, &resolved(other)));
+    crate::groups::store::reassign_leads(&transaction, agent_id).map_err(AgentError::database)?;
     transaction
         .execute("DELETE FROM agents WHERE id = ?1", [agent_id])
         .map_err(AgentError::database)?;
