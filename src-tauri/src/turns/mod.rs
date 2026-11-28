@@ -4,7 +4,7 @@ mod redact;
 mod runner;
 mod store;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -164,6 +164,7 @@ pub struct TurnRegistry {
     slots: Mutex<HashMap<String, Slot>>,
     closing: AtomicBool,
     temp_dir: PathBuf,
+    held: Mutex<HashSet<String>>,
 }
 
 impl TurnRegistry {
@@ -172,6 +173,24 @@ impl TurnRegistry {
             temp_dir,
             ..Self::default()
         }
+    }
+
+    fn held(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
+        self.held
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn hold(&self, agent_id: &str) {
+        self.held().insert(agent_id.to_owned());
+    }
+
+    fn release(&self, agent_id: &str) {
+        self.held().remove(agent_id);
+    }
+
+    fn is_held(&self, agent_id: &str) -> bool {
+        self.held().contains(agent_id)
     }
 
     fn temp_dir(&self) -> PathBuf {
@@ -551,6 +570,7 @@ fn prepare(
     let sent = db
         .with_connection(|connection| store::begin_or_queue(connection, agent_id, text, started_at))
         .map_err(begin_error)?;
+    registry.release(agent_id);
     match sent {
         Sent::Started(begun) => launch_of(
             registry,
@@ -635,6 +655,7 @@ fn resume(
     if registry.is_closing() {
         return Err(TurnError::shutting_down());
     }
+    registry.release(agent_id);
     let executable = executable_of(db, dirs, agent_id)?;
     let started_at = now_millis();
     let advanced = db
@@ -684,6 +705,7 @@ fn prepare_group(
     let sent = db
         .with_connection(|connection| group::begin_or_queue(connection, group_id, text, started_at))
         .map_err(group_begin_error)?;
+    registry.release(&lead);
     match sent {
         group::GroupSent::Started(begun) => {
             launch_of_group(registry, dirs, executable, begun, started_at)
@@ -735,29 +757,41 @@ fn start_next_group(
     launch_of_group(registry, dirs, executable, begun, started_at)
 }
 
+#[derive(Clone, PartialEq, Eq)]
+enum ChatKey {
+    Agent(String),
+    Group(String),
+}
+
+fn chat_key(agent_id: &str, group_id: Option<&str>) -> ChatKey {
+    match group_id {
+        Some(group_id) => ChatKey::Group(group_id.to_owned()),
+        None => ChatKey::Agent(agent_id.to_owned()),
+    }
+}
+
 #[derive(Clone, Default)]
 struct Chain {
-    failed_chats: Vec<Option<String>>,
-    failed_agents: Vec<String>,
+    failed_chats: Vec<ChatKey>,
 }
 
 impl Chain {
-    fn chat_failed(&self, group_id: Option<&str>) -> bool {
-        self.failed_chats
-            .iter()
-            .any(|failed| failed.as_deref() == group_id)
-    }
-
-    fn agent_failed(&self, agent_id: &str) -> bool {
-        self.failed_agents.iter().any(|failed| failed == agent_id)
+    fn chat_failed(&self, key: &ChatKey) -> bool {
+        self.failed_chats.contains(key)
     }
 
     fn record(&mut self, agent_id: &str, group_id: Option<&str>, end: runner::RunEnd) {
-        match end {
-            runner::RunEnd::ChatFailed => self.failed_chats.push(group_id.map(str::to_owned)),
-            runner::RunEnd::AgentFailed => self.failed_agents.push(agent_id.to_owned()),
-            runner::RunEnd::Finished | runner::RunEnd::Closing => {}
+        if end == runner::RunEnd::ChatFailed {
+            self.failed_chats.push(chat_key(agent_id, group_id));
         }
+    }
+}
+
+fn note_end(registry: &TurnRegistry, agent_id: &str, end: runner::RunEnd) {
+    match end {
+        runner::RunEnd::AgentFailed => registry.hold(agent_id),
+        runner::RunEnd::Finished => registry.release(agent_id),
+        runner::RunEnd::ChatFailed | runner::RunEnd::Closing => {}
     }
 }
 
@@ -775,13 +809,13 @@ fn start_group_entry(
     group_id: &str,
     chain: &Chain,
 ) -> Option<Launch> {
-    if chain.chat_failed(Some(group_id)) {
+    if chain.chat_failed(&ChatKey::Group(group_id.to_owned())) {
         return None;
     }
     let head = db
-        .with_connection(|connection| group::head_agent(connection, group_id))
+        .with_connection(|connection| group::effective_head(connection, group_id))
         .ok()??;
-    if chain.agent_failed(&head) {
+    if registry.is_held(&head) {
         return None;
     }
     start_next_group(db, registry, dirs, group_id)
@@ -814,10 +848,10 @@ fn start_after(
                 .and_then(|group_id| start_group_entry(db, registry, dirs, group_id, chain)),
         );
     }
-    if !chain.agent_failed(agent_id) && !chain.chat_failed(None) {
+    if !registry.is_held(agent_id) && !chain.chat_failed(&ChatKey::Agent(agent_id.to_owned())) {
         launches.extend(start_next(db, registry, dirs, agent_id));
     }
-    if !chain.agent_failed(agent_id) {
+    if !registry.is_held(agent_id) {
         let waiting = db
             .with_connection(|connection| group::queued_groups_for(connection, agent_id))
             .unwrap_or_default();
@@ -843,6 +877,7 @@ fn resume_group(
     let Some(head) = head else {
         return Ok(None);
     };
+    registry.release(&head);
     let executable = executable_of(db, dirs, &head)?;
     let started_at = now_millis();
     let begun = db
@@ -965,6 +1000,7 @@ fn drive(
             if closing {
                 continue;
             }
+            note_end(&app.state::<TurnRegistry>(), &agent_id, end);
             chain.record(&agent_id, group_id.as_deref(), end);
             let mut next = next_launches(&app, agent_id, group_id, end, chain.clone()).await;
             if !next.is_empty() {
