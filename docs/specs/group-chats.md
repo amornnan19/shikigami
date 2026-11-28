@@ -1,7 +1,7 @@
 # Spec: group chats and mentions
 
 - Milestone: M4 MVP: agents hand work to each other
-- Status: accepted (2026-11-28, decisions open for review in #54)
+- Status: shipped (M4)
 
 ## Purpose
 
@@ -51,9 +51,14 @@ chat.
     "to hand work to a member, start a line with @Name followed by the task";
   - the group messages it has not seen yet (messages from the user and other agents since its last
     turn in this group), then the message addressed to it.
-- The group folder's own `CLAUDE.md` is loaded as Claude Code normally does for a project. The
-  folder's project settings (permissions, hooks) are not loaded. Agents stay isolated from the
-  user's personal Claude Code configuration, as in one-to-one chats.
+- The group folder's own `CLAUDE.md` is read by Shikigami and given to the agent as text; Claude
+  Code does not load it itself. The folder's project settings (permissions, hooks, environment)
+  never apply. Agents stay isolated from the user's personal Claude Code configuration, as in
+  one-to-one chats.
+- The group details (the briefing and the folder's `CLAUDE.md`) are sent when an agent's group
+  session starts or when the details change, and again after Claude Code compacts the session.
+- An agent-level failure (a sign-in failure, a missing Claude Code CLI) holds that agent's queued
+  work until the user presses Resume.
 
 ### Mentions
 
@@ -66,7 +71,12 @@ chat.
   for that member. The member's turn is queued right after the current one.
 - When a member finishes a task handed to it by another agent, the agent that handed it off gets a
   turn to continue, with the member's answer among its unseen messages.
+- Hand-offs run depth first: a hand-off made by the member that answers runs before the next
+  hand-off of the first agent, and each agent that handed work on continues for the one above.
+- At most 8 mentioned members are addressed by one message.
 - A mention of a name that is not a member is shown as plain text and does nothing.
+- When a member cannot finish a task handed to it (a failure or a stop of that turn), the agent that
+  handed it off still gets a turn to continue, with a notice.
 
 ### Limits
 
@@ -74,7 +84,7 @@ chat.
   group shows "Hand-off limit reached. Mention an agent to continue." and waits for the user.
 - An agent cannot hand work to the agent that just handed work to it more than twice in a row for
   the same user message (ping-pong guard); further hand-offs back are ignored with a notice.
-- Stop ends the running turn and drops the hand-offs that came from it.
+- Stop ends the running turn and drops the queued hand-offs of that message.
 
 ### Permissions
 
@@ -85,7 +95,8 @@ chat.
 
 ## Edge cases
 
-- A member agent is deleted: it leaves every group; a group left with one member shows a notice
+- A member agent is deleted: its group messages stay and show its author as "Former member"; it
+  leaves every group; a group left with one member shows a notice
   and cannot run until another member is added. The lead is reassigned to the first remaining
   member.
 - The group folder is missing: the group shows needs attention with "The group folder is missing."
@@ -112,8 +123,14 @@ chat.
 9. A turn in the group runs in the group's folder (a file listing shows the group folder's files).
 10. Quit during a group turn and reopen: the turn shows interrupted; queued work waits for Resume.
 
+## Subagents
+
+- When an agent's turn runs subagents, they are shown as paper figures beside that agent's avatar,
+  one per running subagent; the group header shows how many each member has out. The figures take
+  the agent's colour. With reduced motion set on the Mac, a static stacked badge with the count is
+  shown instead of moving figures.
+
 ## Out of scope
 
 - Agents running in parallel inside one group (worktrees).
-- Subagent display (#49 builds on this spec).
 - Access levels (M2) and routines (M3).
