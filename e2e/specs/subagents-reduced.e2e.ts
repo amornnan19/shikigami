@@ -20,6 +20,10 @@ describe("subagents under reduced motion", () => {
     expect(await $$(`${agentView} [data-figure]`)).toHaveLength(0);
     expect(await $$(`${agentView} .paper-figure`)).toHaveLength(0);
     await browser.pause(700);
+    await browser.execute(() => {
+      const scroller = document.querySelector('section[aria-label="Agent"] .overflow-y-auto');
+      if (scroller) scroller.scrollTop = 0;
+    });
     await browser.saveScreenshot(join(artifacts, "subagents-reduced-motion.png"));
     await expect($(`${agentView} article`)).toHaveText(
       expect.stringContaining("The scan is done, the outline failed."),

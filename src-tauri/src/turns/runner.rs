@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{self, Write};
@@ -25,6 +25,8 @@ use crate::db::Database;
 use crate::providers::{self, is_allowed_variable};
 use crate::secrets::SecretString;
 
+const MAX_STEPS: usize = 500;
+const STEPS_CAPPED_NOTICE: &str = "More steps ran than are shown.";
 const LINE_LIMIT: usize = 1024 * 1024;
 const STDERR_KEEP: usize = 64 * 1024;
 const STDERR_LINE_LIMIT: usize = 4096;
@@ -214,6 +216,11 @@ struct Runner<'a> {
     next_position: i64,
     texts: HashMap<String, TextRow>,
     step_inputs: HashMap<String, String>,
+    subagent_steps: HashSet<String>,
+    background_steps: HashMap<String, String>,
+    hidden_steps: HashSet<String>,
+    step_count: usize,
+    steps_capped: bool,
     stored_session: String,
     save_failed: bool,
     input_unread: bool,
@@ -425,6 +432,20 @@ impl Runner<'_> {
     }
 
     fn start_step(&mut self, step: StepStart) {
+        if self.step_count >= MAX_STEPS {
+            if !self.steps_capped {
+                self.steps_capped = true;
+                self.add_notice(STEPS_CAPPED_NOTICE);
+            }
+            self.hidden_steps.insert(step.id.clone());
+            self.step_inputs.insert(step.id, step.input);
+            return;
+        }
+        self.step_count += 1;
+        let subagent = claude_code::is_subagent_kind(&step.kind);
+        let task = subagent
+            .then(|| claude_code::subagent_parts(&step.input).0)
+            .flatten();
         let view = StepView {
             id: step.id.clone(),
             parent_step_id: step.parent_step_id,
@@ -432,7 +453,12 @@ impl Runner<'_> {
             title: step.title,
             detail: Some(step.input.clone()),
             status: "running".to_owned(),
+            task,
+            result: None,
         };
+        if subagent {
+            self.subagent_steps.insert(step.id.clone());
+        }
         let position = self.next_position;
         self.next_position += 1;
         let created_at = self.tick();
@@ -446,6 +472,12 @@ impl Runner<'_> {
 
     fn end_step(&mut self, step_id: String, failed: bool, output: String) {
         let input = self.step_inputs.remove(&step_id).unwrap_or_default();
+        if self.hidden_steps.remove(&step_id) {
+            return;
+        }
+        self.background_steps.remove(&step_id);
+        let result =
+            (self.subagent_steps.contains(&step_id) && !output.is_empty()).then(|| output.clone());
         let detail = if output.is_empty() {
             input
         } else {
@@ -457,7 +489,38 @@ impl Runner<'_> {
             step_id,
             status: status.to_owned(),
             detail: Some(detail),
+            result,
         });
+    }
+
+    fn background_step(&mut self, step_id: String, output: String) {
+        let Some(input) = self.step_inputs.get(&step_id).cloned() else {
+            return;
+        };
+        if self.hidden_steps.contains(&step_id) {
+            return;
+        }
+        let detail = if output.is_empty() {
+            input
+        } else {
+            format!("{input}\n\n{output}")
+        };
+        self.save(|connection| store::end_step(connection, &step_id, "running", Some(&detail)));
+        self.background_steps
+            .insert(step_id.clone(), output.clone());
+        self.emit(TurnEvent::StepEnded {
+            step_id,
+            status: "running".to_owned(),
+            detail: Some(detail),
+            result: Some(output),
+        });
+    }
+
+    fn settle_background_steps(&mut self) {
+        let launched: Vec<(String, String)> = self.background_steps.drain().collect();
+        for (step_id, output) in launched {
+            self.end_step(step_id, false, output);
+        }
     }
 
     fn handle(&mut self, parsed: Parsed, attempt: &mut Attempt) {
@@ -478,6 +541,7 @@ impl Runner<'_> {
                 failed,
                 output,
             } => self.end_step(step_id, failed, output),
+            Parsed::StepBackground { step_id, output } => self.background_step(step_id, output),
             Parsed::Compacted => attempt.compacted = true,
             Parsed::Result {
                 is_error,
@@ -523,6 +587,9 @@ impl Runner<'_> {
 
     fn finish(&mut self, status: &str, error: Option<String>, compacted: bool) {
         self.flush_texts();
+        if status == "completed" {
+            self.settle_background_steps();
+        }
         let error = error.map(|message| self.redactor.redact(&message));
         let (status, error) = if status == "completed" && self.save_failed {
             ("failed", Some("Could not save the whole reply.".to_owned()))
@@ -798,6 +865,11 @@ async fn run_turn(
         next_position: 0,
         texts: HashMap::new(),
         step_inputs: HashMap::new(),
+        subagent_steps: HashSet::new(),
+        background_steps: HashMap::new(),
+        hidden_steps: HashSet::new(),
+        step_count: 0,
+        steps_capped: false,
         stored_session,
         save_failed: false,
         input_unread: false,
@@ -1720,6 +1792,10 @@ mod tests {
         assert_eq!(steps[0].parent_step_id, None);
         assert_eq!(steps[0].status, "done");
         assert!(steps[0].detail.as_deref().unwrap().contains("all done"));
+        assert_eq!(steps[0].task.as_deref(), Some("find [redacted]"));
+        assert_eq!(steps[0].result.as_deref(), Some("all done"));
+        assert_eq!(steps[1].task, None);
+        assert_eq!(steps[1].result, None);
         assert_eq!(steps[1].kind, "Bash");
         assert_eq!(steps[1].title, "echo [redacted]");
         assert_eq!(
@@ -1741,6 +1817,114 @@ mod tests {
         let kinds = world.sink.kinds();
         assert_eq!(kinds.iter().filter(|k| *k == "step-started").count(), 3);
         assert_eq!(kinds.iter().filter(|k| *k == "step-ended").count(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_background_subagent_stays_running_until_the_turn_completes_then_is_done() {
+        let world = World::new();
+        let lines = stream_lines(&[
+            serde_json::json!({"type":"system","subtype":"init","session_id":"s1"}),
+            serde_json::json!({"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"bg","name":"Agent","input":{"description":"later","prompt":"do it"}}]}}),
+            serde_json::json!({"type":"user","tool_use_result":{"status":"async_launched"},"message":{"content":[{"type":"tool_result","tool_use_id":"bg","content":"Async agent launched successfully.","is_error":false}]}}),
+            serde_json::json!({"type":"assistant","parent_tool_use_id":"bg","message":{"id":"m2","content":[{"type":"tool_use","id":"in","name":"Bash","input":{"command":"ls"}}]}}),
+            serde_json::json!({"type":"user","parent_tool_use_id":"bg","message":{"content":[{"type":"tool_result","tool_use_id":"in","content":"ok","is_error":false}]}}),
+            serde_json::json!({"type":"result","is_error":false,"result":"ok"}),
+        ]);
+        let fixture = world.fixture("background.jsonl", &lines);
+        world.install(&recording(
+            &world,
+            &format!("cat \"{}\"", fixture.display()),
+        ));
+        world.send("hi", ApiKey::Subscription).await;
+        let turn = only_turn(&world);
+        assert_eq!(turn.status, "completed");
+        let [ItemView::Step(agent), ItemView::Step(inner)] = &turn.items[..] else {
+            panic!("{:?}", turn.items);
+        };
+        assert_eq!(agent.status, "done");
+        assert_eq!(agent.task.as_deref(), Some("do it"));
+        assert_eq!(
+            agent.result.as_deref(),
+            Some("Async agent launched successfully.")
+        );
+        assert_eq!(inner.parent_step_id.as_deref(), Some(agent.id.as_str()));
+        let events = world.sink.0.lock().unwrap();
+        let statuses: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                TurnEvent::StepEnded { status, .. } => Some(status.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(statuses, ["running", "done", "done"]);
+    }
+
+    #[tokio::test]
+    async fn a_background_subagent_of_a_turn_that_does_not_complete_is_stopped() {
+        let world = World::new();
+        let lines = stream_lines(&[
+            serde_json::json!({"type":"system","subtype":"init","session_id":"s1"}),
+            serde_json::json!({"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"bg","name":"Agent","input":{"description":"later","prompt":"do it"}}]}}),
+            serde_json::json!({"type":"user","tool_use_result":{"status":"async_launched"},"message":{"content":[{"type":"tool_result","tool_use_id":"bg","content":"Async agent launched successfully.","is_error":false}]}}),
+            serde_json::json!({"type":"result","is_error":true,"result":"boom"}),
+        ]);
+        let fixture = world.fixture("background.jsonl", &lines);
+        world.install(&recording(
+            &world,
+            &format!("cat \"{}\"", fixture.display()),
+        ));
+        world.send("hi", ApiKey::Subscription).await;
+        let turn = only_turn(&world);
+        assert_eq!(turn.status, "failed");
+        assert!(
+            matches!(&turn.items[..], [ItemView::Step(agent), ..] if agent.status == "stopped")
+        );
+    }
+
+    #[tokio::test]
+    async fn steps_past_the_cap_are_neither_stored_nor_emitted_and_one_notice_says_so() {
+        let world = World::new();
+        let mut values =
+            vec![serde_json::json!({"type":"system","subtype":"init","session_id":"s1"})];
+        let total = MAX_STEPS + 5;
+        for n in 0..total {
+            values.push(serde_json::json!({"type":"assistant","message":{"id":format!("m{n}"),"content":[{"type":"tool_use","id":format!("t{n}"),"name":"Bash","input":{"command":format!("echo {n}")}}]}}));
+            values.push(serde_json::json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":format!("t{n}"),"content":"ok","is_error":false}]}}));
+        }
+        values.push(serde_json::json!({"type":"result","is_error":false,"result":"ok"}));
+        let fixture = world.fixture("many.jsonl", &stream_lines(&values));
+        world.install(&recording(
+            &world,
+            &format!("cat \"{}\"", fixture.display()),
+        ));
+        world.send("hi", ApiKey::Subscription).await;
+        let turn = only_turn(&world);
+        assert_eq!(turn.status, "completed");
+        let steps = turn
+            .items
+            .iter()
+            .filter(|item| matches!(item, ItemView::Step(_)))
+            .count();
+        assert_eq!(steps, MAX_STEPS);
+        let notices: Vec<&str> = turn
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ItemView::Notice { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notices, [STEPS_CAPPED_NOTICE]);
+        let kinds = world.sink.kinds();
+        assert_eq!(
+            kinds.iter().filter(|k| *k == "step-started").count(),
+            MAX_STEPS
+        );
+        assert_eq!(
+            kinds.iter().filter(|k| *k == "step-ended").count(),
+            MAX_STEPS
+        );
+        assert_eq!(kinds.iter().filter(|k| *k == "notice").count(), 1);
     }
 
     #[tokio::test]

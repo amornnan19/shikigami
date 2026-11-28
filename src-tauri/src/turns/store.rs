@@ -1,7 +1,7 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
-use super::claude_code::Session;
+use super::claude_code::{self, Session};
 
 pub const PAGE_SIZE: usize = 20;
 
@@ -41,6 +41,8 @@ pub struct StepView {
     pub title: String,
     pub detail: Option<String>,
     pub status: String,
+    pub task: Option<String>,
+    pub result: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -537,14 +539,24 @@ fn load_items(connection: &Connection, turn_id: &str) -> rusqlite::Result<(Strin
         "SELECT id, kind, title, detail, status, created_at, parent_step_id FROM steps WHERE turn_id = ?1 ORDER BY position",
     )?;
     let rows = steps.query_map([turn_id], |row| {
+        let kind: String = row.get(1)?;
+        let detail: Option<String> = row.get(3)?;
+        let (task, result) = match &detail {
+            Some(detail) if claude_code::is_subagent_kind(&kind) => {
+                claude_code::subagent_parts(detail)
+            }
+            _ => (None, None),
+        };
         Ok((
             StepView {
                 id: row.get(0)?,
-                kind: row.get(1)?,
+                kind,
                 title: row.get(2)?,
-                detail: row.get(3)?,
+                detail,
                 status: row.get(4)?,
                 parent_step_id: row.get(6)?,
+                task,
+                result,
             },
             row.get::<_, i64>(5)?,
         ))
@@ -764,6 +776,8 @@ mod tests {
             let step = StepView {
                 id: "s".into(),
                 parent_step_id: None,
+                task: None,
+                result: None,
                 kind: "Bash".into(),
                 title: "ls".into(),
                 detail: None,
@@ -821,6 +835,8 @@ mod tests {
             let step = StepView {
                 id: "s1".into(),
                 parent_step_id: None,
+                task: None,
+                result: None,
                 kind: "Bash".into(),
                 title: "ls".into(),
                 detail: Some("out".into()),

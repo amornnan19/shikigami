@@ -63,11 +63,11 @@
 @keyframes paper-fold-out {
   from {
     opacity: 0;
-    transform: perspective(160px) translateX(var(--from-x)) scale(0.2) rotateY(90deg);
+    transform: perspective(160px) translate(var(--from-x), var(--from-y)) scale(0.2) rotateY(90deg);
   }
   to {
     opacity: 0.75;
-    transform: perspective(160px) translateX(0) scale(1) rotateY(0deg);
+    transform: perspective(160px) translate(0, 0) scale(1) rotateY(0deg);
   }
 }
 
@@ -87,11 +87,11 @@
 @keyframes paper-fold-back {
   from {
     opacity: 0.75;
-    transform: perspective(160px) translateX(0) scale(1) rotateY(0deg);
+    transform: perspective(160px) translate(0, 0) scale(1) rotateY(0deg);
   }
   to {
     opacity: 0;
-    transform: perspective(160px) translateX(var(--from-x)) scale(0.2) rotateY(90deg);
+    transform: perspective(160px) translate(var(--from-x), var(--from-y)) scale(0.2) rotateY(90deg);
   }
 }
 
@@ -121,7 +121,7 @@
 }
 
 .paper-figure-dissolving {
-  animation: paper-dissolve 500ms ease-out forwards;
+  animation: paper-dissolve 500ms ease-out 150ms forwards;
 }
 
 @media (prefers-reduced-motion: reduce) {

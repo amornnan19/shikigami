@@ -7,7 +7,7 @@ import {
   Square,
   X,
 } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { AgentAvatar } from "@/features/agents/AgentAvatar";
 import { tintClass } from "@/features/agents/colors";
 import type { GroupMember } from "@/features/groups/api";
@@ -16,9 +16,12 @@ import { PaperFigure } from "@/features/shikigami/PaperFigure";
 import {
   buildTree,
   groupStatusLabel,
+  inBackground,
   isSubagent,
   type StepNode,
+  stepsSummary,
   subagentLabel,
+  withEffectiveStatus,
 } from "@/features/shikigami/subagents";
 import { cn } from "@/lib/utils";
 import type { Step, StepStatus, TextItem, Turn } from "./api";
@@ -52,12 +55,18 @@ function StepDetail({ step }: { step: Step }) {
   );
 }
 
-function StepRows({ nodes, tint }: { nodes: StepNode[]; tint: string }) {
+function StepRows({ nodes, tint, busy }: { nodes: StepNode[]; tint: string; busy: Set<string> }) {
   return (
     <ul className="mt-1 flex flex-col gap-2">
       {nodes.map((node) =>
         isSubagent(node.step) ? (
-          <SubagentGroup key={node.step.id} node={node} tint={tint} />
+          <SubagentGroup
+            key={node.step.id}
+            node={node}
+            tint={tint}
+            running={busy.has(node.step.id)}
+            busy={busy}
+          />
         ) : (
           <li key={node.step.id} className="min-w-0">
             <div className="flex items-start gap-2">
@@ -73,14 +82,53 @@ function StepRows({ nodes, tint }: { nodes: StepNode[]; tint: string }) {
   );
 }
 
-function SubagentGroup({ node, tint }: { node: StepNode; tint: string }) {
+function Clamped({ label, text }: { label: string; text: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const [overflows, setOverflows] = useState(false);
+  const box = useRef<HTMLParagraphElement>(null);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: measure again when the text changes
+  useLayoutEffect(() => {
+    const element = box.current;
+    if (element && !expanded) setOverflows(element.scrollHeight > element.clientHeight + 1);
+  }, [text, expanded]);
+  return (
+    <div data-subagent-task="" className="mb-2">
+      <span className="text-xs font-medium text-foreground">{label}</span>
+      <p ref={box} className={cn("break-words whitespace-normal", !expanded && "line-clamp-3")}>
+        {text}
+      </p>
+      {(overflows || expanded) && (
+        <button
+          type="button"
+          onClick={() => setExpanded(!expanded)}
+          className="text-xs underline outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          {expanded ? "Show less" : "Show more"}
+        </button>
+      )}
+    </div>
+  );
+}
+
+function SubagentGroup({
+  node,
+  tint,
+  running,
+  busy,
+}: {
+  node: StepNode;
+  tint: string;
+  running: boolean;
+  busy: Set<string>;
+}) {
   const { step } = node;
   const [chosen, setChosen] = useState<boolean | null>(null);
-  const open = chosen ?? step.status === "running";
+  const status: StepStatus = running ? "running" : step.status;
+  const open = chosen ?? status === "running";
   const Chevron = open ? ChevronDown : ChevronRight;
   const label = subagentLabel(step);
   return (
-    <li data-subagent={step.id} data-status={step.status} className="min-w-0">
+    <li data-subagent={step.id} data-status={status} className="min-w-0">
       <button
         type="button"
         aria-expanded={open}
@@ -88,7 +136,7 @@ function SubagentGroup({ node, tint }: { node: StepNode; tint: string }) {
         className="flex w-full items-start gap-2 rounded-md px-1 py-0.5 text-left outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring"
       >
         <Chevron className="mt-0.5 size-3.5 shrink-0" />
-        <span aria-hidden="true" className="mt-px block h-5 w-4 shrink-0">
+        <span aria-hidden="true" className="mt-px block h-[18px] w-3.5 shrink-0">
           <PaperFigure tintClass={step.status === "failed" ? "text-red-600" : tint} />
         </span>
         <span className="font-medium text-foreground">{label.type}</span>
@@ -97,13 +145,21 @@ function SubagentGroup({ node, tint }: { node: StepNode; tint: string }) {
           data-subagent-status=""
           className={cn("shrink-0 text-xs", step.status === "failed" && "text-red-600")}
         >
-          {groupStatusLabel(step.status)}
+          {groupStatusLabel(status, inBackground(step))}
         </span>
       </button>
       {open && (
         <div className="mt-1 ml-2 border-l border-border pl-3">
-          {node.children.length > 0 && <StepRows nodes={node.children} tint={tint} />}
-          <StepDetail step={step} />
+          {step.task && <Clamped label="Task" text={step.task} />}
+          {node.children.length > 0 && <StepRows nodes={node.children} tint={tint} busy={busy} />}
+          {step.result && (
+            <div data-subagent-result="" className="mt-2">
+              <span className="text-xs font-medium text-foreground">Result</span>
+              <p className="max-h-60 overflow-auto break-words whitespace-pre-wrap">
+                {step.result}
+              </p>
+            </div>
+          )}
         </div>
       )}
     </li>
@@ -111,22 +167,31 @@ function SubagentGroup({ node, tint }: { node: StepNode; tint: string }) {
 }
 
 function Steps({ steps, tint }: { steps: Step[]; tint: string }) {
-  const [open, setOpen] = useState(false);
+  const [chosen, setChosen] = useState<boolean | null>(null);
+  const effective = withEffectiveStatus(steps);
+  const busy = new Set(
+    effective.filter((step) => isSubagent(step) && step.status === "running").map((s) => s.id),
+  );
+  const anyRunning = busy.size > 0;
+  useEffect(() => {
+    if (anyRunning) setChosen((current) => current ?? true);
+  }, [anyRunning]);
+  const open = chosen ?? false;
   const Chevron = open ? ChevronDown : ChevronRight;
   return (
     <div className="my-2 text-sm text-muted-foreground">
       <button
         type="button"
         aria-expanded={open}
-        onClick={() => setOpen(!open)}
+        onClick={() => setChosen(!open)}
         className="flex items-center gap-1 rounded-md px-1 py-0.5 outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring"
       >
         <Chevron className="size-4" />
-        {steps.length === 1 ? "1 step" : `${steps.length} steps`}
+        {stepsSummary(steps)}
       </button>
       {open && (
         <div className="pl-5">
-          <StepRows nodes={buildTree(steps)} tint={tint} />
+          <StepRows nodes={buildTree(steps)} tint={tint} busy={busy} />
         </div>
       )}
     </div>
@@ -164,7 +229,15 @@ function HandOffMarkers({ turn, members }: { turn: Turn; members?: GroupMember[]
   );
 }
 
-export function TurnView({ turn, members }: { turn: Turn; members?: GroupMember[] }) {
+export function TurnView({
+  turn,
+  members,
+  color,
+}: {
+  turn: Turn;
+  members?: GroupMember[];
+  color?: string;
+}) {
   const notices = turn.items.filter((item): item is TextItem => item.type === "notice");
   const steps = turn.items.filter((item): item is Step => item.type === "step");
   const texts = turn.items.filter((item): item is TextItem => item.type === "text");
@@ -173,7 +246,9 @@ export function TurnView({ turn, members }: { turn: Turn; members?: GroupMember[
     : null;
   const reply = (
     <>
-      {steps.length > 0 && <Steps steps={steps} tint={tintClass(author?.color ?? "slate")} />}
+      {steps.length > 0 && (
+        <Steps steps={steps} tint={tintClass(author?.color ?? color ?? "slate")} />
+      )}
       {texts.map((item) => (
         <Markdown key={item.id} text={item.text} members={members} />
       ))}
@@ -213,15 +288,15 @@ export function TurnView({ turn, members }: { turn: Turn; members?: GroupMember[
         </p>
       ))}
       {author ? (
-        <div data-figure-scope="" className="flex gap-3">
-          <span data-figure-anchor="" className="shrink-0">
-            <AgentAvatar name={author.name} color={author.color} className="size-8" />
+        <div className="flex gap-3">
+          <span data-figure-anchor="" className="relative shrink-0">
+            <FigureTray steps={steps} color={author.color} anchor={32} />
+            <span className="relative z-10 block">
+              <AgentAvatar name={author.name} color={author.color} className="size-8" />
+            </span>
           </span>
           <div className="flex min-w-0 flex-1 flex-col gap-2">
-            <div className="flex items-center gap-2">
-              <span className="text-sm font-medium">{author.name}</span>
-              <FigureTray steps={steps} color={author.color} />
-            </div>
+            <span className="text-sm font-medium">{author.name}</span>
             {reply}
           </div>
         </div>

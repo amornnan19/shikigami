@@ -1,20 +1,12 @@
 import { useQuery } from "@tanstack/react-query";
 import { invoke } from "@tauri-apps/api/core";
-import {
-  type CSSProperties,
-  useEffect,
-  useLayoutEffect,
-  useRef,
-  useState,
-  useSyncExternalStore,
-} from "react";
+import { type CSSProperties, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { tintClass } from "@/features/agents/colors";
 import type { Step } from "@/features/chat/api";
 import { cn } from "@/lib/utils";
 import { PaperFigure } from "./PaperFigure";
 import {
-  advanceFigures,
-  exitMs,
+  FigureTimeline,
   figuresOut,
   MAX_FIGURES,
   subagentSteps,
@@ -22,7 +14,11 @@ import {
 } from "./subagents";
 
 const REDUCED_QUERY = "(prefers-reduced-motion: reduce)";
-const SLOT_PX = 28;
+const SLOT_PX = 20;
+const FIGURE_WIDTH_PX = 24;
+const TRAY_LIFT_PX = 12;
+const TRAY_LEFT_PX = 4;
+const FIGURE_HEIGHT_PX = 32;
 
 function subscribeReduced(notify: () => void) {
   const media = window.matchMedia(REDUCED_QUERY);
@@ -49,23 +45,19 @@ export function useTrayFigures(steps: Step[]) {
   const subagents = subagentSteps(steps);
   const signature = subagents.map((step) => `${step.id}:${step.status}`).join(",");
   const [figures, setFigures] = useState<TrayFigure[]>([]);
-  const scheduled = useRef(new Set<string>());
+  const timeline = useRef<FigureTimeline | null>(null);
+  useEffect(() => {
+    const created = new FigureTimeline(setFigures);
+    timeline.current = created;
+    return () => {
+      created.dispose();
+      timeline.current = null;
+    };
+  }, []);
   // biome-ignore lint/correctness/useExhaustiveDependencies: the signature stands for the subagent steps
   useEffect(() => {
-    setFigures((previous) => advanceFigures(previous, subagents));
+    timeline.current?.update(subagents);
   }, [signature]);
-  useEffect(() => {
-    const timers: number[] = [];
-    for (const figure of figures) {
-      if (figure.phase === "working" || scheduled.current.has(figure.id)) continue;
-      scheduled.current.add(figure.id);
-      timers.push(
-        window.setTimeout(() => {
-          setFigures((current) => current.filter((candidate) => candidate.id !== figure.id));
-        }, exitMs(figure.phase)),
-      );
-    }
-  }, [figures]);
   return figures;
 }
 
@@ -74,13 +66,13 @@ export function FigureTrayView({
   running,
   tint,
   reduced,
-  origin,
+  anchor,
 }: {
   figures: TrayFigure[];
   running: number;
   tint: string;
   reduced: boolean;
-  origin: number;
+  anchor: number;
 }) {
   if (reduced) {
     if (running === 0) return null;
@@ -91,28 +83,36 @@ export function FigureTrayView({
         aria-label={label}
         title={label}
         data-figure-badge=""
-        className="relative flex h-6 items-center gap-1 pr-1 text-xs text-muted-foreground"
+        style={{ left: TRAY_LEFT_PX, top: -TRAY_LIFT_PX }}
+        className="absolute z-0 block h-8 w-8"
       >
-        <span aria-hidden="true" className="relative block h-5 w-6">
-          <span className="absolute top-0 left-2 block h-5 w-4 -rotate-6 opacity-60">
-            <PaperFigure tintClass={tint} />
-          </span>
-          <span className="absolute top-0 left-0 block h-5 w-4">
-            <PaperFigure tintClass={tint} />
-          </span>
+        <span
+          aria-hidden="true"
+          className="absolute top-0 left-2 block h-8 w-6 -rotate-6 opacity-60"
+        >
+          <PaperFigure tintClass={tint} />
         </span>
-        <span aria-hidden="true">{running}</span>
+        <span aria-hidden="true" className="absolute top-0 left-0 block h-8 w-6">
+          <PaperFigure tintClass={tint} />
+        </span>
+        <span
+          aria-hidden="true"
+          className="absolute top-0 -right-2 rounded-full bg-background px-1 text-[10px] leading-4 font-medium text-foreground ring-1 ring-border"
+        >
+          {running}
+        </span>
       </span>
     );
   }
   if (figures.length === 0) return null;
   const shown = figures.slice(0, MAX_FIGURES);
   const extra = figures.length - shown.length;
+  const fromY = anchor / 2 - (FIGURE_HEIGHT_PX / 2 - TRAY_LIFT_PX);
   return (
     <span
       data-figure-tray=""
-      style={{ "--origin": `${origin}px` } as CSSProperties}
-      className="relative flex h-8 items-center gap-1"
+      style={{ left: TRAY_LEFT_PX, top: -TRAY_LIFT_PX }}
+      className="absolute z-0 flex"
     >
       {shown.map((figure, slot) => (
         <span
@@ -122,14 +122,21 @@ export function FigureTrayView({
           title={figure.type}
           data-figure={figure.id}
           data-phase={figure.phase}
-          style={{ "--from-x": `${-(origin + slot * SLOT_PX)}px` } as CSSProperties}
-          className={cn("paper-figure relative block h-7 w-6", `paper-figure-${figure.phase}`)}
+          style={
+            {
+              "--from-x": `${anchor / 2 - (TRAY_LEFT_PX + slot * SLOT_PX + FIGURE_WIDTH_PX / 2)}px`,
+              "--from-y": `${fromY}px`,
+              marginLeft: slot === 0 ? 0 : SLOT_PX - FIGURE_WIDTH_PX,
+              rotate: `${slot * 5}deg`,
+            } as CSSProperties
+          }
+          className={cn("paper-figure relative block h-8 w-6", `paper-figure-${figure.phase}`)}
         >
           <PaperFigure tintClass={figure.phase === "dissolving" ? "text-red-600" : tint} />
           {extra > 0 && slot === shown.length - 1 && (
             <span
               data-figure-more=""
-              className="absolute -right-1 -bottom-1 rounded-full bg-foreground px-1 text-[10px] leading-4 text-background"
+              className="absolute -right-2 -bottom-1 rounded-full bg-background px-1 text-[10px] leading-4 font-medium text-foreground ring-1 ring-border"
             >
               +{extra}
             </span>
@@ -140,33 +147,24 @@ export function FigureTrayView({
   );
 }
 
-export function FigureTray({ steps, color }: { steps: Step[]; color: string }) {
+export function FigureTray({
+  steps,
+  color,
+  anchor,
+}: {
+  steps: Step[];
+  color: string;
+  anchor: number;
+}) {
   const figures = useTrayFigures(steps);
   const reduced = useReducedMotion();
-  const holder = useRef<HTMLSpanElement>(null);
-  const [origin, setOrigin] = useState(44);
-  const count = figures.length;
-  // biome-ignore lint/correctness/useExhaustiveDependencies: measure again when the figures change
-  useLayoutEffect(() => {
-    const tray = holder.current?.querySelector("[data-figure-tray]");
-    const anchor = holder.current
-      ?.closest("[data-figure-scope]")
-      ?.querySelector("[data-figure-anchor]");
-    if (tray && anchor) {
-      setOrigin(
-        Math.round(tray.getBoundingClientRect().left - anchor.getBoundingClientRect().left),
-      );
-    }
-  }, [count]);
   return (
-    <span ref={holder} className="contents">
-      <FigureTrayView
-        figures={figures}
-        running={figuresOut(steps)}
-        tint={tintClass(color)}
-        reduced={reduced}
-        origin={origin}
-      />
-    </span>
+    <FigureTrayView
+      figures={figures}
+      running={figuresOut(steps)}
+      tint={tintClass(color)}
+      reduced={reduced}
+      anchor={anchor}
+    />
   );
 }

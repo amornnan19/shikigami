@@ -12,7 +12,7 @@ function view(figures: TrayFigure[], reduced: boolean, running = figures.length)
       running={running}
       tint="text-red-500"
       reduced={reduced}
-      origin={40}
+      anchor={36}
     />,
   );
 }

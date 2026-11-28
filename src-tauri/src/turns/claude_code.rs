@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use serde_json::Value;
@@ -107,6 +107,10 @@ pub enum Parsed {
         failed: bool,
         output: String,
     },
+    StepBackground {
+        step_id: String,
+        output: String,
+    },
     Compacted,
     Result {
         is_error: bool,
@@ -150,6 +154,7 @@ pub struct StreamParser {
     messages: HashMap<String, MessageTexts>,
     steps: HashMap<String, String>,
     step_ids: HashMap<String, String>,
+    subagents: HashSet<String>,
 }
 
 fn new_id() -> String {
@@ -212,15 +217,55 @@ fn subagent_input(kind: &str, task: &str, input: &Value) -> String {
         .get("prompt")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    truncate(
-        &format!(
+    let build = |prompt: &str| {
+        format!(
             "{{\"subagent_type\":{},\"description\":{},\"prompt\":{}}}",
             quoted(kind),
             quoted(task),
             quoted(prompt)
-        ),
-        DETAIL_LIMIT,
-    )
+        )
+    };
+    let mut keep = prompt.chars().count();
+    let mut shown = prompt.to_owned();
+    loop {
+        let json = build(&shown);
+        if json.len() <= DETAIL_LIMIT || keep == 0 {
+            return json;
+        }
+        keep = keep * 3 / 4;
+        shown = format!("{}…", first_chars(prompt, keep));
+    }
+}
+
+pub fn is_subagent_kind(kind: &str) -> bool {
+    SUBAGENT_TOOLS.contains(&kind)
+}
+
+pub fn subagent_parts(detail: &str) -> (Option<String>, Option<String>) {
+    let (input, result) = match detail.split_once("\n\n") {
+        Some((input, result)) => (input, Some(result)),
+        None => (detail, None),
+    };
+    let task = serde_json::from_str::<Value>(input)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("prompt")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .filter(|prompt| !prompt.is_empty());
+    let result = result.filter(|text| !text.is_empty()).map(str::to_owned);
+    (task, result)
+}
+
+fn is_async_launch(value: &Value, text: &str) -> bool {
+    value
+        .pointer("/tool_use_result/status")
+        .and_then(Value::as_str)
+        == Some("async_launched")
+        || text.contains("async_launched")
+        || text.starts_with("Async agent launched")
 }
 
 fn result_text(content: &Value) -> String {
@@ -406,7 +451,8 @@ impl StreamParser {
         let id = new_id();
         self.steps.insert(tool_use_id.to_owned(), id.clone());
         self.step_ids.insert(tool_use_id.to_owned(), id.clone());
-        let (title, input) = if SUBAGENT_TOOLS.contains(&kind) {
+        let (title, input) = if is_subagent_kind(kind) {
+            self.subagents.insert(tool_use_id.to_owned());
             let (subagent, task) = subagent_label(&input);
             let json = subagent_input(&subagent, &task, &input);
             let title = if task.is_empty() { subagent } else { task };
@@ -430,24 +476,31 @@ impl StreamParser {
         let Some(blocks) = value.pointer("/message/content").and_then(Value::as_array) else {
             return Vec::new();
         };
-        blocks
-            .iter()
-            .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
-            .filter_map(|block| {
-                let tool_use_id = block.get("tool_use_id").and_then(Value::as_str)?;
-                let step_id = self.steps.remove(tool_use_id)?;
-                Some(Parsed::StepEnded {
+        let mut parsed = Vec::new();
+        for block in blocks {
+            if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                continue;
+            }
+            let Some(tool_use_id) = block.get("tool_use_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(step_id) = self.steps.remove(tool_use_id) else {
+                continue;
+            };
+            let raw = block.get("content").map(result_text).unwrap_or_default();
+            let output = truncate(&self.redactor.redact(&raw), DETAIL_LIMIT);
+            let failed = block.get("is_error").and_then(Value::as_bool) == Some(true);
+            if !failed && self.subagents.contains(tool_use_id) && is_async_launch(value, &raw) {
+                parsed.push(Parsed::StepBackground { step_id, output });
+            } else {
+                parsed.push(Parsed::StepEnded {
                     step_id,
-                    failed: block.get("is_error").and_then(Value::as_bool) == Some(true),
-                    output: truncate(
-                        &self
-                            .redactor
-                            .redact(&block.get("content").map(result_text).unwrap_or_default()),
-                        DETAIL_LIMIT,
-                    ),
-                })
-            })
-            .collect()
+                    failed,
+                    output,
+                });
+            }
+        }
+        parsed
     }
 
     fn result(value: &Value) -> Vec<Parsed> {
@@ -832,6 +885,58 @@ mod tests {
         );
         assert!(!format!("{parsed:?}").contains("SECRETSECRET"));
         assert!(format!("{parsed:?}").contains("[redacted]"));
+    }
+
+    #[test]
+    fn a_subagent_launched_in_the_background_reports_a_launch_and_keeps_its_children() {
+        let mut parser = StreamParser::default();
+        let parsed = parse_values(
+            &mut parser,
+            &[
+                serde_json::json!({"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"bg","name":"Agent","input":{"description":"later","run_in_background":true}}]}}),
+                serde_json::json!({"type":"user","tool_use_result":{"status":"async_launched","agentId":"x"},"message":{"content":[{"type":"tool_result","tool_use_id":"bg","content":[{"type":"text","text":"Async agent launched successfully.\nagentId: x"}]}]}}),
+                serde_json::json!({"type":"assistant","parent_tool_use_id":"bg","message":{"id":"m2","content":[{"type":"tool_use","id":"in","name":"Bash","input":{"command":"ls"}}]}}),
+            ],
+        );
+        let started = started_steps(&parsed);
+        assert_eq!(started.len(), 2);
+        assert_eq!(
+            started[1].parent_step_id.as_deref(),
+            Some(started[0].id.as_str())
+        );
+        assert!(ended_steps(&parsed).is_empty());
+        assert!(matches!(
+            &parsed[1],
+            Parsed::StepBackground { step_id, output }
+                if step_id == &started[0].id && output.contains("Async agent launched")
+        ));
+    }
+
+    #[test]
+    fn a_launch_marker_on_an_ordinary_tool_or_a_failed_subagent_ends_the_step() {
+        let mut parser = StreamParser::default();
+        let parsed = parse_values(
+            &mut parser,
+            &[
+                serde_json::json!({"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"b","name":"Bash","input":{"command":"echo"}},{"type":"tool_use","id":"a","name":"Agent","input":{"description":"x"}}]}}),
+                serde_json::json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"b","content":"async_launched","is_error":false},{"type":"tool_result","tool_use_id":"a","content":"async_launched","is_error":true}]}}),
+            ],
+        );
+        assert_eq!(ended_steps(&parsed).len(), 2);
+    }
+
+    #[test]
+    fn the_saved_subagent_input_stays_valid_json_and_splits_into_task_and_result() {
+        let long = "p\"\n".repeat(5000);
+        let json = subagent_input("Explore", "look", &serde_json::json!({"prompt": long}));
+        assert!(json.len() <= DETAIL_LIMIT);
+        let value: Value = serde_json::from_str(&json).unwrap();
+        assert!(value["prompt"].as_str().unwrap().ends_with('…'));
+        let (task, result) = subagent_parts(&format!("{json}\n\nfound it"));
+        assert!(task.unwrap().starts_with("p\"\n"));
+        assert_eq!(result.as_deref(), Some("found it"));
+        assert_eq!(subagent_parts(&json).1, None);
+        assert_eq!(subagent_parts("not json"), (None, None));
     }
 
     #[test]
