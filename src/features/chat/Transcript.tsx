@@ -14,6 +14,7 @@ export function Transcript({
   onLoadOlder,
   members,
   color,
+  name,
 }: {
   turns: Turn[];
   hasMore: boolean;
@@ -22,6 +23,7 @@ export function Transcript({
   onLoadOlder: () => void;
   members?: GroupMember[];
   color?: string;
+  name?: string;
 }) {
   const scroller = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
@@ -69,7 +71,7 @@ export function Transcript({
           <p className="py-24 text-center text-muted-foreground">No messages yet.</p>
         )}
         {turns.map((turn) => (
-          <TurnView key={turn.id} turn={turn} members={members} color={color} />
+          <TurnView key={turn.id} turn={turn} members={members} color={color} name={name} />
         ))}
       </div>
     </div>

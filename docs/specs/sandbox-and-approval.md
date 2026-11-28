@@ -43,7 +43,6 @@ enforced, the agent does not run rather than run unprotected.
 
 - Every shell command. It runs inside the sandbox even when allowed: it can write only inside the
   folder and the temporary folder, cannot read protected locations, and has no network.
-- Reading or listing anything outside the folder (outside protected locations).
 - Fetching a web page or searching the web.
 - Any other tool the agent's CLI offers that is not in the list above.
 
@@ -52,6 +51,7 @@ enforced, the agent does not run rather than run unprotected.
 - Reading protected locations: SSH and GPG keys, cloud and container credentials, package-registry and
   git credentials, the macOS keychains, browser profiles, Mail and Messages data, shell history and
   shell configuration files, other agents' workspaces, and Shikigami's data folder.
+- Reading or listing anything outside the folder (for now it is refused, not asked about).
 - Writing outside the folder and the temporary folder.
 - Network access from shell commands.
 - Running a command outside the sandbox.

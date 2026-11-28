@@ -49,7 +49,7 @@ pub fn arguments(
     ]
     .into_iter()
     .chain(ISOLATION_FLAGS)
-    .chain(["none"])
+    .chain(["host"])
     .map(str::to_owned)
     .collect();
     if model != "default" {
@@ -567,7 +567,7 @@ const ISOLATION: [&str; 7] = [
     "--permission-mode",
     "manual",
     "--permission-prompts",
-    "none",
+    "host",
 ];
 
 #[cfg(test)]
@@ -642,7 +642,7 @@ mod tests {
                 "--permission-mode",
                 "manual",
                 "--permission-prompts",
-                "none",
+                "host",
                 "--session-id",
                 "abc"
             ]

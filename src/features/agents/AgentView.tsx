@@ -75,6 +75,7 @@ export function AgentView({
         loaded={query.isSuccess}
         onLoadOlder={loadOlder}
         color={agent.color}
+        name={agent.name}
       />
       <QueueList scope={scope} messages={queue.data ?? []} />
       {waiting > 0 && !running && blockedReason === null && (

@@ -2,6 +2,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
 use super::claude_code::{self, Session};
+use crate::approvals::ApprovalView;
 
 pub const PAGE_SIZE: usize = 20;
 
@@ -51,6 +52,7 @@ pub enum ItemView {
     Text { id: String, text: String },
     Notice { id: String, text: String },
     Step(StepView),
+    Approval(ApprovalView),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -493,6 +495,7 @@ pub fn sweep_interrupted(connection: &Connection, now: i64) -> rusqlite::Result<
            AND turn_id IN (SELECT id FROM turns WHERE status = 'running')",
         [],
     )?;
+    crate::approvals::store::sweep_pending(&transaction, now)?;
     let count = transaction.execute(
         "UPDATE turns SET status = 'interrupted', ended_at = ?1 WHERE status = 'running'",
         [now],
@@ -564,6 +567,9 @@ fn load_items(connection: &Connection, turn_id: &str) -> rusqlite::Result<(Strin
     for row in rows {
         let (step, created_at) = row?;
         ordered.push((created_at, 1, ItemView::Step(step)));
+    }
+    for approval in crate::approvals::store::for_turn(connection, turn_id)? {
+        ordered.push((approval.created_at, 2, ItemView::Approval(approval)));
     }
     ordered.sort_by_key(|(created_at, rank, _)| (*created_at, *rank));
     Ok((
@@ -854,5 +860,44 @@ mod tests {
         assert!(matches!(&items[2], ItemView::Notice { .. }));
         assert!(matches!(&items[3], ItemView::Text { text, .. } if text == "second"));
         assert_eq!(page.turns[0].user_message, "go");
+    }
+
+    #[test]
+    fn cards_come_back_among_the_items_with_their_outcome_in_the_order_they_were_written() {
+        let (_dir, db) = database();
+        let begun = begin(&db, "go", 10).unwrap();
+        db.with_connection(|c| {
+            insert_message(c, "t1", "a", &begun.turn_id, "assistant", "before", 11).unwrap();
+            for (id, at) in [("c1", 12), ("c2", 14)] {
+                crate::approvals::store::insert(
+                    c,
+                    &crate::approvals::store::NewApproval {
+                        id,
+                        turn_id: &begun.turn_id,
+                        tool: "Bash",
+                        summary: "ls",
+                        detail: "{}",
+                        reason: None,
+                        created_at: at,
+                    },
+                )
+                .unwrap();
+            }
+            crate::approvals::store::resolve(c, "c1", &crate::approvals::store::DENIED_BY_USER, 13)
+                .unwrap();
+            insert_message(c, "t2", "a", &begun.turn_id, "assistant", "after", 15).unwrap();
+        });
+        let page = db.with_connection(|c| conversation(c, "a", None).unwrap());
+        let items = &page.turns[0].items;
+        assert_eq!(items.len(), 4);
+        assert!(
+            matches!(&items[1], ItemView::Approval(card) if card.id == "c1" && card.status == "denied")
+        );
+        assert!(
+            matches!(&items[2], ItemView::Approval(card) if card.id == "c2" && card.status == "pending")
+        );
+        let json = serde_json::to_value(&items[1]).unwrap();
+        assert_eq!(json["type"], "approval");
+        assert_eq!(json["answeredBy"], "user");
     }
 }

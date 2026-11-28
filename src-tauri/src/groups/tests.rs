@@ -904,3 +904,32 @@ fn a_deleted_agent_resolves_the_debt_of_its_waiting_hand_off() {
         )]
     );
 }
+
+#[test]
+fn a_group_with_an_open_card_is_marked_as_waiting_for_the_user() {
+    let fx = Fixture::new();
+    let (group, agent, _) = fx.pair_group("Team", Some(&fx.project("repo")));
+    assert!(!fx.groups()[0].waiting_for_you);
+    fx.db.with_connection(|c| {
+        c.execute(
+            "INSERT INTO turns (id, agent_id, status, started_at, group_id) VALUES ('t', ?1, 'running', 1, ?2)",
+            params![agent, group.id],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO approvals (id, turn_id, tool, summary, detail, status, created_at)
+             VALUES ('p', 't', 'Bash', 'ls', '{}', 'pending', 1)",
+            [],
+        )
+        .unwrap();
+    });
+    assert!(fx.groups()[0].waiting_for_you);
+    fx.db.with_connection(|c| {
+        c.execute(
+            "UPDATE approvals SET status = 'denied', answered_by = 'user'",
+            [],
+        )
+        .unwrap()
+    });
+    assert!(!fx.groups()[0].waiting_for_you);
+}

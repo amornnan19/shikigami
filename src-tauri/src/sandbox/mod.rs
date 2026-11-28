@@ -282,7 +282,7 @@ pub fn turn_settings(
         },
         "permissions": {
             "blockReadsOutsideWorkingDirectories": true,
-            "ask": ["WebFetch", "WebSearch"],
+            "ask": ["Bash", "WebFetch", "WebSearch"],
             "allow": [format!("Read({own}/**)"), format!("Edit({own}/**)")],
             "deny": deny
         }
@@ -339,7 +339,7 @@ mod tests {
         );
         assert_eq!(
             value["permissions"]["ask"],
-            json!(["WebFetch", "WebSearch"])
+            json!(["Bash", "WebFetch", "WebSearch"])
         );
         assert_eq!(
             value["permissions"]["allow"],

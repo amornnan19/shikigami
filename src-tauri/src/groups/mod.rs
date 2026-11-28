@@ -120,6 +120,7 @@ pub struct Group {
     pub created_at: i64,
     pub last_activity_at: i64,
     pub attention: Option<Attention>,
+    pub waiting_for_you: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -167,19 +168,22 @@ pub(crate) fn derive_attention(folder_exists: bool, member_count: usize) -> Opti
 }
 
 fn list_with(connection: &rusqlite::Connection) -> Result<Vec<Group>, GroupError> {
-    Ok(store::list(connection)?
+    store::list(connection)?
         .into_iter()
-        .map(|(row, members)| Group {
-            attention: derive_attention(Path::new(&row.folder_path).is_dir(), members.len()),
-            id: row.id,
-            name: row.name,
-            folder_path: row.folder_path,
-            members,
-            lead_agent_id: row.lead_agent_id,
-            created_at: row.created_at,
-            last_activity_at: row.last_activity_at,
+        .map(|(row, members)| {
+            Ok(Group {
+                attention: derive_attention(Path::new(&row.folder_path).is_dir(), members.len()),
+                waiting_for_you: crate::approvals::group_waiting(connection, &row.id)?,
+                id: row.id,
+                name: row.name,
+                folder_path: row.folder_path,
+                members,
+                lead_agent_id: row.lead_agent_id,
+                created_at: row.created_at,
+                last_activity_at: row.last_activity_at,
+            })
         })
-        .collect())
+        .collect()
 }
 
 fn find_with(connection: &rusqlite::Connection, group_id: &str) -> Result<Group, GroupError> {

@@ -25,7 +25,24 @@ export interface TextItem {
   text: string;
 }
 
-export type Item = Step | TextItem;
+export type ApprovalStatus = "pending" | "allowed" | "denied" | "timed-out";
+export type ApprovalAnsweredBy = "user" | "timeout" | "stop" | "shutdown";
+
+export interface Approval {
+  type: "approval";
+  id: string;
+  tool: string;
+  summary: string;
+  detail: string;
+  reason: string | null;
+  status: ApprovalStatus;
+  answeredBy: ApprovalAnsweredBy | null;
+  createdAt: number;
+  answeredAt: number | null;
+  folder: string;
+}
+
+export type Item = Step | TextItem | Approval;
 
 export interface HandOff {
   agentId: string;
@@ -64,6 +81,8 @@ export type TurnEvent = { agentId: string; groupId: string | null; turnId: strin
       result: string | null;
     }
   | { kind: "notice"; itemId: string; text: string }
+  | { kind: "approval-requested"; approval: Omit<Approval, "type"> }
+  | { kind: "approval-resolved"; approval: Omit<Approval, "type"> }
   | { kind: "ended"; status: TurnStatus; error: string | null }
 );
 
@@ -102,6 +121,10 @@ export function editQueued(queuedId: string, text: string) {
 
 export function removeQueued(queuedId: string) {
   return invoke<void>("remove_queued", { queuedId });
+}
+
+export function answerApproval(approvalId: string, allow: boolean) {
+  return invoke<void>("answer_approval", { approvalId, allow });
 }
 
 export function onQueueChanged(handler: (agentId: string) => void) {

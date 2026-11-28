@@ -75,7 +75,7 @@ describe("the sandbox", () => {
     expect(settings?.sandbox.credentials.envVars).toEqual([
       { name: "ANTHROPIC_API_KEY", mode: "deny" },
     ]);
-    expect(settings?.permissions.ask).toEqual(["WebFetch", "WebSearch"]);
+    expect(settings?.permissions.ask).toEqual(["Bash", "WebFetch", "WebSearch"]);
     expect(sandbox?.filesystem.denyRead).toContain("/Volumes");
     expect(settings?.permissions.allow).toEqual([`Read(/${folder}/**)`, `Edit(/${folder}/**)`]);
     expect(settings?.permissions.deny).toContain(`Read(/${join(home, ".ssh")}/**)`);
