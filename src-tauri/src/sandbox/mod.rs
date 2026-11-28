@@ -131,8 +131,17 @@ pub fn fixed_protected(home: Option<&Path>) -> Vec<PathBuf> {
         .collect()
 }
 
-pub fn tools_ignore_settings(tools: &[String]) -> bool {
-    tools.is_empty() || tools.iter().any(|tool| tool == CANARY_TOOL)
+const REQUIRED_TOOLS: [&str; 3] = ["Read", "Edit", "Write"];
+
+pub fn canary_listed(tools: &[String]) -> bool {
+    tools.iter().any(|tool| tool == CANARY_TOOL)
+}
+
+pub fn first_init_unsafe(tools: &[String]) -> bool {
+    canary_listed(tools)
+        || REQUIRED_TOOLS
+            .iter()
+            .any(|required| !tools.iter().any(|tool| tool == required))
 }
 
 pub fn inside_protected_location(folder: &Path, home: Option<&Path>) -> bool {
@@ -328,9 +337,22 @@ mod tests {
         let listed = |names: &[&str]| -> Vec<String> {
             names.iter().map(|name| (*name).to_owned()).collect()
         };
-        assert!(!tools_ignore_settings(&listed(&["Read", "Bash"])));
-        assert!(tools_ignore_settings(&listed(&["Read", "NotebookEdit"])));
-        assert!(tools_ignore_settings(&[]));
+        assert!(!first_init_unsafe(&listed(&[
+            "Read", "Edit", "Write", "Bash"
+        ])));
+        assert!(first_init_unsafe(&listed(&[
+            "Read",
+            "Edit",
+            "Write",
+            "NotebookEdit"
+        ])));
+        for missing in [["Edit", "Write"], ["Read", "Write"], ["Read", "Edit"]] {
+            assert!(first_init_unsafe(&listed(&missing)), "{missing:?}");
+        }
+        assert!(first_init_unsafe(&[]));
+        assert!(canary_listed(&listed(&["Read", "NotebookEdit"])));
+        assert!(!canary_listed(&listed(&["Bash"])));
+        assert!(!canary_listed(&[]));
     }
 
     #[test]

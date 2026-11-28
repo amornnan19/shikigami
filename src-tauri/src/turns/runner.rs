@@ -187,6 +187,7 @@ struct Attempt {
     result: Option<(bool, String)>,
     api_error_status: Option<u64>,
     compacted: bool,
+    init_checked: bool,
     settings_ignored: bool,
     failure: Option<String>,
     stderr: StderrSummary,
@@ -266,10 +267,14 @@ impl TempFile {
             "{prefix}-{}.{extension}",
             uuid::Uuid::new_v4().simple()
         ));
+        Self::create_at(path, 0o600, text)
+    }
+
+    fn create_at(path: PathBuf, mode: u32, text: &str) -> io::Result<Self> {
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .mode(0o600)
+            .mode(mode)
             .open(&path)?;
         let written = file.write_all(text.as_bytes());
         let guard = Self(Some(path));
@@ -288,6 +293,21 @@ impl Drop for TempFile {
             let _ = fs::remove_file(path);
         }
     }
+}
+
+fn shell_quoted(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+fn key_files(temp_dir: &Path, key: &str) -> io::Result<(TempFile, TempFile)> {
+    fs::create_dir_all(temp_dir)?;
+    let id = uuid::Uuid::new_v4().simple();
+    let key_path = temp_dir.join(format!("key-{id}"));
+    let helper_path = temp_dir.join(format!("key-helper-{id}.sh"));
+    let key_file = TempFile::create_at(key_path.clone(), 0o600, key)?;
+    let script = format!("#!/bin/sh\nexec /bin/cat {}\n", shell_quoted(&key_path));
+    let helper = TempFile::create_at(helper_path, 0o700, &script)?;
+    Ok((key_file, helper))
 }
 
 fn safe_end(redactor: &Redactor, raw: &str) -> usize {
@@ -554,7 +574,14 @@ impl Runner<'_> {
     fn handle(&mut self, parsed: Parsed, attempt: &mut Attempt) {
         match parsed {
             Parsed::Tools(tools) => {
-                if sandbox::tools_ignore_settings(&tools) {
+                let first = !attempt.init_checked;
+                attempt.init_checked = true;
+                let unsafe_list = if first {
+                    sandbox::first_init_unsafe(&tools)
+                } else {
+                    sandbox::canary_listed(&tools)
+                };
+                if unsafe_list {
                     attempt.settings_ignored = true;
                     attempt.failure = Some(sandbox::UNAVAILABLE_MESSAGE.to_owned());
                     self.registry.kill(&self.agent_id, &self.turn_id);
@@ -709,28 +736,29 @@ impl Runner<'_> {
             .stderr(Stdio::piped())
             .process_group(0)
             .kill_on_drop(true);
-        if let ApiKey::Present(secret) = key {
-            command
-                .env(sandbox::API_KEY_VARIABLE, secret.expose())
-                .env(sandbox::SCRUB_VARIABLE, "1");
+        if matches!(key, ApiKey::Present(_)) {
+            command.env(sandbox::SCRUB_VARIABLE, "1");
         }
         Some(command)
     }
 
-    fn settings_file(&self, launch: &Launch) -> Option<TempFile> {
+    fn settings_file(&self, launch: &Launch, helper: Option<&Path>) -> Option<TempFile> {
         let home = launch.sandbox.home.as_deref()?;
         let others: Vec<PathBuf> = crate::agents::recorded_workspaces(self.db)
             .ok()?
             .iter()
             .map(|path| sandbox::real_path(path))
             .collect();
-        let settings = sandbox::turn_settings(
+        let mut settings = sandbox::turn_settings(
             &sandbox::real_path(&launch.workspace),
             &sandbox::real_path(&launch.sandbox.temp),
             home,
             &sandbox::real_path(&launch.sandbox.data_dir),
             &others,
         );
+        if let Some(helper) = helper {
+            settings["apiKeyHelper"] = serde_json::Value::String(shell_quoted(helper));
+        }
         let text = serde_json::to_string(&settings).ok()?;
         TempFile::create(&self.registry.temp_dir(), "settings", "json", &text).ok()
     }
@@ -752,7 +780,22 @@ impl Runner<'_> {
                 return attempt;
             }
         }
-        let Some(settings) = self.settings_file(launch) else {
+        let key_guard = match key {
+            ApiKey::Present(secret) => {
+                match key_files(&self.registry.temp_dir(), secret.expose()) {
+                    Ok(files) => Some(files),
+                    Err(_) => {
+                        attempt.failure = Some("Could not start Claude Code.".to_owned());
+                        return attempt;
+                    }
+                }
+            }
+            _ => None,
+        };
+        let helper_path = key_guard
+            .as_ref()
+            .and_then(|(_, helper)| helper.path().map(Path::to_path_buf));
+        let Some(settings) = self.settings_file(launch, helper_path.as_deref()) else {
             attempt.failure = Some(sandbox::UNAVAILABLE_MESSAGE.to_owned());
             return attempt;
         };
@@ -846,13 +889,19 @@ impl Runner<'_> {
             };
             match read {
                 Ok(Line::Text(line)) => {
+                    if !attempt.init_checked && claude_code::is_model_or_tool_event(&line) {
+                        attempt.settings_ignored = true;
+                        attempt.failure = Some(sandbox::UNAVAILABLE_MESSAGE.to_owned());
+                        self.registry.kill(&self.agent_id, &self.turn_id);
+                        break;
+                    }
                     for parsed in parser.line(&line) {
                         self.handle(parsed, &mut attempt);
                         if attempt.settings_ignored {
                             break;
                         }
                     }
-                    if attempt.result.is_some() {
+                    if attempt.result.is_some() || attempt.settings_ignored {
                         break;
                     }
                 }
@@ -978,6 +1027,13 @@ async fn run_turn(
         .group
         .as_ref()
         .and_then(|group| group.folder_notice.as_deref())
+    {
+        runner.add_notice(notice);
+    }
+    if let Some(notice) = launch
+        .group
+        .as_ref()
+        .and_then(|group| group.member_notice.as_deref())
     {
         runner.add_notice(notice);
     }
@@ -1229,7 +1285,7 @@ mod tests {
     fn recording(world: &World, rest: &str) -> String {
         let records = world.records().display();
         format!(
-            "n=$(ls \"{records}\" | grep -c '^args' || true)\nfor a in \"$@\"; do echo \"$a\"; done > \"{records}/args.$n\"\nprev=\"\"; for a in \"$@\"; do if [ \"$prev\" = \"--settings\" ]; then cp \"$a\" \"{records}/settings.$n\"; stat -f %Lp \"$a\" > \"{records}/settings-mode.$n\"; fi; if [ \"$prev\" = \"--append-system-prompt-file\" ]; then cp \"$a\" \"{records}/prompt.$n\"; echo \"$a\" > \"{records}/promptpath.$n\"; fi; prev=\"$a\"; done\ncat > \"{records}/stdin.$n\"\nprintf '%s' \"$ANTHROPIC_API_KEY\" > \"{records}/key.$n\"\nprintf '%s' \"$ANTHROPIC_AUTH_TOKEN\" > \"{records}/token.$n\"\nprintf '%s' \"$ANTHROPIC_BASE_URL\" > \"{records}/base.$n\"\nprintf '%s' \"$LC_KEPT\" > \"{records}/kept.$n\"\n{rest}"
+            "n=$(ls \"{records}\" | grep -c '^args' || true)\nfor a in \"$@\"; do echo \"$a\"; done > \"{records}/args.$n\"\nprev=\"\"; for a in \"$@\"; do if [ \"$prev\" = \"--settings\" ]; then cp \"$a\" \"{records}/settings.$n\"; stat -f %Lp \"$a\" > \"{records}/settings-mode.$n\"; fi; if [ \"$prev\" = \"--append-system-prompt-file\" ]; then cp \"$a\" \"{records}/prompt.$n\"; echo \"$a\" > \"{records}/promptpath.$n\"; fi; prev=\"$a\"; done\nhelper=$(sed -n 's/.*\"apiKeyHelper\":\"\\([^\"]*\\)\".*/\\1/p' \"{records}/settings.$n\" 2>/dev/null | sed \"s/^'//; s/'$//\")\nif [ -n \"$helper\" ]; then HELPER_KEY=$(\"$helper\"); printf '%s' \"$HELPER_KEY\" > \"{records}/helperkey.$n\"; echo \"$helper\" > \"{records}/helperpath.$n\"; stat -f %Lp \"$helper\" > \"{records}/helpermode.$n\"; keyfile=$(sed -n \"s/.*cat '\\(.*\\)'$/\\1/p\" \"$helper\"); echo \"$keyfile\" > \"{records}/keypath.$n\"; stat -f %Lp \"$keyfile\" > \"{records}/keymode.$n\"; fi\ncat > \"{records}/stdin.$n\"\nprintf '%s' \"$ANTHROPIC_API_KEY\" > \"{records}/key.$n\"\nprintf '%s' \"$ANTHROPIC_AUTH_TOKEN\" > \"{records}/token.$n\"\nprintf '%s' \"$ANTHROPIC_BASE_URL\" > \"{records}/base.$n\"\nprintf '%s' \"$LC_KEPT\" > \"{records}/kept.$n\"\n{rest}"
         )
     }
 
@@ -1345,11 +1401,13 @@ mod tests {
             )
             .await;
         world.send("two", ApiKey::Subscription).await;
-        assert_eq!(read(&world, "key.0"), "sk-ant-saved-0000");
+        assert_eq!(read(&world, "key.0"), "");
+        assert_eq!(read(&world, "helperkey.0"), "sk-ant-saved-0000");
         assert_eq!(read(&world, "token.0"), "");
         assert_eq!(read(&world, "base.0"), "");
         assert_eq!(read(&world, "kept.0"), "kept");
         assert_eq!(read(&world, "key.1"), "");
+        assert!(!has_record(&world, "helperkey.1"));
         assert_eq!(read(&world, "token.1"), "");
         assert_eq!(read(&world, "base.1"), "");
     }
@@ -1424,7 +1482,8 @@ mod tests {
             .lines()
             .filter(|line| line.starts_with("ANTHROPIC_"))
             .collect();
-        assert_eq!(anthropic, ["ANTHROPIC_API_KEY=sk-ant-saved-0000"]);
+        assert!(anthropic.is_empty(), "{anthropic:?}");
+        assert!(!text.contains("sk-ant-saved-0000"));
     }
 
     #[tokio::test]
@@ -1714,7 +1773,7 @@ mod tests {
         let leaky = World::new();
         leaky.install(&recording(
             &leaky,
-            "echo \"bad key $ANTHROPIC_API_KEY\" >&2\nexit 1",
+            "echo \"bad key $HELPER_KEY\" >&2\nexit 1",
         ));
         leaky
             .send(
@@ -1884,8 +1943,7 @@ mod tests {
             .db
             .with_connection(|c| c.execute("UPDATE agents SET provider_session_id = 'old-id'", []))
             .unwrap();
-        let init =
-            r#"{"type":"system","subtype":"init","tools":["Read","Bash"],"session_id":"old-id"}"#;
+        let init = r#"{"type":"system","subtype":"init","tools":["Read","Edit","Write","Bash"],"session_id":"old-id"}"#;
         world.install(&recording(
             &world,
             &format!("echo '{init}'\necho 'died' >&2\nexit 1"),
@@ -1917,7 +1975,7 @@ mod tests {
     async fn a_key_in_a_tool_step_a_reply_and_an_error_is_stored_and_emitted_redacted() {
         let world = World::new();
         let lines = stream_lines(&[
-            serde_json::json!({"type":"system","subtype":"init","tools":["Read","Bash"],"session_id":"s1"}),
+            serde_json::json!({"type":"system","subtype":"init","tools":["Read","Edit","Write","Bash"],"session_id":"s1"}),
             serde_json::json!({"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":format!("echo {SAVED_KEY}")}}]}}),
             serde_json::json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":format!("out {SAVED_KEY} and sk-ant-another-token-0123456789"),"is_error":false}]}}),
             serde_json::json!({"type":"assistant","message":{"id":"m2","content":[{"type":"text","text":format!("the key is {SAVED_KEY}")}]}}),
@@ -1954,7 +2012,7 @@ mod tests {
         let world = World::new();
         let big = "z".repeat(claude_code::DETAIL_LIMIT * 3);
         let lines = stream_lines(&[
-            serde_json::json!({"type":"system","subtype":"init","tools":["Read","Bash"],"session_id":"s1"}),
+            serde_json::json!({"type":"system","subtype":"init","tools":["Read","Edit","Write","Bash"],"session_id":"s1"}),
             serde_json::json!({"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"agent1","name":"Agent","input":{"subagent_type":"Explore","description":"Look around","prompt":format!("find {SAVED_KEY}")}}]}}),
             serde_json::json!({"type":"assistant","parent_tool_use_id":"agent1","message":{"id":"m2","content":[{"type":"tool_use","id":"inner1","name":"Bash","input":{"command":format!("echo {SAVED_KEY}")}},{"type":"tool_use","id":"inner2","name":"Read","input":{"file_path":"/a"}}]}}),
             serde_json::json!({"type":"user","parent_tool_use_id":"agent1","message":{"content":[{"type":"tool_result","tool_use_id":"inner1","content":format!("out {SAVED_KEY} sk-ant-another-token-0123456789"),"is_error":false},{"type":"tool_result","tool_use_id":"inner2","content":big,"is_error":true}]}}),
@@ -2016,7 +2074,7 @@ mod tests {
     async fn a_background_subagent_stays_running_until_the_turn_completes_then_is_done() {
         let world = World::new();
         let lines = stream_lines(&[
-            serde_json::json!({"type":"system","subtype":"init","tools":["Read","Bash"],"session_id":"s1"}),
+            serde_json::json!({"type":"system","subtype":"init","tools":["Read","Edit","Write","Bash"],"session_id":"s1"}),
             serde_json::json!({"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"bg","name":"Agent","input":{"description":"later","prompt":"do it"}}]}}),
             serde_json::json!({"type":"user","tool_use_result":{"status":"async_launched"},"message":{"content":[{"type":"tool_result","tool_use_id":"bg","content":"Async agent launched successfully.","is_error":false}]}}),
             serde_json::json!({"type":"assistant","parent_tool_use_id":"bg","message":{"id":"m2","content":[{"type":"tool_use","id":"in","name":"Bash","input":{"command":"ls"}}]}}),
@@ -2056,7 +2114,7 @@ mod tests {
     async fn a_background_subagent_of_a_turn_that_does_not_complete_is_stopped() {
         let world = World::new();
         let lines = stream_lines(&[
-            serde_json::json!({"type":"system","subtype":"init","tools":["Read","Bash"],"session_id":"s1"}),
+            serde_json::json!({"type":"system","subtype":"init","tools":["Read","Edit","Write","Bash"],"session_id":"s1"}),
             serde_json::json!({"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"bg","name":"Agent","input":{"description":"later","prompt":"do it"}}]}}),
             serde_json::json!({"type":"user","tool_use_result":{"status":"async_launched"},"message":{"content":[{"type":"tool_result","tool_use_id":"bg","content":"Async agent launched successfully.","is_error":false}]}}),
             serde_json::json!({"type":"result","is_error":true,"result":"boom"}),
@@ -2078,7 +2136,7 @@ mod tests {
     async fn steps_past_the_cap_are_neither_stored_nor_emitted_and_one_notice_says_so() {
         let world = World::new();
         let mut values = vec![
-            serde_json::json!({"type":"system","subtype":"init","tools":["Read","Bash"],"session_id":"s1"}),
+            serde_json::json!({"type":"system","subtype":"init","tools":["Read","Edit","Write","Bash"],"session_id":"s1"}),
         ];
         let total = MAX_STEPS + 5;
         for n in 0..total {
@@ -2127,7 +2185,7 @@ mod tests {
         let (head, tail) = SAVED_KEY.split_at(25);
         let padding = "p".repeat(300);
         let lines = stream_lines(&[
-            serde_json::json!({"type":"system","subtype":"init","tools":["Read","Bash"],"session_id":"s1"}),
+            serde_json::json!({"type":"system","subtype":"init","tools":["Read","Edit","Write","Bash"],"session_id":"s1"}),
             delta(0, &format!("{padding} {head}")),
             delta(0, tail),
             delta(0, &format!(" {padding}")),
@@ -2157,7 +2215,7 @@ mod tests {
         let world = World::new();
         let token = format!("sk-ant-{}", "A".repeat(130));
         let lines = stream_lines(&[
-            serde_json::json!({"type":"system","subtype":"init","tools":["Read","Bash"],"session_id":"s1"}),
+            serde_json::json!({"type":"system","subtype":"init","tools":["Read","Edit","Write","Bash"],"session_id":"s1"}),
             delta(0, &format!("{}sk-ant-", "p".repeat(100))),
             delta(0, &"A".repeat(130)),
             serde_json::json!({"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":format!("{}{token}", "p".repeat(100))}]}}),
@@ -2180,7 +2238,7 @@ mod tests {
     async fn text_streamed_without_a_final_message_is_flushed_redacted_when_the_turn_ends() {
         let world = World::new();
         let lines = stream_lines(&[
-            serde_json::json!({"type":"system","subtype":"init","tools":["Read","Bash"],"session_id":"s1"}),
+            serde_json::json!({"type":"system","subtype":"init","tools":["Read","Edit","Write","Bash"],"session_id":"s1"}),
             delta(0, &format!("see {SAVED_KEY}")),
         ]);
         let fixture = world.fixture("cut.jsonl", &lines);
@@ -2200,6 +2258,7 @@ mod tests {
 
     fn partial_stream() -> String {
         stream_lines(&[
+            serde_json::json!({"type":"system","subtype":"init","session_id":"s1","tools":["Read","Edit","Write","Bash"]}),
             delta(0, &format!("partial {SAVED_KEY}")),
             serde_json::json!({"type":"assistant","message":{"id":"m2","content":[{"type":"tool_use","id":"tu1","name":"Bash","input":{"command":"sleep 99"}}]}}),
         ])
@@ -2477,7 +2536,7 @@ mod tests {
         assert_eq!(statuses, ["completed", "failed"]);
     }
 
-    const SIGN_IN_FAILURE: &str = "echo '{\"type\":\"system\",\"subtype\":\"init\",\"tools\":[\"Read\",\"Bash\"],\"session_id\":\"s1\"}'\necho '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,\"api_error_status\":401,\"result\":\"Invalid API key\"}'\nexit 1";
+    const SIGN_IN_FAILURE: &str = "echo '{\"type\":\"system\",\"subtype\":\"init\",\"tools\":[\"Read\",\"Edit\",\"Write\",\"Bash\"],\"session_id\":\"s1\"}'\necho '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,\"api_error_status\":401,\"result\":\"Invalid API key\"}'\nexit 1";
 
     #[tokio::test]
     async fn a_sign_in_failure_after_the_process_started_holds_the_agent_and_shows_the_guidance() {
@@ -2651,7 +2710,7 @@ mod tests {
         let world = World::new();
         world.install(&recording(
             &world,
-            "echo '{\"type\":\"system\",\"subtype\":\"init\",\"tools\":[\"Read\",\"Bash\"],\"session_id\":\"s1\"}'\necho '{\"type\":\"result\",\"subtype\":\"error\",\"is_error\":true,\"result\":\"sandbox required but unavailable\"}'\nexit 1",
+            "echo '{\"type\":\"system\",\"subtype\":\"init\",\"tools\":[\"Read\",\"Edit\",\"Write\",\"Bash\"],\"session_id\":\"s1\"}'\necho '{\"type\":\"result\",\"subtype\":\"error\",\"is_error\":true,\"result\":\"sandbox required but unavailable\"}'\nexit 1",
         ));
         let launch = world.launch("hi");
         let end = run(
@@ -2956,6 +3015,198 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(1500)).await;
             assert!(!marker.exists(), "a tool ran after the stop: {tools}");
         }
+    }
+
+    fn init_line(tools: &str) -> String {
+        format!(
+            "{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\",\"tools\":{tools}}}"
+        )
+    }
+
+    async fn run_script(world: &World, body: &str) -> RunEnd {
+        world.install(&recording(world, body));
+        let launch = world.launch("hi");
+        run(
+            &world.db,
+            &world.sink,
+            &world.registry,
+            launch,
+            ApiKey::Subscription,
+        )
+        .await
+    }
+
+    const SANDBOX_FAILED: &str = "The sandbox could not start, so this agent did not run.";
+    const RESULT_LINE: &str =
+        "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}";
+
+    #[tokio::test]
+    async fn an_init_that_lacks_read_edit_or_write_fails_the_turn_closed() {
+        for tools in [
+            "[\"Edit\",\"Write\"]",
+            "[\"Read\",\"Write\"]",
+            "[\"Read\",\"Edit\"]",
+        ] {
+            let world = World::new();
+            let end = run_script(
+                &world,
+                &format!("echo '{}'\necho '{RESULT_LINE}'", init_line(tools)),
+            )
+            .await;
+            assert_eq!(end, RunEnd::AgentFailed, "{tools}");
+            assert_eq!(only_turn(&world).error.as_deref(), Some(SANDBOX_FAILED));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_model_or_tool_event_before_the_first_init_fails_the_turn_closed() {
+        let events = [
+            "{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"content\":[{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Bash\",\"input\":{\"command\":\"id\"}}]}}",
+            "{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"content\":[]}}",
+            "{\"type\":\"user\",\"message\":{\"content\":[]}}",
+            "{\"type\":\"stream_event\",\"event\":{\"type\":\"message_start\"}}",
+        ];
+        for event in events {
+            let world = World::new();
+            let marker = world.records().join("tool-ran");
+            let end = run_script(
+                &world,
+                &format!(
+                    "echo '{event}'\nsleep 1\ntouch '{}'\necho '{}'\necho '{RESULT_LINE}'",
+                    marker.display(),
+                    init_line("[\"Read\",\"Edit\",\"Write\"]")
+                ),
+            )
+            .await;
+            assert_eq!(end, RunEnd::AgentFailed, "{event}");
+            let turn = only_turn(&world);
+            assert_eq!(turn.error.as_deref(), Some(SANDBOX_FAILED));
+            assert!(turn.items.is_empty(), "{event}");
+            tokio::time::sleep(Duration::from_millis(1400)).await;
+            assert!(!marker.exists(), "{event}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_later_init_fails_only_when_the_canary_appears() {
+        let world = World::new();
+        let end = run_script(
+            &world,
+            &format!(
+                "echo '{}'\necho '{}'\necho '{RESULT_LINE}'",
+                init_line("[\"Read\",\"Edit\",\"Write\"]"),
+                init_line("[]"),
+            ),
+        )
+        .await;
+        assert_eq!(end, RunEnd::Finished);
+        assert_eq!(only_turn(&world).status, "completed");
+        let world = World::new();
+        let end = run_script(
+            &world,
+            &format!(
+                "echo '{}'\necho '{}'\nsleep 1\necho '{RESULT_LINE}'",
+                init_line("[\"Read\",\"Edit\",\"Write\"]"),
+                init_line("[\"Read\",\"NotebookEdit\"]"),
+            ),
+        )
+        .await;
+        assert_eq!(end, RunEnd::AgentFailed);
+        assert_eq!(only_turn(&world).error.as_deref(), Some(SANDBOX_FAILED));
+    }
+
+    #[tokio::test]
+    async fn lines_already_buffered_when_the_canary_stop_happens_are_not_stored_or_shown() {
+        let world = World::new();
+        let text = "{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"content\":[{\"type\":\"text\",\"text\":\"leaked reply\"}]}}";
+        let end = run_script(
+            &world,
+            &format!(
+                "{{ echo '{}'; echo '{text}'; echo '{text}'; echo '{RESULT_LINE}'; }}",
+                init_line("[\"Read\",\"Edit\",\"Write\",\"NotebookEdit\"]"),
+            ),
+        )
+        .await;
+        assert_eq!(end, RunEnd::AgentFailed);
+        let turn = only_turn(&world);
+        assert_eq!(turn.error.as_deref(), Some(SANDBOX_FAILED));
+        assert!(turn.items.is_empty());
+        assert!(!world
+            .sink
+            .kinds()
+            .iter()
+            .any(|kind| kind.starts_with("text")));
+    }
+
+    #[test]
+    fn a_path_is_shell_quoted_with_single_quotes_escaped() {
+        assert_eq!(
+            shell_quoted(Path::new("/a b/it's/key")),
+            "'/a b/it'\\''s/key'"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_saved_key_reaches_the_cli_only_through_a_private_helper_that_is_removed_after_the_turn(
+    ) {
+        let world = World::new();
+        let fixture = world.fixture("basic.jsonl", BASIC);
+        world.install(&recording(
+            &world,
+            &format!("cat \"{}\"", fixture.display()),
+        ));
+        world
+            .send(
+                "one",
+                ApiKey::Present(SecretString::new("sk-ant-saved-0000")),
+            )
+            .await;
+        let settings: serde_json::Value =
+            serde_json::from_str(&read(&world, "settings.0")).unwrap();
+        let helper = PathBuf::from(read(&world, "helperpath.0").trim());
+        let key_file = PathBuf::from(read(&world, "keypath.0").trim());
+        assert_eq!(
+            settings["apiKeyHelper"],
+            serde_json::Value::String(shell_quoted(&helper))
+        );
+        let tmp = world.data.path().join("tmp");
+        assert!(helper.starts_with(&tmp) && key_file.starts_with(&tmp));
+        let helper_name = helper.file_name().unwrap().to_string_lossy().into_owned();
+        let key_name = key_file.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(helper_name.starts_with("key-helper-") && helper_name.ends_with(".sh"));
+        assert!(key_name.starts_with("key-") && !key_name.starts_with("key-helper-"));
+        assert_eq!(read(&world, "keymode.0").trim(), "600");
+        assert_eq!(read(&world, "helpermode.0").trim(), "700");
+        assert_eq!(read(&world, "helperkey.0"), "sk-ant-saved-0000");
+        assert!(!read(&world, "settings.0").contains("sk-ant-saved-0000"));
+        assert!(!args(&world, 0)
+            .iter()
+            .any(|arg| arg.contains("sk-ant-saved-0000")));
+        assert!(!helper.exists() && !key_file.exists());
+        assert_eq!(fs::read_dir(&tmp).unwrap().count(), 0);
+        world.send("two", ApiKey::Subscription).await;
+        let later: serde_json::Value = serde_json::from_str(&read(&world, "settings.1")).unwrap();
+        assert!(later.get("apiKeyHelper").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_key_that_cannot_be_put_in_a_file_fails_the_turn_without_a_process() {
+        let mut world = World::new();
+        let blocker = world.data.path().join("blocker");
+        fs::write(&blocker, "x").unwrap();
+        world.registry = TurnRegistry::with_temp_dir(blocker.join("tmp"));
+        world.install(&recording(&world, "exit 0"));
+        let launch = world.launch("hi");
+        let end = run(
+            &world.db,
+            &world.sink,
+            &world.registry,
+            launch,
+            ApiKey::Present(SecretString::new("sk-ant-saved-0000")),
+        )
+        .await;
+        assert_eq!(end, RunEnd::AgentFailed);
+        assert!(!has_record(&world, "args.0"));
     }
 
     #[tokio::test]
