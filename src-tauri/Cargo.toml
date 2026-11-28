@@ -30,6 +30,7 @@ keyring = { version = "=3.6.3", features = ["apple-native"] }
 security-framework = "=3.7.0"
 zeroize = "=1.9.2"
 trash = { version = "=5.4.0", default-features = false }
+jiff = "=1.0.3"
 
 [features]
 e2e = ["dep:tauri-plugin-wdio-webdriver"]

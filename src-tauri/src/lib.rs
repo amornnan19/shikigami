@@ -6,6 +6,7 @@ mod commands;
 pub mod db;
 mod groups;
 mod providers;
+mod routines;
 mod sandbox;
 pub mod secrets;
 mod settings;
@@ -85,7 +86,14 @@ pub fn run() {
             let data_dir = resolved.clone().unwrap_or_default();
             let opened = resolved
                 .and_then(|dir| open_database(&dir))
-                .and_then(|database| turns::sweep_interrupted(&database).map(|_| database));
+                .and_then(|database| turns::sweep_interrupted(&database).map(|_| database))
+                .inspect(|database| {
+                    let _ = routines::refresh_next_runs(
+                        database,
+                        &routines::zone(),
+                        jiff::Timestamp::now(),
+                    );
+                });
             if !data_dir.as_os_str().is_empty() {
                 let temp = data_dir.join("tmp");
                 turns::sweep_temp_files(&temp);
@@ -153,7 +161,13 @@ pub fn run() {
             turns::list_group_queue,
             turns::edit_group_queued,
             turns::remove_group_queued,
-            turns::resume_group_queue
+            turns::resume_group_queue,
+            routines::list_routines,
+            routines::create_routine,
+            routines::update_routine,
+            routines::set_routine_active,
+            routines::delete_routine,
+            routines::routine_time_zone
         ])
         .build(app_context())
         .expect("error while building tauri application")

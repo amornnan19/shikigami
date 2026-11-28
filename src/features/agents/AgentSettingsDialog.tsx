@@ -10,6 +10,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { RoutinesSection } from "@/features/routines/RoutinesSection";
 import {
   authChoiceOf,
   authModeOf,
@@ -208,6 +209,14 @@ function DeleteSection({
   );
 }
 
+function focusSignIn() {
+  requestAnimationFrame(() => {
+    const trigger = document.getElementById("settings-sign-in");
+    trigger?.scrollIntoView({ block: "center" });
+    trigger?.focus();
+  });
+}
+
 export function AgentSettingsDialog({
   agent,
   running,
@@ -236,6 +245,9 @@ export function AgentSettingsDialog({
         <IdentitySection agent={agent} />
         <ModelSection agent={agent} />
         <SignInSection agent={agent} />
+        <Section label="Routines">
+          <RoutinesSection agent={agent} onChangeSignIn={focusSignIn} />
+        </Section>
         <InstructionsSection agentId={agent.id} />
         <DeleteSection agent={agent} running={running} onDeleted={onDeleted} />
       </DialogContent>

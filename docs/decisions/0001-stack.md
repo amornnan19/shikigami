@@ -146,6 +146,7 @@ The desktop shell (Tauri 2), the UI framework (React with TypeScript, Vite) and 
 | `tauri-plugin-dialog` 2.8.4 (native folder picker for a group chat's folder) | MIT or Apache-2.0 |
 | `rfd` 0.17.2 and `tauri-plugin-fs` 2.7.1 (pulled in by `tauri-plugin-dialog`) | Apache-2.0 or MIT (`rfd`), MIT (`tauri-plugin-fs`) |
 | `uuid` feature `v4` (random session ids for Claude Code; same crate as before) | MIT or Apache-2.0 |
+| `jiff` 1.0.3 (time zones and daylight-saving rules for routine schedules; chosen over chrono plus chrono-tz, which needs two crates and bundled zone data) | MIT or Unlicense |
 
 All listed licenses are permissive and compatible with PolyForm Noncommercial 1.0.0. Their notices
 go into the shipped app's third-party notices (M5).
