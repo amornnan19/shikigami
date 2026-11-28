@@ -38,6 +38,8 @@ const SNAPSHOT_FLAG: &str = "--system-prompt-snapshot";
 const MINIMUM_VERSION: [u32; 3] = [2, 1, 285];
 const TOO_OLD_MESSAGE: &str =
     "This Claude Code version is too old to run safely. Update it, then press Resume.";
+const VERSION_UNREADABLE_MESSAGE: &str =
+    "Could not check the Claude Code version. Press Resume to try again.";
 const SESSION_MISSING: &str = "No conversation found";
 
 const RESUME_NOTICE: &str =
@@ -185,13 +187,16 @@ struct Attempt {
     result: Option<(bool, String)>,
     api_error_status: Option<u64>,
     compacted: bool,
+    settings_ignored: bool,
     failure: Option<String>,
     stderr: StderrSummary,
 }
 
 impl Attempt {
     fn succeeded(&self) -> bool {
-        matches!(self.result, Some((false, _))) && self.failure.is_none()
+        matches!(self.result, Some((false, _)))
+            && self.failure.is_none()
+            && !self.stderr.sandbox_unavailable
     }
 
     fn sign_in_failed(&self) -> bool {
@@ -202,7 +207,8 @@ impl Attempt {
     }
 
     fn sandbox_unavailable(&self) -> bool {
-        self.stderr.sandbox_unavailable
+        self.settings_ignored
+            || self.stderr.sandbox_unavailable
             || (!self.saw_init
                 && self
                     .result
@@ -547,6 +553,13 @@ impl Runner<'_> {
 
     fn handle(&mut self, parsed: Parsed, attempt: &mut Attempt) {
         match parsed {
+            Parsed::Tools(tools) => {
+                if sandbox::tools_ignore_settings(&tools) {
+                    attempt.settings_ignored = true;
+                    attempt.failure = Some(sandbox::UNAVAILABLE_MESSAGE.to_owned());
+                    self.registry.kill(&self.agent_id, &self.turn_id);
+                }
+            }
             Parsed::Session(id) => {
                 attempt.saw_init = true;
                 self.store_context_hash();
@@ -697,7 +710,9 @@ impl Runner<'_> {
             .process_group(0)
             .kill_on_drop(true);
         if let ApiKey::Present(secret) = key {
-            command.env("ANTHROPIC_API_KEY", secret.expose());
+            command
+                .env(sandbox::API_KEY_VARIABLE, secret.expose())
+                .env(sandbox::SCRUB_VARIABLE, "1");
         }
         Some(command)
     }
@@ -726,11 +741,16 @@ impl Runner<'_> {
         {
             return attempt;
         }
-        if !providers::version_at_least(&launch.executable, &launch.search_dirs, MINIMUM_VERSION)
-            .await
-        {
-            attempt.failure = Some(TOO_OLD_MESSAGE.to_owned());
-            return attempt;
+        match providers::cli_version(&launch.executable, &launch.search_dirs).await {
+            Some(version) if version >= MINIMUM_VERSION => {}
+            Some(_) => {
+                attempt.failure = Some(TOO_OLD_MESSAGE.to_owned());
+                return attempt;
+            }
+            None => {
+                attempt.failure = Some(VERSION_UNREADABLE_MESSAGE.to_owned());
+                return attempt;
+            }
         }
         let Some(settings) = self.settings_file(launch) else {
             attempt.failure = Some(sandbox::UNAVAILABLE_MESSAGE.to_owned());
@@ -828,6 +848,9 @@ impl Runner<'_> {
                 Ok(Line::Text(line)) => {
                     for parsed in parser.line(&line) {
                         self.handle(parsed, &mut attempt);
+                        if attempt.settings_ignored {
+                            break;
+                        }
                     }
                     if attempt.result.is_some() {
                         break;
@@ -958,6 +981,9 @@ async fn run_turn(
     {
         runner.add_notice(notice);
     }
+    if let Some(notice) = launch.notice.as_deref() {
+        runner.add_notice(notice);
+    }
     if !launch.workspace.is_dir() {
         runner.input_unread = true;
         let missing = if launch.group.is_some() {
@@ -966,6 +992,11 @@ async fn run_turn(
             "The workspace folder is missing."
         };
         runner.finish("failed", Some(missing.to_owned()), false);
+        return RunEnd::ChatFailed;
+    }
+    if sandbox::inside_protected_location(&launch.workspace, launch.sandbox.home.as_deref()) {
+        runner.input_unread = true;
+        runner.finish("failed", Some(sandbox::protected_folder_reason()), false);
         return RunEnd::ChatFailed;
     }
     if sandbox::has_unsafe_characters(&launch.workspace) {
@@ -1159,6 +1190,7 @@ mod tests {
                 session: begun.session,
                 text: text.to_owned(),
                 instructions: String::new(),
+                notice: None,
                 started_at: now_millis(),
                 environment: self.environment.lock().unwrap().clone(),
                 stall_timeout: STALL_TIMEOUT,
@@ -1393,6 +1425,70 @@ mod tests {
             .filter(|line| line.starts_with("ANTHROPIC_"))
             .collect();
         assert_eq!(anthropic, ["ANTHROPIC_API_KEY=sk-ant-saved-0000"]);
+    }
+
+    #[tokio::test]
+    async fn the_scrub_variable_reaches_the_child_only_together_with_the_saved_key() {
+        for (key, scrubbed) in [
+            (
+                ApiKey::Present(SecretString::new("sk-ant-saved-0000")),
+                true,
+            ),
+            (ApiKey::Subscription, false),
+        ] {
+            let world = World::new();
+            let fixture = world.fixture("basic.jsonl", BASIC);
+            world.install(&recording(
+                &world,
+                &format!(
+                    "env > \"{}/env.txt\"\ncat \"{}\"",
+                    world.records().display(),
+                    fixture.display()
+                ),
+            ));
+            world.send("one", key).await;
+            let text = read(&world, "env.txt");
+            let line = text
+                .lines()
+                .find(|line| line.starts_with("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB="));
+            assert_eq!(
+                line,
+                scrubbed.then_some("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1")
+            );
+            let settings: serde_json::Value =
+                serde_json::from_str(&read(&world, "settings.0")).unwrap();
+            assert_eq!(
+                settings["sandbox"]["credentials"]["envVars"],
+                serde_json::json!([{"name": "ANTHROPIC_API_KEY", "mode": "deny"}])
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_launch_notice_is_shown_in_the_turn_and_the_turn_runs() {
+        let world = World::new();
+        let fixture = world.fixture("basic.jsonl", BASIC);
+        world.install(&recording(
+            &world,
+            &format!("cat \"{}\"", fixture.display()),
+        ));
+        let mut launch = world.launch("hi");
+        launch.notice =
+            Some("The workspace's CLAUDE.md was not loaded (it is not UTF-8 text).".to_owned());
+        run(
+            &world.db,
+            &world.sink,
+            &world.registry,
+            launch,
+            ApiKey::Subscription,
+        )
+        .await;
+        let turn = only_turn(&world);
+        assert_eq!(turn.status, "completed");
+        assert!(turn.items.iter().any(|item| matches!(
+            item,
+            ItemView::Notice { text, .. } if text == "The workspace's CLAUDE.md was not loaded (it is not UTF-8 text)."
+        )));
     }
 
     #[tokio::test]
@@ -1788,7 +1884,8 @@ mod tests {
             .db
             .with_connection(|c| c.execute("UPDATE agents SET provider_session_id = 'old-id'", []))
             .unwrap();
-        let init = r#"{"type":"system","subtype":"init","session_id":"old-id"}"#;
+        let init =
+            r#"{"type":"system","subtype":"init","tools":["Read","Bash"],"session_id":"old-id"}"#;
         world.install(&recording(
             &world,
             &format!("echo '{init}'\necho 'died' >&2\nexit 1"),
@@ -1820,7 +1917,7 @@ mod tests {
     async fn a_key_in_a_tool_step_a_reply_and_an_error_is_stored_and_emitted_redacted() {
         let world = World::new();
         let lines = stream_lines(&[
-            serde_json::json!({"type":"system","subtype":"init","session_id":"s1"}),
+            serde_json::json!({"type":"system","subtype":"init","tools":["Read","Bash"],"session_id":"s1"}),
             serde_json::json!({"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":format!("echo {SAVED_KEY}")}}]}}),
             serde_json::json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":format!("out {SAVED_KEY} and sk-ant-another-token-0123456789"),"is_error":false}]}}),
             serde_json::json!({"type":"assistant","message":{"id":"m2","content":[{"type":"text","text":format!("the key is {SAVED_KEY}")}]}}),
@@ -1857,7 +1954,7 @@ mod tests {
         let world = World::new();
         let big = "z".repeat(claude_code::DETAIL_LIMIT * 3);
         let lines = stream_lines(&[
-            serde_json::json!({"type":"system","subtype":"init","session_id":"s1"}),
+            serde_json::json!({"type":"system","subtype":"init","tools":["Read","Bash"],"session_id":"s1"}),
             serde_json::json!({"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"agent1","name":"Agent","input":{"subagent_type":"Explore","description":"Look around","prompt":format!("find {SAVED_KEY}")}}]}}),
             serde_json::json!({"type":"assistant","parent_tool_use_id":"agent1","message":{"id":"m2","content":[{"type":"tool_use","id":"inner1","name":"Bash","input":{"command":format!("echo {SAVED_KEY}")}},{"type":"tool_use","id":"inner2","name":"Read","input":{"file_path":"/a"}}]}}),
             serde_json::json!({"type":"user","parent_tool_use_id":"agent1","message":{"content":[{"type":"tool_result","tool_use_id":"inner1","content":format!("out {SAVED_KEY} sk-ant-another-token-0123456789"),"is_error":false},{"type":"tool_result","tool_use_id":"inner2","content":big,"is_error":true}]}}),
@@ -1919,7 +2016,7 @@ mod tests {
     async fn a_background_subagent_stays_running_until_the_turn_completes_then_is_done() {
         let world = World::new();
         let lines = stream_lines(&[
-            serde_json::json!({"type":"system","subtype":"init","session_id":"s1"}),
+            serde_json::json!({"type":"system","subtype":"init","tools":["Read","Bash"],"session_id":"s1"}),
             serde_json::json!({"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"bg","name":"Agent","input":{"description":"later","prompt":"do it"}}]}}),
             serde_json::json!({"type":"user","tool_use_result":{"status":"async_launched"},"message":{"content":[{"type":"tool_result","tool_use_id":"bg","content":"Async agent launched successfully.","is_error":false}]}}),
             serde_json::json!({"type":"assistant","parent_tool_use_id":"bg","message":{"id":"m2","content":[{"type":"tool_use","id":"in","name":"Bash","input":{"command":"ls"}}]}}),
@@ -1959,7 +2056,7 @@ mod tests {
     async fn a_background_subagent_of_a_turn_that_does_not_complete_is_stopped() {
         let world = World::new();
         let lines = stream_lines(&[
-            serde_json::json!({"type":"system","subtype":"init","session_id":"s1"}),
+            serde_json::json!({"type":"system","subtype":"init","tools":["Read","Bash"],"session_id":"s1"}),
             serde_json::json!({"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"bg","name":"Agent","input":{"description":"later","prompt":"do it"}}]}}),
             serde_json::json!({"type":"user","tool_use_result":{"status":"async_launched"},"message":{"content":[{"type":"tool_result","tool_use_id":"bg","content":"Async agent launched successfully.","is_error":false}]}}),
             serde_json::json!({"type":"result","is_error":true,"result":"boom"}),
@@ -1980,8 +2077,9 @@ mod tests {
     #[tokio::test]
     async fn steps_past_the_cap_are_neither_stored_nor_emitted_and_one_notice_says_so() {
         let world = World::new();
-        let mut values =
-            vec![serde_json::json!({"type":"system","subtype":"init","session_id":"s1"})];
+        let mut values = vec![
+            serde_json::json!({"type":"system","subtype":"init","tools":["Read","Bash"],"session_id":"s1"}),
+        ];
         let total = MAX_STEPS + 5;
         for n in 0..total {
             values.push(serde_json::json!({"type":"assistant","message":{"id":format!("m{n}"),"content":[{"type":"tool_use","id":format!("t{n}"),"name":"Bash","input":{"command":format!("echo {n}")}}]}}));
@@ -2029,7 +2127,7 @@ mod tests {
         let (head, tail) = SAVED_KEY.split_at(25);
         let padding = "p".repeat(300);
         let lines = stream_lines(&[
-            serde_json::json!({"type":"system","subtype":"init","session_id":"s1"}),
+            serde_json::json!({"type":"system","subtype":"init","tools":["Read","Bash"],"session_id":"s1"}),
             delta(0, &format!("{padding} {head}")),
             delta(0, tail),
             delta(0, &format!(" {padding}")),
@@ -2059,7 +2157,7 @@ mod tests {
         let world = World::new();
         let token = format!("sk-ant-{}", "A".repeat(130));
         let lines = stream_lines(&[
-            serde_json::json!({"type":"system","subtype":"init","session_id":"s1"}),
+            serde_json::json!({"type":"system","subtype":"init","tools":["Read","Bash"],"session_id":"s1"}),
             delta(0, &format!("{}sk-ant-", "p".repeat(100))),
             delta(0, &"A".repeat(130)),
             serde_json::json!({"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":format!("{}{token}", "p".repeat(100))}]}}),
@@ -2082,7 +2180,7 @@ mod tests {
     async fn text_streamed_without_a_final_message_is_flushed_redacted_when_the_turn_ends() {
         let world = World::new();
         let lines = stream_lines(&[
-            serde_json::json!({"type":"system","subtype":"init","session_id":"s1"}),
+            serde_json::json!({"type":"system","subtype":"init","tools":["Read","Bash"],"session_id":"s1"}),
             delta(0, &format!("see {SAVED_KEY}")),
         ]);
         let fixture = world.fixture("cut.jsonl", &lines);
@@ -2379,7 +2477,7 @@ mod tests {
         assert_eq!(statuses, ["completed", "failed"]);
     }
 
-    const SIGN_IN_FAILURE: &str = "echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\"}'\necho '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,\"api_error_status\":401,\"result\":\"Invalid API key\"}'\nexit 1";
+    const SIGN_IN_FAILURE: &str = "echo '{\"type\":\"system\",\"subtype\":\"init\",\"tools\":[\"Read\",\"Bash\"],\"session_id\":\"s1\"}'\necho '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,\"api_error_status\":401,\"result\":\"Invalid API key\"}'\nexit 1";
 
     #[tokio::test]
     async fn a_sign_in_failure_after_the_process_started_holds_the_agent_and_shows_the_guidance() {
@@ -2553,7 +2651,7 @@ mod tests {
         let world = World::new();
         world.install(&recording(
             &world,
-            "echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\"}'\necho '{\"type\":\"result\",\"subtype\":\"error\",\"is_error\":true,\"result\":\"sandbox required but unavailable\"}'\nexit 1",
+            "echo '{\"type\":\"system\",\"subtype\":\"init\",\"tools\":[\"Read\",\"Bash\"],\"session_id\":\"s1\"}'\necho '{\"type\":\"result\",\"subtype\":\"error\",\"is_error\":true,\"result\":\"sandbox required but unavailable\"}'\nexit 1",
         ));
         let launch = world.launch("hi");
         let end = run(
@@ -2689,7 +2787,20 @@ mod tests {
 
     #[tokio::test]
     async fn a_claude_code_older_than_the_minimum_or_unreadable_fails_closed_and_starts_no_turn() {
-        for version in ["2.1.284 (Claude Code)", "garbage", ""] {
+        for (version, message) in [
+            (
+                "2.1.284 (Claude Code)",
+                "This Claude Code version is too old to run safely. Update it, then press Resume.",
+            ),
+            (
+                "garbage",
+                "Could not check the Claude Code version. Press Resume to try again.",
+            ),
+            (
+                "",
+                "Could not check the Claude Code version. Press Resume to try again.",
+            ),
+        ] {
             let world = World::new();
             let path = world.bin.path().join("claude");
             let body = recording(&world, "exit 0");
@@ -2713,10 +2824,29 @@ mod tests {
             assert_eq!(end, RunEnd::AgentFailed, "{version}");
             assert_eq!(
                 only_turn(&world).error.as_deref(),
-                Some("This Claude Code version is too old to run safely. Update it, then press Resume.")
+                Some(message),
+                "{version}"
             );
             assert!(!has_record(&world, "args.0"), "{version}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_version_printed_after_other_output_lines_is_still_read() {
+        let world = World::new();
+        let path = world.bin.path().join("claude");
+        let fixture = world.fixture("basic.jsonl", BASIC);
+        let body = recording(&world, &format!("cat \"{}\"", fixture.display()));
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in --version) echo 'note: update available'; echo '2.1.332 (Claude Code)'; exit 0;; esac\n{body}\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        world.send("hi", ApiKey::Subscription).await;
+        assert_eq!(only_turn(&world).status, "completed");
     }
 
     #[tokio::test]
@@ -2736,6 +2866,34 @@ mod tests {
         world.send("hi", ApiKey::Subscription).await;
         assert!(has_record(&world, "args.0"));
         assert_eq!(only_turn(&world).status, "completed");
+    }
+
+    #[tokio::test]
+    async fn a_turn_folder_inside_a_protected_location_fails_the_chat_and_starts_no_process() {
+        let home = tempfile::tempdir().unwrap();
+        let ssh = home.path().join(".ssh").join("work");
+        fs::create_dir_all(&ssh).unwrap();
+        for folder in [ssh, PathBuf::from("/Volumes")] {
+            let world = World::new();
+            world.install(&recording(&world, "exit 0"));
+            let mut launch = world.launch("hi");
+            launch.sandbox.home = Some(home.path().to_path_buf());
+            launch.workspace = folder.clone();
+            let end = run(
+                &world.db,
+                &world.sink,
+                &world.registry,
+                launch,
+                ApiKey::Subscription,
+            )
+            .await;
+            assert_eq!(end, RunEnd::ChatFailed, "{}", folder.display());
+            assert_eq!(
+                only_turn(&world).error.as_deref(),
+                Some("This folder cannot be used. It is inside a protected location.")
+            );
+            assert!(!has_record(&world, "args.0"));
+        }
     }
 
     #[tokio::test]
@@ -2763,6 +2921,70 @@ mod tests {
             );
             assert!(!has_record(&world, "args.0"), "{name}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_cli_that_ignores_the_settings_is_stopped_before_any_tool_runs() {
+        for tools in ["[\"Read\",\"Bash\",\"NotebookEdit\"]", "[]"] {
+            let world = World::new();
+            let marker = world.records().join("tool-ran");
+            world.install(&recording(
+                &world,
+                &format!(
+                    "echo '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\",\"tools\":{tools}}}'\nsleep 1\ntouch '{}'\necho '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}}'",
+                    marker.display()
+                ),
+            ));
+            let launch = world.launch("hi");
+            let end = run(
+                &world.db,
+                &world.sink,
+                &world.registry,
+                launch,
+                ApiKey::Subscription,
+            )
+            .await;
+            assert_eq!(end, RunEnd::AgentFailed, "{tools}");
+            let turn = only_turn(&world);
+            assert_eq!(turn.status, "failed");
+            assert_eq!(
+                turn.error.as_deref(),
+                Some("The sandbox could not start, so this agent did not run.")
+            );
+            assert!(turn.items.is_empty());
+            assert_eq!(world.session(), None, "{tools}");
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            assert!(!marker.exists(), "a tool ran after the stop: {tools}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_settings_marker_on_stderr_fails_a_turn_that_otherwise_succeeded() {
+        let world = World::new();
+        let fixture = world.fixture("basic.jsonl", BASIC);
+        world.install(&recording(
+            &world,
+            &format!(
+                "cat \"{}\"\necho 'These settings entries were skipped; the rest of each source is in effect:' >&2",
+                fixture.display()
+            ),
+        ));
+        let launch = world.launch("hi");
+        let end = run(
+            &world.db,
+            &world.sink,
+            &world.registry,
+            launch,
+            ApiKey::Subscription,
+        )
+        .await;
+        assert_eq!(end, RunEnd::AgentFailed);
+        let turn = only_turn(&world);
+        assert_eq!(turn.status, "failed");
+        assert_eq!(
+            turn.error.as_deref(),
+            Some("The sandbox could not start, so this agent did not run.")
+        );
     }
 
     #[tokio::test]

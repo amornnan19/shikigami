@@ -126,44 +126,34 @@ async fn help_lists_flag_within(
 
 static VERSIONS: OnceLock<Mutex<HashMap<PathBuf, [u32; 3]>>> = OnceLock::new();
 
-pub async fn version_at_least(executable: &Path, dirs: &[PathBuf], minimum: [u32; 3]) -> bool {
-    version_at_least_within(executable, dirs, minimum, PROBE_TIMEOUT).await
+pub async fn cli_version(executable: &Path, dirs: &[PathBuf]) -> Option<[u32; 3]> {
+    cli_version_within(executable, dirs, PROBE_TIMEOUT).await
 }
 
-async fn version_at_least_within(
+async fn cli_version_within(
     executable: &Path,
     dirs: &[PathBuf],
-    minimum: [u32; 3],
     limit: Duration,
-) -> bool {
+) -> Option<[u32; 3]> {
     let cache = VERSIONS.get_or_init(Mutex::default);
     let known = cache
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(executable)
         .copied();
-    let version = match known {
-        Some(version) => version,
-        None => {
-            let Some(output) =
-                probe::run_allowlisted(executable, &["--version"], dirs, limit).await
-            else {
-                return false;
-            };
-            let Some(version) = output
-                .first_line()
-                .and_then(|line| parse_version(&line, claude_code::SPEC.version_prefix))
-            else {
-                return false;
-            };
-            cache
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(executable.to_path_buf(), version);
-            version
-        }
-    };
-    version >= minimum
+    if known.is_some() {
+        return known;
+    }
+    let output = probe::run_allowlisted(executable, &["--version"], dirs, limit).await?;
+    let version = output
+        .stdout
+        .lines()
+        .find_map(|line| parse_version(line.trim(), claude_code::SPEC.version_prefix))?;
+    cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(executable.to_path_buf(), version);
+    Some(version)
 }
 
 pub async fn claude_status(dirs: &[PathBuf]) -> ProviderStatus {
@@ -388,6 +378,61 @@ esac"#,
         assert!(!help_lists_flag_within(&path, &dirs(&dir), "--late-flag", short).await);
         fs::remove_file(&slow).unwrap();
         assert!(help_lists_flag_within(&path, &dirs(&dir), "--late-flag", LIMIT).await);
+    }
+
+    #[tokio::test]
+    async fn a_version_is_found_on_any_line_and_cached_per_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("gone");
+        fake(
+            dir.path(),
+            "claude",
+            &format!(
+                "if [ -f {g} ]; then exit 1; fi\necho 'warning: update available'\necho '2.1.332 (Claude Code)'",
+                g = gone.display()
+            ),
+        );
+        let path = dir.path().join("claude");
+        assert_eq!(
+            cli_version_within(&path, &dirs(&dir), LIMIT).await,
+            Some([2, 1, 332])
+        );
+        fs::write(&gone, "").unwrap();
+        assert_eq!(
+            cli_version_within(&path, &dirs(&dir), Duration::from_millis(10)).await,
+            Some([2, 1, 332])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_version_probe_that_times_out_or_prints_nonsense_is_unknown_and_not_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let slow = dir.path().join("slow");
+        fake(
+            dir.path(),
+            "claude",
+            &format!(
+                "if [ -f {m} ]; then /bin/sleep 30; fi\necho '2.1.332 (Claude Code)'",
+                m = slow.display()
+            ),
+        );
+        fs::write(&slow, "").unwrap();
+        let path = dir.path().join("claude");
+        assert_eq!(
+            cli_version_within(&path, &dirs(&dir), Duration::from_millis(400)).await,
+            None
+        );
+        fs::remove_file(&slow).unwrap();
+        assert_eq!(
+            cli_version_within(&path, &dirs(&dir), LIMIT).await,
+            Some([2, 1, 332])
+        );
+        let other = tempfile::tempdir().unwrap();
+        fake(other.path(), "claude", "echo 'not a version'");
+        assert_eq!(
+            cli_version_within(&other.path().join("claude"), &dirs(&other), LIMIT).await,
+            None
+        );
     }
 
     #[tokio::test]

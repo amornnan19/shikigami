@@ -6,6 +6,9 @@ pub const UNAVAILABLE_MESSAGE: &str = "The sandbox could not start, so this agen
 pub const UNSAFE_FOLDER_MESSAGE: &str =
     "This folder's name contains characters the sandbox cannot use safely.";
 pub const PROTECTED_FOLDER_MESSAGE: &str = "It is inside a protected location.";
+pub const CANARY_TOOL: &str = "NotebookEdit";
+pub const API_KEY_VARIABLE: &str = "ANTHROPIC_API_KEY";
+pub const SCRUB_VARIABLE: &str = "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB";
 
 const UNAVAILABLE_MARKERS: [&str; 6] = [
     "sandbox required but unavailable",
@@ -128,6 +131,21 @@ pub fn fixed_protected(home: Option<&Path>) -> Vec<PathBuf> {
         .collect()
 }
 
+pub fn tools_ignore_settings(tools: &[String]) -> bool {
+    tools.is_empty() || tools.iter().any(|tool| tool == CANARY_TOOL)
+}
+
+pub fn inside_protected_location(folder: &Path, home: Option<&Path>) -> bool {
+    let folder = real_path(folder);
+    fixed_protected(home)
+        .iter()
+        .any(|location| folder.starts_with(real_path(location)))
+}
+
+pub fn protected_folder_reason() -> String {
+    format!("This folder cannot be used. {PROTECTED_FOLDER_MESSAGE}")
+}
+
 pub fn has_unsafe_characters(path: &Path) -> bool {
     path.to_string_lossy()
         .chars()
@@ -178,7 +196,7 @@ pub fn turn_settings(
 ) -> Value {
     let protected = protected_paths(folder, home, data_dir, other_workspaces);
     let own = rule_path(folder);
-    let deny: Vec<String> = protected
+    let mut deny: Vec<String> = protected
         .iter()
         .flat_map(|path| {
             let rule = rule_path(path);
@@ -187,6 +205,7 @@ pub fn turn_settings(
                 .flat_map(move |tool| [format!("{tool}({rule})"), format!("{tool}({rule}/**)")])
         })
         .collect();
+    deny.push(CANARY_TOOL.to_owned());
     let blocked: Vec<String> = protected.iter().map(|path| text(path)).collect();
     json!({
         "sandbox": {
@@ -197,6 +216,9 @@ pub fn turn_settings(
             "network": {
                 "allowedDomains": [],
                 "strictAllowlist": true
+            },
+            "credentials": {
+                "envVars": [{"name": API_KEY_VARIABLE, "mode": "deny"}]
             },
             "filesystem": {
                 "allowWrite": [text(folder), text(temp)],
@@ -249,6 +271,7 @@ mod tests {
                 "allowUnsandboxedCommands": false,
                 "autoAllowBashIfSandboxed": false,
                 "network": {"allowedDomains": [], "strictAllowlist": true},
+                "credentials": {"envVars": [{"name": "ANTHROPIC_API_KEY", "mode": "deny"}]},
                 "filesystem": {
                     "allowWrite": ["/Users/me/Agents/ada", "/var/folders/t/T"],
                     "denyRead": value["sandbox"]["filesystem"]["denyRead"],
@@ -290,9 +313,50 @@ mod tests {
         ] {
             assert!(deny.contains(&rule), "{rule}");
         }
-        assert!(deny
+        assert_eq!(deny.last(), Some(&"NotebookEdit"));
+        assert!(deny[..deny.len() - 1]
             .iter()
             .all(|rule| rule.starts_with("Read(//") || rule.starts_with("Edit(//")));
+    }
+
+    #[test]
+    fn the_canary_tool_is_denied_by_its_bare_name_in_every_turn_and_tools_are_judged_by_it() {
+        for folder in ["/Users/me/Agents/ada", "/Users/me/Projects/site"] {
+            let value = settings(folder, &[]);
+            assert!(strings(&value["permissions"]["deny"]).contains(&CANARY_TOOL));
+        }
+        let listed = |names: &[&str]| -> Vec<String> {
+            names.iter().map(|name| (*name).to_owned()).collect()
+        };
+        assert!(!tools_ignore_settings(&listed(&["Read", "Bash"])));
+        assert!(tools_ignore_settings(&listed(&["Read", "NotebookEdit"])));
+        assert!(tools_ignore_settings(&[]));
+    }
+
+    #[test]
+    fn a_location_check_covers_volumes_and_protected_home_entries_but_not_near_names() {
+        let home = Path::new("/Users/me");
+        assert!(inside_protected_location(
+            Path::new("/Volumes/Backup/project"),
+            Some(home)
+        ));
+        assert!(inside_protected_location(Path::new("/Volumes"), None));
+        assert!(inside_protected_location(
+            Path::new("/Users/me/.ssh/keys"),
+            Some(home)
+        ));
+        assert!(!inside_protected_location(
+            Path::new("/Users/me/Projects"),
+            Some(home)
+        ));
+        assert!(!inside_protected_location(
+            Path::new("/Volumesx/a"),
+            Some(home)
+        ));
+        assert_eq!(
+            protected_folder_reason(),
+            "This folder cannot be used. It is inside a protected location."
+        );
     }
 
     #[test]
@@ -305,7 +369,10 @@ mod tests {
             read.len(),
             PROTECTED_IN_HOME.len() + PROTECTED_ABSOLUTE.len() + 2
         );
-        assert_eq!(strings(&value["permissions"]["deny"]).len(), read.len() * 4);
+        assert_eq!(
+            strings(&value["permissions"]["deny"]).len(),
+            read.len() * 4 + 1
+        );
         for path in [
             "/Users/me/.ssh",
             "/Users/me/.gnupg",

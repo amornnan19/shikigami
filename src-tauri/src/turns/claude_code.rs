@@ -93,6 +93,7 @@ pub struct StepStart {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Parsed {
+    Tools(Vec<String>),
     Session(String),
     TextDelta {
         item_id: String,
@@ -313,11 +314,27 @@ impl StreamParser {
 
     fn system(value: &Value) -> Vec<Parsed> {
         match value.get("subtype").and_then(Value::as_str) {
-            Some("init") => value
-                .get("session_id")
-                .and_then(Value::as_str)
-                .map(|id| vec![Parsed::Session(id.to_owned())])
-                .unwrap_or_default(),
+            Some("init") => {
+                let tools = value
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .map(|tools| {
+                        tools
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let mut parsed = vec![Parsed::Tools(tools)];
+                parsed.extend(
+                    value
+                        .get("session_id")
+                        .and_then(Value::as_str)
+                        .map(|id| Parsed::Session(id.to_owned())),
+                );
+                parsed
+            }
             Some("compact_boundary") => vec![Parsed::Compacted],
             _ => Vec::new(),
         }
@@ -697,7 +714,11 @@ mod tests {
     #[test]
     fn the_basic_fixture_takes_the_session_streams_text_and_ends_the_turn() {
         let parsed = parse(BASIC);
-        assert!(matches!(&parsed[0], Parsed::Session(id) if !id.is_empty()));
+        assert!(
+            matches!(&parsed[0], Parsed::Tools(tools) if tools.contains(&"Read".to_owned())
+            && !tools.contains(&"NotebookEdit".to_owned()))
+        );
+        assert!(matches!(&parsed[1], Parsed::Session(id) if !id.is_empty()));
         let Some(Parsed::TextSet { item_id, text }) = parsed
             .iter()
             .find(|event| matches!(event, Parsed::TextSet { .. }))
@@ -714,6 +735,23 @@ mod tests {
                 api_error_status: None
             })
         );
+    }
+
+    #[test]
+    fn an_init_event_reports_its_tools_before_the_session_and_a_missing_list_is_empty() {
+        let with =
+            parse(r#"{"type":"system","subtype":"init","session_id":"s","tools":["Read","Bash"]}"#);
+        assert_eq!(
+            with,
+            [
+                Parsed::Tools(vec!["Read".to_owned(), "Bash".to_owned()]),
+                Parsed::Session("s".to_owned())
+            ]
+        );
+        let without = parse(r#"{"type":"system","subtype":"init","session_id":"s"}"#);
+        assert_eq!(without[0], Parsed::Tools(Vec::new()));
+        let no_session = parse(r#"{"type":"system","subtype":"init","tools":["Read"]}"#);
+        assert_eq!(no_session, [Parsed::Tools(vec!["Read".to_owned()])]);
     }
 
     #[test]

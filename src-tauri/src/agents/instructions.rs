@@ -1,6 +1,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -75,17 +75,38 @@ fn open_regular(path: &Path) -> Result<Option<(File, fs::Metadata)>, AgentError>
     Ok(Some((file, metadata)))
 }
 
+fn linked() -> AgentError {
+    AgentError::new(
+        "linked",
+        format!(
+            "{} has more than one hard link.",
+            workspace::instruction_file()
+        ),
+    )
+}
+
 pub fn read(folder: &Path) -> Result<Instructions, AgentError> {
     read_up_to(folder, MAX_BYTES)
 }
 
 pub fn read_up_to(folder: &Path, limit: u64) -> Result<Instructions, AgentError> {
+    read_with(folder, limit, false)
+}
+
+pub fn read_for_turn(folder: &Path, limit: u64) -> Result<Instructions, AgentError> {
+    read_with(folder, limit, true)
+}
+
+fn read_with(folder: &Path, limit: u64, refuse_linked: bool) -> Result<Instructions, AgentError> {
     let Some((file, metadata)) = open_regular(&path_in(folder))? else {
         return Ok(Instructions {
             text: String::new(),
             modified_at: None,
         });
     };
+    if refuse_linked && metadata.nlink() > 1 {
+        return Err(linked());
+    }
     if metadata.len() > limit {
         return Err(too_large());
     }
