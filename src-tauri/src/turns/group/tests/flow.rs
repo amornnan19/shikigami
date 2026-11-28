@@ -126,6 +126,37 @@ fn a_user_mention_runs_the_mentioned_member_and_a_plain_message_still_goes_to_th
 }
 
 #[test]
+fn a_reply_addressed_to_the_agent_that_handed_off_is_the_answer_not_a_hand_off() {
+    let fx = Fixture::new();
+    fx.add_cy();
+    let first = fx.started("g", "hello");
+    fx.finish_with(&first, "completed", "@Bo read the first line");
+    let second = fx.next(&first).unwrap();
+    assert_eq!(second.agent_id, "b");
+    fx.finish_with(
+        &second,
+        "completed",
+        "@Ada the first line is X\n@Cy check it too",
+    );
+    assert_eq!(fx.entries(), [entry("c", "hand-off", "check it too")]);
+    let third = fx.next(&second).unwrap();
+    assert_eq!(third.agent_id, "c");
+    fx.finish_with(&third, "completed", "Checked.");
+    let fourth = fx.next(&third).unwrap();
+    assert_eq!(fourth.agent_id, "b");
+    fx.finish_with(&fourth, "completed", "@Ada it is X");
+    assert_eq!(
+        fx.entries(),
+        [entry("a", "continuation", "Continue with Bo's answer.")]
+    );
+    let fifth = fx.next(&fourth).unwrap();
+    assert_eq!(fifth.agent_id, "a");
+    fx.finish_with(&fifth, "completed", "It is X.");
+    assert!(fx.next(&fifth).is_none());
+    assert_eq!(fx.turn_count(), 5);
+}
+
+#[test]
 fn several_user_mentions_run_one_after_another_in_the_order_mentioned() {
     let fx = Fixture::new();
     let first = fx.started("g", "@Bo then @Ada, and @Bo again");
@@ -456,14 +487,14 @@ fn an_agent_with_two_open_debts_in_one_message_continues_for_each() {
         &fx,
         &[
             "@Bo ask",
-            "@Ada back",
-            "@Cy dig",
-            "dug",
+            "@Cy look",
+            "@Ada over",
             "A2 done",
+            "C done",
             "B done",
             "A1 done",
         ],
-        &["a", "b", "a", "c", "a", "b", "a"],
+        &["a", "b", "c", "a", "c", "b", "a"],
     );
 }
 
@@ -476,15 +507,15 @@ fn siblings_with_a_back_hand_off_and_a_nested_one_each_continue_once_in_depth_fi
         &fx,
         &[
             "@Bo p1\n@Cy p2",
-            "@Ada q",
-            "@Dee r",
-            "dee done",
+            "@Dee q",
+            "@Ada r",
             "A2 done",
+            "D done",
             "B done",
             "C done",
             "A1 done",
         ],
-        &["a", "b", "a", "d", "a", "b", "c", "a"],
+        &["a", "b", "d", "a", "d", "b", "c", "a"],
     );
 }
 
@@ -693,21 +724,24 @@ fn a_third_hand_off_between_the_same_two_agents_is_not_queued_and_posts_a_notice
     fx.finish_with(&first, "completed", "@Bo please");
     let second = fx.next(&first).unwrap();
     assert_eq!(second.agent_id, "b");
-    fx.finish_with(&second, "completed", "@Ada back to you");
-    assert_eq!(fx.entries(), [entry("a", "hand-off", "back to you")]);
-    assert!(fx.notices().is_empty());
+    fx.finish_with(&second, "completed", "done");
     let third = fx.next(&second).unwrap();
     assert_eq!(third.agent_id, "a");
-    fx.finish_with(&third, "completed", "@Bo once more");
-    assert!(fx.marks(&third.turn_id).is_empty());
+    fx.finish_with(&third, "completed", "@Bo again");
+    assert_eq!(fx.entries(), [entry("b", "hand-off", "again")]);
+    assert!(fx.notices().is_empty());
+    let fourth = fx.next(&third).unwrap();
+    assert_eq!(fourth.agent_id, "b");
+    fx.finish_with(&fourth, "completed", "done again");
+    let fifth = fx.next(&fourth).unwrap();
+    assert_eq!(fifth.agent_id, "a");
+    fx.finish_with(&fifth, "completed", "@Bo once more");
+    assert!(fx.marks(&fifth.turn_id).is_empty());
     assert_eq!(
         fx.notices(),
         ["Ada and Bo keep handing work back; that hand-off was not started."]
     );
-    assert_eq!(
-        fx.entries(),
-        [entry("b", "continuation", "Continue with Ada's answer.")]
-    );
+    assert!(fx.entries().is_empty());
 }
 
 #[test]
@@ -716,7 +750,9 @@ fn two_hand_offs_in_a_row_between_the_same_agents_are_allowed() {
     let first = fx.started("g", "hello");
     fx.finish_with(&first, "completed", "@Bo please");
     let second = fx.next(&first).unwrap();
-    fx.finish_with(&second, "completed", "@Ada back to you");
+    fx.finish_with(&second, "completed", "done");
+    let third = fx.next(&second).unwrap();
+    fx.finish_with(&third, "completed", "@Bo again");
     assert_eq!(fx.entries().len(), 1);
     assert!(fx.notices().is_empty());
 }

@@ -331,18 +331,20 @@ esac"#,
     #[tokio::test]
     async fn a_help_probe_that_times_out_is_not_cached() {
         let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join("seen");
+        let slow = dir.path().join("slow");
         fake(
             dir.path(),
             "claude",
             &format!(
-                "if [ ! -f {m} ]; then /usr/bin/touch {m}; /bin/sleep 5; fi\necho '--late-flag'",
-                m = marker.display()
+                "if [ -f {m} ]; then /bin/sleep 30; fi\necho '--late-flag'",
+                m = slow.display()
             ),
         );
+        fs::write(&slow, "").unwrap();
         let path = dir.path().join("claude");
         let short = Duration::from_millis(400);
         assert!(!help_lists_flag_within(&path, &dirs(&dir), "--late-flag", short).await);
+        fs::remove_file(&slow).unwrap();
         assert!(help_lists_flag_within(&path, &dirs(&dir), "--late-flag", LIMIT).await);
     }
 

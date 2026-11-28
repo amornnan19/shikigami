@@ -235,8 +235,22 @@ pub fn queue_after(
     };
     let members = groups::store::members_of(connection, &turn.group_id)?;
     let reply = final_reply(connection, turn_id)?.unwrap_or_default();
+    let owed_agent: Option<String> = match &turn.parent_turn_id {
+        Some(parent) => connection
+            .query_row(
+                "SELECT agent_id FROM turns WHERE id = ?1",
+                [parent],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten(),
+        None => None,
+    };
     let mut created = 0;
-    for hand_off in mentions::hand_offs(&reply, &members, &turn.agent_id) {
+    for hand_off in mentions::hand_offs(&reply, &members, &turn.agent_id)
+        .into_iter()
+        .filter(|hand_off| owed_agent.as_deref() != Some(hand_off.agent_id.as_str()))
+    {
         if turns_of_root(connection, &turn.group_id, &turn.root)? >= MAX_TURNS {
             post_limit_notice(connection, &turn, turn_id, now, &mut notices)?;
             break;
