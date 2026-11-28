@@ -774,3 +774,84 @@ fn the_groups_root_defaults_to_home_and_rejects_a_relative_override() {
     assert!(resolve_groups_root(Some(home), Some(OsString::from("rel"))).is_err());
     assert!(resolve_groups_root(None, None).is_err());
 }
+
+fn open_hand_off(fx: &Fixture, group: &str, from: &str, to: &str) {
+    fx.db.with_connection(|conn| {
+        conn.execute(
+            "INSERT INTO turns (id, agent_id, group_id, status, started_at, root_message_id, deferred)
+             VALUES ('t1', ?1, ?2, 'completed', 1, 'r', 1)",
+            params![from, group],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO group_queue (id, group_id, addressed_agent_id, content, kind, root_message_id, parent_turn_id, position, created_at)
+             VALUES ('q', ?1, ?2, 'task', 'hand-off', 'r', 't1', 0, 1)",
+            params![group, to],
+        )
+        .unwrap();
+    });
+}
+
+fn queue_rows(fx: &Fixture) -> Vec<(String, String, String)> {
+    fx.db.with_connection(|conn| {
+        conn.prepare("SELECT addressed_agent_id, kind, content FROM group_queue ORDER BY position")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    })
+}
+
+#[test]
+fn a_member_removed_from_a_group_resolves_the_debt_of_its_waiting_hand_off() {
+    let fx = Fixture::new();
+    let folder = fx.project("repo");
+    let a = fx.agent("Ada");
+    let b = fx.agent("Bo");
+    let c = fx.agent("Cy");
+    let created = fx
+        .create(fx.input("Team", &[&a, &b, &c], &a, Some(&folder)))
+        .unwrap();
+    let id = created.group.id;
+    open_hand_off(&fx, &id, &a, &b);
+    update(
+        &fx.db,
+        &id,
+        UpdateGroupInput {
+            member_ids: Some(vec![a.clone(), c.clone()]),
+            ..UpdateGroupInput::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        queue_rows(&fx),
+        [(
+            a,
+            "continuation".to_owned(),
+            "Continue without Bo's answer.".to_owned()
+        )]
+    );
+}
+
+#[test]
+fn a_deleted_agent_resolves_the_debt_of_its_waiting_hand_off() {
+    let fx = Fixture::new();
+    let folder = fx.project("repo");
+    let a = fx.agent("Ada");
+    let b = fx.agent("Bo");
+    let c = fx.agent("Cy");
+    let created = fx
+        .create(fx.input("Team", &[&a, &b, &c], &a, Some(&folder)))
+        .unwrap();
+    open_hand_off(&fx, &created.group.id, &a, &b);
+    fx.delete_agent(&b);
+    assert_eq!(
+        queue_rows(&fx),
+        [(
+            a,
+            "continuation".to_owned(),
+            "Continue without Bo's answer.".to_owned()
+        )]
+    );
+}

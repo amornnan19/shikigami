@@ -21,7 +21,7 @@ struct Finished {
     agent_id: String,
     root: String,
     hop: i64,
-    return_to: Option<String>,
+    parent_turn_id: Option<String>,
     access: AccessLevel,
 }
 
@@ -36,7 +36,7 @@ fn finished_turn(connection: &Connection, turn_id: &str) -> rusqlite::Result<Opt
     );
     let row: Option<Row> = connection
         .query_row(
-            "SELECT group_id, agent_id, root_message_id, hop, return_to, access
+            "SELECT group_id, agent_id, root_message_id, hop, parent_turn_id, access
              FROM turns WHERE id = ?1",
             [turn_id],
             |row| {
@@ -52,13 +52,13 @@ fn finished_turn(connection: &Connection, turn_id: &str) -> rusqlite::Result<Opt
         )
         .optional()?;
     Ok(
-        row.and_then(|(group_id, agent_id, root, hop, return_to, access)| {
+        row.and_then(|(group_id, agent_id, root, hop, parent_turn_id, access)| {
             Some(Finished {
                 group_id: group_id?,
                 agent_id: agent_id?,
                 root: root.unwrap_or_else(|| turn_id.to_owned()),
                 hop,
-                return_to,
+                parent_turn_id,
                 access: AccessLevel::from_value(access),
             })
         }),
@@ -256,10 +256,10 @@ pub fn queue_after(
             from_agent_id: Some(turn.agent_id.clone()),
             root: Some(turn.root.clone()),
             hop: turn.hop + 1,
-            return_to: Some(turn.agent_id.clone()),
             parent_turn_id: Some(turn_id.to_owned()),
+            owes_turn_id: None,
             access: turn.access,
-            truncated: false,
+            notice: None,
         };
         let position = place_at_head(connection, &turn.group_id, created)?;
         enqueue_at(
@@ -275,86 +275,215 @@ pub fn queue_after(
     }
     if created > 0 {
         connection.execute("UPDATE turns SET deferred = 1 WHERE id = ?1", [turn_id])?;
-    } else if let Some(owed) = turn.return_to.as_deref() {
-        queue_continuation(connection, &turn, turn_id, owed, now, &mut notices)?;
+    } else {
+        let answer = Answer {
+            agent_id: Some(turn.agent_id.clone()),
+            name: name_of(connection, &turn.agent_id)?,
+            finished: true,
+        };
+        settle_for(connection, &turn, turn_id, answer, now, &mut notices)?;
     }
     Ok(notices)
 }
 
-fn owed_elsewhere(connection: &Connection, turn: &Finished, owed: &str) -> rusqlite::Result<bool> {
-    connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM group_queue
-                       WHERE group_id = ?1 AND root_message_id = ?2 AND return_to = ?3)
-             OR EXISTS(SELECT 1 FROM turns
-                       WHERE group_id = ?1 AND root_message_id = ?2 AND return_to = ?3
-                         AND (status = 'running' OR deferred = 1))",
-        params![turn.group_id, turn.root, owed],
-        |row| row.get(0),
-    )
+pub fn unfinished_after(
+    connection: &Connection,
+    turn_id: &str,
+    now: i64,
+) -> rusqlite::Result<Vec<Notice>> {
+    let mut notices = Vec::new();
+    let Some(turn) = finished_turn(connection, turn_id)? else {
+        return Ok(notices);
+    };
+    let answer = Answer {
+        agent_id: Some(turn.agent_id.clone()),
+        name: name_of(connection, &turn.agent_id)?,
+        finished: false,
+    };
+    settle_for(connection, &turn, turn_id, answer, now, &mut notices)?;
+    Ok(notices)
 }
 
-fn queue_continuation(
+pub fn settle_interrupted(
+    connection: &Connection,
+    turn_ids: &[String],
+    now: i64,
+) -> rusqlite::Result<()> {
+    for turn_id in turn_ids {
+        unfinished_after(connection, turn_id, now)?;
+    }
+    Ok(())
+}
+
+pub fn drop_for_departed(
+    connection: &Connection,
+    group_id: Option<&str>,
+    agent_id: &str,
+    now: i64,
+) -> rusqlite::Result<()> {
+    if group_id.is_none() {
+        connection.execute("DELETE FROM group_members WHERE agent_id = ?1", [agent_id])?;
+    }
+    type Waiting = (String, String, Option<String>, i64, i64);
+    let waiting: Vec<Waiting> = {
+        let mut statement = connection.prepare(
+            "SELECT id, group_id, parent_turn_id, hop, access
+             FROM group_queue
+             WHERE addressed_agent_id = ?1 AND kind IN ('hand-off', 'continuation')
+               AND (?2 IS NULL OR group_id = ?2)
+             ORDER BY position",
+        )?;
+        let rows = statement.query_map(params![agent_id, group_id], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let name = name_of(connection, agent_id)?;
+    for (id, entry_group, parent, hop, access) in waiting {
+        connection.execute("DELETE FROM group_queue WHERE id = ?1", [&id])?;
+        let answer = Answer {
+            agent_id: Some(agent_id.to_owned()),
+            name: name.clone(),
+            finished: false,
+        };
+        settle(
+            connection,
+            &entry_group,
+            parent,
+            answer,
+            hop,
+            AccessLevel::from_value(access),
+            now,
+        )?;
+    }
+    Ok(())
+}
+
+struct Answer {
+    agent_id: Option<String>,
+    name: String,
+    finished: bool,
+}
+
+enum Settled {
+    Nothing,
+    Queued,
+    LimitReached,
+}
+
+fn settle_for(
     connection: &Connection,
     turn: &Finished,
     turn_id: &str,
-    owed: &str,
+    answer: Answer,
     now: i64,
     notices: &mut Vec<Notice>,
 ) -> rusqlite::Result<()> {
-    let still_member: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM group_members WHERE group_id = ?1 AND agent_id = ?2)",
-        params![turn.group_id, owed],
-        |row| row.get(0),
-    )?;
-    let waiting: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM group_queue
-                       WHERE group_id = ?1 AND root_message_id = ?2 AND addressed_agent_id = ?3
-                         AND kind = 'continuation')",
-        params![turn.group_id, turn.root, owed],
-        |row| row.get(0),
-    )?;
-    if !still_member || waiting || owed_elsewhere(connection, turn, owed)? {
-        return Ok(());
-    }
-    let debt: Option<(String, Option<String>)> = connection
-        .query_row(
-            "SELECT id, return_to FROM turns
-             WHERE group_id = ?1 AND root_message_id = ?2 AND agent_id = ?3 AND deferred = 1
-             ORDER BY rowid DESC LIMIT 1",
-            params![turn.group_id, turn.root, owed],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    let Some((debt_id, carried)) = debt else {
-        return Ok(());
-    };
-    if turns_of_root(connection, &turn.group_id, &turn.root)? >= MAX_TURNS {
-        return post_limit_notice(connection, turn, turn_id, now, notices);
-    }
-    connection.execute("UPDATE turns SET deferred = 0 WHERE id = ?1", [debt_id])?;
-    let text = format!(
-        "Continue with {}'s answer.",
-        name_of(connection, &turn.agent_id)?
-    );
-    let origin = Origin {
-        kind: EntryKind::Continuation,
-        from_agent_id: Some(turn.agent_id.clone()),
-        root: Some(turn.root.clone()),
-        hop: turn.hop + 1,
-        return_to: carried,
-        parent_turn_id: Some(turn_id.to_owned()),
-        access: turn.access,
-        truncated: false,
-    };
-    let position = place_at_head(connection, &turn.group_id, 0)?;
-    enqueue_at(
+    let settled = settle(
         connection,
         &turn.group_id,
-        owed,
-        &text,
-        &origin,
-        position,
+        turn.parent_turn_id.clone(),
+        answer,
+        turn.hop,
+        turn.access,
         now,
     )?;
+    if matches!(settled, Settled::LimitReached) {
+        post_limit_notice(connection, turn, turn_id, now, notices)?;
+    }
     Ok(())
+}
+
+fn settle(
+    connection: &Connection,
+    group_id: &str,
+    first_parent: Option<String>,
+    first_answer: Answer,
+    hop: i64,
+    access: AccessLevel,
+    now: i64,
+) -> rusqlite::Result<Settled> {
+    let mut parent = first_parent;
+    let mut answer = first_answer;
+    while let Some(parent_id) = parent.take() {
+        type Row = (Option<String>, Option<String>, Option<String>, bool);
+        let row: Option<Row> = connection
+            .query_row(
+                "SELECT agent_id, root_message_id, parent_turn_id, deferred FROM turns WHERE id = ?1",
+                [&parent_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((agent_id, root, grandparent, deferred)) = row else {
+            break;
+        };
+        if !deferred {
+            break;
+        }
+        let open: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM group_queue WHERE parent_turn_id = ?1)
+                 OR EXISTS(SELECT 1 FROM turns
+                           WHERE parent_turn_id = ?1 AND (status = 'running' OR deferred = 1))",
+            [&parent_id],
+            |row| row.get(0),
+        )?;
+        if open {
+            break;
+        }
+        connection.execute("UPDATE turns SET deferred = 0 WHERE id = ?1", [&parent_id])?;
+        let root = root.unwrap_or_else(|| parent_id.clone());
+        let present: bool = match &agent_id {
+            Some(agent) => connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM group_members WHERE group_id = ?1 AND agent_id = ?2)",
+                params![group_id, agent],
+                |row| row.get(0),
+            )?,
+            None => false,
+        };
+        if let (true, Some(agent)) = (present, agent_id.as_deref()) {
+            if turns_of_root(connection, group_id, &root)? >= MAX_TURNS {
+                return Ok(Settled::LimitReached);
+            }
+            let (text, notice) = if answer.finished {
+                (format!("Continue with {}'s answer.", answer.name), None)
+            } else {
+                (
+                    format!("Continue without {}'s answer.", answer.name),
+                    Some(format!(
+                        "{} did not finish; continuing without its answer.",
+                        answer.name
+                    )),
+                )
+            };
+            let origin = Origin {
+                kind: EntryKind::Continuation,
+                from_agent_id: answer.agent_id.clone(),
+                root: Some(root),
+                hop: hop + 1,
+                parent_turn_id: grandparent,
+                owes_turn_id: Some(parent_id),
+                access,
+                notice,
+            };
+            let position = place_at_head(connection, group_id, 0)?;
+            enqueue_at(connection, group_id, agent, &text, &origin, position, now)?;
+            return Ok(Settled::Queued);
+        }
+        answer = Answer {
+            agent_id: None,
+            name: match &agent_id {
+                Some(agent) => name_of(connection, agent)?,
+                None => "Former member".to_owned(),
+            },
+            finished: false,
+        };
+        parent = grandparent;
+    }
+    Ok(Settled::Nothing)
 }

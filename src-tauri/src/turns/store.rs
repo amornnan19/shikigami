@@ -479,6 +479,10 @@ pub fn finish_turn_rows(
 
 pub fn sweep_interrupted(connection: &Connection, now: i64) -> rusqlite::Result<usize> {
     let transaction = connection.unchecked_transaction()?;
+    let group_turns: Vec<String> = transaction
+        .prepare("SELECT id FROM turns WHERE status = 'running' AND group_id IS NOT NULL")?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
     transaction.execute(
         "UPDATE steps SET status = 'stopped'
          WHERE status = 'running'
@@ -489,6 +493,7 @@ pub fn sweep_interrupted(connection: &Connection, now: i64) -> rusqlite::Result<
         "UPDATE turns SET status = 'interrupted', ended_at = ?1 WHERE status = 'running'",
         [now],
     )?;
+    super::group::settle_interrupted(&transaction, &group_turns, now)?;
     transaction.commit()?;
     Ok(count)
 }

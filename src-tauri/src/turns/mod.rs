@@ -904,6 +904,14 @@ fn resume_group(
         .transpose()
 }
 
+pub fn drop_departed_hand_offs(
+    connection: &rusqlite::Connection,
+    group_id: Option<&str>,
+    agent_id: &str,
+) -> rusqlite::Result<()> {
+    group::drop_for_departed(connection, group_id, agent_id, now_millis())
+}
+
 pub fn sweep_instruction_files(dir: &Path) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;

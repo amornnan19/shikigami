@@ -413,13 +413,15 @@ fn a_stopped_failed_or_interrupted_turn_hands_nothing_off_and_queues_no_continua
         assert!(fx.entries().is_empty(), "{status}");
         assert!(fx.next(&first).is_none(), "{status}");
 
-        let fx = Fixture::new();
-        let first = fx.started("g", "hello");
-        fx.finish_with(&first, "completed", "@Bo check the README");
-        let second = fx.next(&first).unwrap();
-        fx.finish_with(&second, status, "partial answer");
-        assert!(fx.entries().is_empty(), "{status}");
-        assert!(fx.next(&second).is_none(), "{status}");
+        if status == "stopped" {
+            let fx = Fixture::new();
+            let first = fx.started("g", "hello");
+            fx.finish_with(&first, "completed", "@Bo check the README");
+            let second = fx.next(&first).unwrap();
+            fx.finish_with(&second, status, "partial answer");
+            assert!(fx.entries().is_empty(), "{status}");
+            assert!(fx.next(&second).is_none(), "{status}");
+        }
     }
     let fx = Fixture::new();
     let first = fx.started("g", "hello");
@@ -435,6 +437,178 @@ fn a_stopped_failed_or_interrupted_turn_hands_nothing_off_and_queues_no_continua
         .with_connection(|c| super::super::super::store::sweep_interrupted(c, 60))
         .unwrap();
     assert!(fx.entries().is_empty());
+}
+
+fn all_continue(fx: &Fixture, replies: &[&str], expected: &[&str]) {
+    let first = fx.started("g", "hello");
+    let steps: Vec<(&str, &str)> = replies.iter().map(|reply| ("completed", *reply)).collect();
+    assert_eq!(fx.order(first, &steps), expected);
+    assert!(fx.entries().is_empty());
+    assert_eq!(fx.turn_count(), expected.len() as i64);
+    assert!(fx.notices().is_empty());
+}
+
+#[test]
+fn an_agent_with_two_open_debts_in_one_message_continues_for_each() {
+    let fx = Fixture::new();
+    fx.add_cy();
+    all_continue(
+        &fx,
+        &[
+            "@Bo ask",
+            "@Ada back",
+            "@Cy dig",
+            "dug",
+            "A2 done",
+            "B done",
+            "A1 done",
+        ],
+        &["a", "b", "a", "c", "a", "b", "a"],
+    );
+}
+
+#[test]
+fn siblings_with_a_back_hand_off_and_a_nested_one_each_continue_once_in_depth_first_order() {
+    let fx = Fixture::new();
+    fx.add_cy();
+    fx.add_dee();
+    all_continue(
+        &fx,
+        &[
+            "@Bo p1\n@Cy p2",
+            "@Ada q",
+            "@Dee r",
+            "dee done",
+            "A2 done",
+            "B done",
+            "C done",
+            "A1 done",
+        ],
+        &["a", "b", "a", "d", "a", "b", "c", "a"],
+    );
+}
+
+#[test]
+fn a_failed_grandchild_lets_its_parent_continue_with_a_notice_and_the_chain_go_on() {
+    let fx = Fixture::new();
+    fx.add_cy();
+    let first = fx.started("g", "hello");
+    fx.finish_with(&first, "completed", "@Bo ask Cy");
+    let bo = fx.next(&first).unwrap();
+    fx.finish_with(&bo, "completed", "@Cy dig");
+    let cy = fx.next(&bo).unwrap();
+    fx.finish_with(&cy, "failed", "");
+    assert_eq!(
+        fx.entries(),
+        [entry("b", "continuation", "Continue without Cy's answer.")]
+    );
+    let bo_again = fx.next(&cy).unwrap();
+    assert_eq!(bo_again.agent_id, "b");
+    assert_eq!(
+        fx.notices(),
+        ["Cy did not finish; continuing without its answer."]
+    );
+    fx.finish_with(&bo_again, "completed", "Bo wraps up");
+    let ada = fx.next(&bo_again).unwrap();
+    assert_eq!(ada.agent_id, "a");
+    assert!(ada.text.contains("Bo: Bo wraps up"));
+}
+
+#[test]
+fn an_interrupted_grandchild_is_settled_by_the_startup_sweep_and_the_parent_waits_for_resume() {
+    let fx = Fixture::new();
+    fx.add_cy();
+    let first = fx.started("g", "hello");
+    fx.finish_with(&first, "completed", "@Bo ask Cy");
+    let bo = fx.next(&first).unwrap();
+    fx.finish_with(&bo, "completed", "@Cy dig");
+    let cy = fx.next(&bo).unwrap();
+    fx.registry.clear(&cy.agent_id, &cy.turn_id);
+    fx.db
+        .with_connection(|c| super::super::super::store::sweep_interrupted(c, 60))
+        .unwrap();
+    assert_eq!(
+        fx.entries(),
+        [entry("b", "continuation", "Continue without Cy's answer.")]
+    );
+    let resumed = resume_group(&fx.db, &fx.registry, &fx.dirs(), "g")
+        .unwrap()
+        .unwrap();
+    assert_eq!(resumed.agent_id, "b");
+    assert_eq!(
+        fx.notices(),
+        ["Cy did not finish; continuing without its answer."]
+    );
+}
+
+#[test]
+fn a_member_removed_mid_chain_resolves_its_parents_debt() {
+    let fx = Fixture::new();
+    let first = fx.started("g", "hello");
+    fx.finish_with(&first, "completed", "@Bo check");
+    assert_eq!(fx.entries(), [entry("b", "hand-off", "check")]);
+    fx.db.with_connection(|c| {
+        crate::groups::store::replace_members(c, "g", &["a".to_owned()], 60).unwrap();
+        super::super::drop_for_departed(c, Some("g"), "b", 60).unwrap();
+    });
+    assert_eq!(
+        fx.entries(),
+        [entry("a", "continuation", "Continue without Bo's answer.")]
+    );
+}
+
+#[test]
+fn a_deleted_agent_resolves_its_waiting_hand_off_and_a_parent_that_left_passes_the_debt_up() {
+    let fx = Fixture::new();
+    fx.add_cy();
+    let first = fx.started("g", "hello");
+    fx.finish_with(&first, "completed", "@Bo ask Cy");
+    let bo = fx.next(&first).unwrap();
+    fx.finish_with(&bo, "completed", "@Cy dig");
+    fx.db.with_connection(|c| {
+        super::super::drop_for_departed(c, None, "b", 60).unwrap();
+    });
+    assert_eq!(fx.entries(), [entry("c", "hand-off", "dig")]);
+    let cy = fx.next(&bo).unwrap();
+    fx.finish_with(&cy, "completed", "dug");
+    assert_eq!(
+        fx.entries(),
+        [entry("a", "continuation", "Continue without Bo's answer.")]
+    );
+}
+
+#[test]
+fn an_edited_queued_message_is_stored_and_shown_and_reaches_other_agents() {
+    let fx = Fixture::new();
+    fx.add_cy();
+    let first = fx.started("g", "@Bo look then @Ada decide");
+    let queued = fx.db.with_connection(|c| list_queue(c, "g")).unwrap();
+    fx.db
+        .with_connection(|c| edit_queued(c, &queued[0].id, "@Ada decide differently"))
+        .unwrap();
+    fx.finish_with(&first, "completed", "looked");
+    let second = fx.next(&first).unwrap();
+    assert_eq!(second.agent_id, "a");
+    fx.finish_with(&second, "completed", "decided");
+    let page = fx
+        .db
+        .with_connection(|c| store::group_conversation(c, "g", None))
+        .unwrap();
+    let bubbles: Vec<&str> = page
+        .turns
+        .iter()
+        .map(|turn| turn.user_message.as_str())
+        .collect();
+    assert_eq!(
+        bubbles,
+        ["@Bo look then @Ada decide", "@Ada decide differently"]
+    );
+    let cy = fx.started("g", "@Cy catch up");
+    assert!(cy.text.contains("User: @Ada decide differently"));
+    assert_eq!(
+        cy.text.matches("User: @Bo look then @Ada decide").count(),
+        1
+    );
 }
 
 #[test]
@@ -789,4 +963,45 @@ fn the_conversation_tells_a_hand_off_or_continuation_turn_from_a_user_turn() {
             ("continuation".to_owned(), Some("b".to_owned())),
         ]
     );
+}
+
+fn crafted(fx: &Fixture, parent_deferred: i64, sibling_deferred: i64) {
+    fx.db.with_connection(|c| {
+        c.execute(
+            "INSERT INTO turns (id, agent_id, group_id, status, started_at, root_message_id, deferred)
+             VALUES ('p', 'a', 'g', 'completed', 1, 'r', ?1)",
+            [parent_deferred],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO turns (id, agent_id, group_id, status, started_at, root_message_id, deferred, parent_turn_id, kind)
+             VALUES ('s', 'b', 'g', 'completed', 2, 'r', ?1, 'p', 'hand-off')",
+            [sibling_deferred],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO turns (id, agent_id, group_id, status, started_at, root_message_id, parent_turn_id, kind)
+             VALUES ('c', 'b', 'g', 'failed', 3, 'r', 'p', 'hand-off')",
+            [],
+        )
+        .unwrap();
+        super::super::hand_offs::unfinished_after(c, "c", 60).unwrap();
+    });
+}
+
+#[test]
+fn a_parent_is_not_resolved_while_a_sibling_is_itself_waiting_on_its_own_children() {
+    let fx = Fixture::new();
+    crafted(&fx, 1, 1);
+    assert!(fx.entries().is_empty());
+    let fx = Fixture::new();
+    crafted(&fx, 1, 0);
+    assert_eq!(fx.entries().len(), 1);
+}
+
+#[test]
+fn a_parent_that_is_no_longer_owed_gets_no_second_continuation() {
+    let fx = Fixture::new();
+    crafted(&fx, 0, 0);
+    assert!(fx.entries().is_empty());
 }

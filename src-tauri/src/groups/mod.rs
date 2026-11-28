@@ -407,7 +407,11 @@ fn update(db: &Database, group_id: &str, input: UpdateGroupInput) -> Result<Grou
             store::rename(&transaction, group_id, name)?;
         }
         if let Some(members) = &members {
+            let before = store::member_ids(&transaction, group_id)?;
             store::replace_members(&transaction, group_id, members, now_millis())?;
+            for gone in before.iter().filter(|id| !members.contains(id)) {
+                crate::turns::drop_departed_hand_offs(&transaction, Some(group_id), gone)?;
+            }
         }
         if let Some(lead) = &lead {
             store::set_lead(&transaction, group_id, Some(lead))?;
