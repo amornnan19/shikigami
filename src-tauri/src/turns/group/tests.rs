@@ -760,13 +760,13 @@ fn a_group_queue_message_can_be_edited_and_removed_until_it_starts() {
     assert_eq!((group.as_str(), edited.text.as_str()), ("g", "two, edited"));
     let removed = fx
         .db
-        .with_connection(|c| remove_queued(c, &queue[1].id))
+        .with_connection(|c| remove_queued(c, &queue[1].id, 60))
         .unwrap();
     assert_eq!(removed.as_deref(), Some("g"));
     assert_eq!(fx.queue_texts("g"), ["two, edited"]);
     assert!(fx
         .db
-        .with_connection(|c| remove_queued(c, &queue[1].id))
+        .with_connection(|c| remove_queued(c, &queue[1].id, 60))
         .unwrap()
         .is_none());
     assert!(fx
