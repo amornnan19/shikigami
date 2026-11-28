@@ -69,6 +69,8 @@ chat.
 - In an agent's final reply, a line that starts with `@Name` (a member other than itself) is a
   hand-off: the rest of that line, plus any following lines up to the next hand-off line, is the task
   for that member. The member's turn is queued right after the current one.
+- A line addressed to the agent that handed the current task over is part of the answer, not a
+  hand-off: that agent continues with the answer anyway.
 - When a member finishes a task handed to it by another agent, the agent that handed it off gets a
   turn to continue, with the member's answer among its unseen messages.
 - Hand-offs run depth first: a hand-off made by the member that answers runs before the next
