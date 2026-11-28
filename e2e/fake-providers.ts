@@ -106,6 +106,11 @@ case "$1" in
         sleep 7
         tail -n +5 "$dir/claude-stream-basic.jsonl"
         exit 0 ;;
+      *SIGNIN*)
+        head -n 4 "$dir/claude-stream-basic.jsonl"
+        sleep 3
+        printf '%s\\n' '{"type":"result","subtype":"success","is_error":true,"api_error_status":401,"result":"Invalid API key · Please run /login"}'
+        exit 1 ;;
       *files*) fixture="$dir/claude-stream-denied.jsonl" ;;
       *) fixture="$dir/claude-stream-basic.jsonl" ;;
     esac

@@ -102,10 +102,33 @@ pub enum Parsed {
         failed: bool,
         output: String,
     },
+    Compacted,
     Result {
         is_error: bool,
         text: String,
+        api_error_status: Option<u64>,
     },
+}
+
+const SIGN_IN_MARKERS: [&str; 5] = [
+    "authentication_error",
+    "invalid x-api-key",
+    "invalid api key",
+    "not logged in",
+    "please run /login",
+];
+const TOKEN_EXPIRED: &str = "oauth token has expired";
+const UNAUTHORIZED: u64 = 401;
+
+pub fn is_sign_in_failure(error_text: &str, api_error_status: Option<u64>) -> bool {
+    if api_error_status == Some(UNAUTHORIZED) {
+        return true;
+    }
+    let lowered = error_text.to_lowercase();
+    SIGN_IN_MARKERS
+        .iter()
+        .chain([&TOKEN_EXPIRED])
+        .any(|marker| lowered.contains(marker))
 }
 
 #[derive(Default)]
@@ -192,14 +215,15 @@ impl StreamParser {
     }
 
     fn system(value: &Value) -> Vec<Parsed> {
-        if value.get("subtype").and_then(Value::as_str) != Some("init") {
-            return Vec::new();
+        match value.get("subtype").and_then(Value::as_str) {
+            Some("init") => value
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(|id| vec![Parsed::Session(id.to_owned())])
+                .unwrap_or_default(),
+            Some("compact_boundary") => vec![Parsed::Compacted],
+            _ => Vec::new(),
         }
-        value
-            .get("session_id")
-            .and_then(Value::as_str)
-            .map(|id| vec![Parsed::Session(id.to_owned())])
-            .unwrap_or_default()
     }
 
     fn message_key(&self, value: &Value) -> String {
@@ -361,7 +385,12 @@ impl StreamParser {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
-        vec![Parsed::Result { is_error, text }]
+        let api_error_status = value.get("api_error_status").and_then(Value::as_u64);
+        vec![Parsed::Result {
+            is_error,
+            text,
+            api_error_status,
+        }]
     }
 }
 
@@ -537,7 +566,8 @@ mod tests {
             parsed.last(),
             Some(&Parsed::Result {
                 is_error: false,
-                text: "pong".to_owned()
+                text: "pong".to_owned(),
+                api_error_status: None
             })
         );
     }
@@ -623,9 +653,58 @@ mod tests {
             StreamParser::default().line(line),
             vec![Parsed::Result {
                 is_error: true,
-                text: "Boom".to_owned()
+                text: "Boom".to_owned(),
+                api_error_status: None
             }]
         );
+    }
+
+    #[test]
+    fn an_error_result_carries_the_api_error_status() {
+        let line = r#"{"type":"result","subtype":"success","is_error":true,"api_error_status":401,"result":"Invalid API key"}"#;
+        assert_eq!(
+            StreamParser::default().line(line),
+            vec![Parsed::Result {
+                is_error: true,
+                text: "Invalid API key".to_owned(),
+                api_error_status: Some(401)
+            }]
+        );
+    }
+
+    #[test]
+    fn a_compact_boundary_event_is_reported_and_other_system_events_are_not() {
+        let mut parser = StreamParser::default();
+        let boundary = r#"{"type":"system","subtype":"compact_boundary","session_id":"s","compact_metadata":{"trigger":"auto","pre_tokens":1000}}"#;
+        assert_eq!(parser.line(boundary), vec![Parsed::Compacted]);
+        let micro = r#"{"type":"system","subtype":"microcompact_boundary"}"#;
+        assert!(parser.line(micro).is_empty());
+    }
+
+    #[test]
+    fn sign_in_failures_are_told_from_other_errors() {
+        for text in [
+            "API Error: 401 {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\"}}",
+            "Invalid X-API-Key",
+            "Invalid API key · Fix external API key",
+            "Not logged in · Please run /login",
+            "Please run /login",
+            "OAuth token has expired. Please obtain a new token",
+            "AUTHENTICATION_ERROR",
+        ] {
+            assert!(is_sign_in_failure(text, None), "{text}");
+        }
+        assert!(is_sign_in_failure("anything", Some(401)));
+        assert!(is_sign_in_failure("", Some(401)));
+        for (text, status) in [
+            ("Credit balance is too low", None),
+            ("Credit balance is too low", Some(400)),
+            ("Boom", None),
+            ("", None),
+            ("rate limited", Some(429)),
+        ] {
+            assert!(!is_sign_in_failure(text, status), "{text}");
+        }
     }
 
     #[test]
