@@ -340,6 +340,43 @@ pub struct GroupRun {
     pub instructions: String,
     pub temp_dir: PathBuf,
     pub previous_seen: i64,
+    pub context: String,
+    pub context_hash: String,
+    pub context_stale: bool,
+    pub context_changed: bool,
+    pub input: String,
+    pub folder_notice: Option<String>,
+}
+
+impl GroupRun {
+    pub fn stdin(&self, session: &claude_code::Session) -> String {
+        let fresh = matches!(session, claude_code::Session::New(_));
+        if fresh || self.context_stale {
+            let prefix = if !fresh && self.context_changed {
+                "The group details changed:\n"
+            } else {
+                ""
+            };
+            format!(
+                "{prefix}{}\n\n{}{}",
+                self.context,
+                group::MESSAGES_HEADER,
+                self.input
+            )
+        } else {
+            format!("{}{}", group::MESSAGES_HEADER, self.input)
+        }
+    }
+}
+
+fn folder_notice(error: &crate::agents::AgentError) -> String {
+    let reason = match error.code {
+        "too-large" => "it is larger than 64 KiB",
+        "not-text" => "it is not UTF-8 text",
+        "not-a-file" => "it is not a regular file",
+        _ => "it could not be read",
+    };
+    format!("The group folder's CLAUDE.md was not loaded ({reason}).")
 }
 
 pub struct Launch {
@@ -450,13 +487,29 @@ fn launch_of_group(
     let instructions = instructions::read(Path::new(&begun.begun.agent.workspace_path))
         .map(|read| read.text)
         .unwrap_or_default();
-    let folder_instructions = instructions::read_up_to(
+    let (folder_instructions, folder_notice) = match instructions::read_up_to(
         Path::new(&begun.folder),
         group::FOLDER_INSTRUCTIONS_MAX_BYTES,
-    )
-    .map(|read| read.text)
-    .unwrap_or_default();
-    let text = group::turn_input(&begun, &folder_instructions);
+    ) {
+        Ok(read) => (read.text, None),
+        Err(error) => (String::new(), Some(folder_notice(&error))),
+    };
+    let context = group::context_block(&begun, &folder_instructions);
+    let context_hash = group::context_hash(&context);
+    let context_stale = begun.stored_context_hash.as_deref() != Some(context_hash.as_str());
+    let run = GroupRun {
+        group_id: begun.group_id,
+        instructions,
+        temp_dir: registry.temp_dir(),
+        previous_seen: begun.previous_seen,
+        context,
+        context_hash,
+        context_stale,
+        context_changed: context_stale && begun.stored_context_hash.is_some(),
+        input: begun.input,
+        folder_notice,
+    };
+    let text = run.stdin(&begun.begun.session);
     Some(Launch {
         agent_id: begun.agent_id,
         turn_id: begun.begun.turn_id,
@@ -470,12 +523,7 @@ fn launch_of_group(
         environment: std::env::vars_os().collect(),
         stall_timeout: stall_timeout(),
         tool_stall_timeout: TOOL_STALL_TIMEOUT,
-        group: Some(GroupRun {
-            group_id: begun.group_id,
-            instructions,
-            temp_dir: registry.temp_dir(),
-            previous_seen: begun.previous_seen,
-        }),
+        group: Some(run),
     })
 }
 
@@ -634,9 +682,7 @@ fn prepare_group(
     let executable = executable_of(db, dirs, &lead)?;
     let started_at = now_millis();
     let sent = db
-        .with_connection(|connection| {
-            group::begin_or_queue(connection, group_id, &lead, text, started_at)
-        })
+        .with_connection(|connection| group::begin_or_queue(connection, group_id, text, started_at))
         .map_err(group_begin_error)?;
     match sent {
         group::GroupSent::Started(begun) => {
@@ -689,10 +735,56 @@ fn start_next_group(
     launch_of_group(registry, dirs, executable, begun, started_at)
 }
 
+#[derive(Clone, Default)]
+struct Chain {
+    failed_chats: Vec<Option<String>>,
+    failed_agents: Vec<String>,
+}
+
+impl Chain {
+    fn chat_failed(&self, group_id: Option<&str>) -> bool {
+        self.failed_chats
+            .iter()
+            .any(|failed| failed.as_deref() == group_id)
+    }
+
+    fn agent_failed(&self, agent_id: &str) -> bool {
+        self.failed_agents.iter().any(|failed| failed == agent_id)
+    }
+
+    fn record(&mut self, agent_id: &str, group_id: Option<&str>, end: runner::RunEnd) {
+        match end {
+            runner::RunEnd::ChatFailed => self.failed_chats.push(group_id.map(str::to_owned)),
+            runner::RunEnd::AgentFailed => self.failed_agents.push(agent_id.to_owned()),
+            runner::RunEnd::Finished | runner::RunEnd::Closing => {}
+        }
+    }
+}
+
 struct Finished<'a> {
     agent_id: &'a str,
     group_id: Option<&'a str>,
-    advance_same_chat: bool,
+    end: runner::RunEnd,
+    chain: &'a Chain,
+}
+
+fn start_group_entry(
+    db: &Database,
+    registry: &TurnRegistry,
+    dirs: &[PathBuf],
+    group_id: &str,
+    chain: &Chain,
+) -> Option<Launch> {
+    if chain.chat_failed(Some(group_id)) {
+        return None;
+    }
+    let head = db
+        .with_connection(|connection| group::head_agent(connection, group_id))
+        .ok()??;
+    if chain.agent_failed(&head) {
+        return None;
+    }
+    start_next_group(db, registry, dirs, group_id)
 }
 
 fn start_after(
@@ -702,27 +794,35 @@ fn start_after(
     finished: &Finished,
 ) -> Vec<Launch> {
     let mut launches = Vec::new();
-    if registry.is_closing() {
+    if registry.is_closing() || finished.end == runner::RunEnd::Closing {
         return launches;
     }
-    if finished.advance_same_chat {
+    let chain = finished.chain;
+    let agent_id = finished.agent_id;
+    if finished.end == runner::RunEnd::AgentFailed {
         launches.extend(
             finished
                 .group_id
-                .and_then(|group_id| start_next_group(db, registry, dirs, group_id)),
+                .and_then(|group_id| start_group_entry(db, registry, dirs, group_id, chain)),
+        );
+        return launches;
+    }
+    if finished.end == runner::RunEnd::Finished {
+        launches.extend(
+            finished
+                .group_id
+                .and_then(|group_id| start_group_entry(db, registry, dirs, group_id, chain)),
         );
     }
-    if finished.advance_same_chat || finished.group_id.is_some() {
-        launches.extend(start_next(db, registry, dirs, finished.agent_id));
+    if !chain.agent_failed(agent_id) && !chain.chat_failed(None) {
+        launches.extend(start_next(db, registry, dirs, agent_id));
     }
-    let waiting = db
-        .with_connection(|connection| group::queued_groups_for(connection, finished.agent_id))
-        .unwrap_or_default();
-    for waiting_group in &waiting {
-        let own_failed_chat =
-            !finished.advance_same_chat && finished.group_id == Some(waiting_group.as_str());
-        if !own_failed_chat {
-            launches.extend(start_next_group(db, registry, dirs, waiting_group));
+    if !chain.agent_failed(agent_id) {
+        let waiting = db
+            .with_connection(|connection| group::queued_groups_for(connection, agent_id))
+            .unwrap_or_default();
+        for waiting_group in &waiting {
+            launches.extend(start_group_entry(db, registry, dirs, waiting_group, chain));
         }
     }
     launches
@@ -765,12 +865,29 @@ fn resume_group(
         .transpose()
 }
 
+pub fn sweep_instruction_files(dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("instructions-")
+                && name.ends_with(".md")
+                && entry.file_type().is_ok_and(|kind| kind.is_file())
+        })
+        .filter(|entry| std::fs::remove_file(entry.path()).is_ok())
+        .count()
+}
+
 pub fn sweep_interrupted(db: &Database) -> Result<usize, String> {
     db.with_connection(|connection| store::sweep_interrupted(connection, now_millis()))
         .map_err(|error| format!("could not recover running turns: {error}"))
 }
 
-async fn drive_one(app: &AppHandle, launch: Launch) -> bool {
+async fn drive_one(app: &AppHandle, launch: Launch) -> runner::RunEnd {
     let key_app = app.clone();
     let key_agent = launch.agent_id.clone();
     let key = tauri::async_runtime::spawn_blocking(move || {
@@ -786,7 +903,7 @@ async fn drive_one(app: &AppHandle, launch: Launch) -> bool {
     .unwrap_or(runner::ApiKey::Unreadable(None));
     let (Some(db), Some(registry)) = (app.try_state::<Database>(), app.try_state::<TurnRegistry>())
     else {
-        return false;
+        return runner::RunEnd::Closing;
     };
     runner::run(&db, app, &registry, launch, key).await
 }
@@ -795,7 +912,8 @@ async fn next_launches(
     app: &AppHandle,
     agent_id: String,
     group_id: Option<String>,
-    advance_same_chat: bool,
+    end: runner::RunEnd,
+    chain: Chain,
 ) -> Vec<Launch> {
     let next_app = app.clone();
     let next = tauri::async_runtime::spawn_blocking(move || {
@@ -812,7 +930,8 @@ async fn next_launches(
             &Finished {
                 agent_id: &agent_id,
                 group_id: group_id.as_deref(),
-                advance_same_chat,
+                end,
+                chain: &chain,
             },
         );
         emit_queue_changed(&next_app, &agent_id);
@@ -831,24 +950,27 @@ async fn next_launches(
 fn drive(
     app: AppHandle,
     first: Launch,
+    chain: Chain,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
     Box::pin(async move {
+        let mut chain = chain;
         let mut current = Some(first);
         while let Some(launch) = current.take() {
             let agent_id = launch.agent_id.clone();
             let group_id = launch.group.as_ref().map(|group| group.group_id.clone());
-            let advance = drive_one(&app, launch).await;
+            let end = drive_one(&app, launch).await;
             let closing = app
                 .try_state::<TurnRegistry>()
                 .is_none_or(|registry| registry.is_closing());
             if closing {
                 continue;
             }
-            let mut next = next_launches(&app, agent_id, group_id, advance).await;
+            chain.record(&agent_id, group_id.as_deref(), end);
+            let mut next = next_launches(&app, agent_id, group_id, end, chain.clone()).await;
             if !next.is_empty() {
                 current = Some(next.remove(0));
                 for extra in next {
-                    tauri::async_runtime::spawn(drive(app.clone(), extra));
+                    tauri::async_runtime::spawn(drive(app.clone(), extra, chain.clone()));
                 }
             }
         }
@@ -877,13 +999,13 @@ pub async fn send_message(
     match prepared {
         Prepared::Started(launch) => {
             let turn_id = launch.turn_id.clone();
-            tauri::async_runtime::spawn(drive(app, launch));
+            tauri::async_runtime::spawn(drive(app, launch, Chain::default()));
             Ok(SendResult::Started { turn_id })
         }
         Prepared::Queued { queued, launch } => {
             emit_queue_changed(&app, &queue_agent);
             if let Some(launch) = launch {
-                tauri::async_runtime::spawn(drive(app, launch));
+                tauri::async_runtime::spawn(drive(app, launch, Chain::default()));
             }
             Ok(SendResult::Queued {
                 queued_id: queued.id,
@@ -909,7 +1031,7 @@ pub async fn resume_queue(app: AppHandle, agent_id: String) -> Result<(), TurnEr
     .map_err(TurnError::database)??;
     if let Some(launch) = launch {
         emit_queue_changed(&app, &queue_agent);
-        tauri::async_runtime::spawn(drive(app, launch));
+        tauri::async_runtime::spawn(drive(app, launch, Chain::default()));
     }
     Ok(())
 }
@@ -1029,13 +1151,13 @@ pub async fn send_group_message(
     match prepared {
         Prepared::Started(launch) => {
             let turn_id = launch.turn_id.clone();
-            tauri::async_runtime::spawn(drive(app, launch));
+            tauri::async_runtime::spawn(drive(app, launch, Chain::default()));
             Ok(SendResult::Started { turn_id })
         }
         Prepared::Queued { queued, launch } => {
             emit_group_queue_changed(&app, &queue_group);
             if let Some(launch) = launch {
-                tauri::async_runtime::spawn(drive(app, launch));
+                tauri::async_runtime::spawn(drive(app, launch, Chain::default()));
             }
             Ok(SendResult::Queued {
                 queued_id: queued.id,
@@ -1061,7 +1183,7 @@ pub async fn resume_group_queue(app: AppHandle, group_id: String) -> Result<(), 
     .map_err(TurnError::database)??;
     if let Some(launch) = launch {
         emit_group_queue_changed(&app, &queue_group);
-        tauri::async_runtime::spawn(drive(app, launch));
+        tauri::async_runtime::spawn(drive(app, launch, Chain::default()));
     }
     Ok(())
 }
@@ -1414,6 +1536,50 @@ mod tests {
         assert_eq!(code(fx.send("missing", "hi")), "not-found");
         assert_eq!(code(fx.send("a", "hi")), "provider-unavailable");
         assert_eq!(fx.turns(), 0);
+    }
+
+    #[test]
+    fn the_startup_sweep_removes_only_regular_instruction_files_of_its_own_folder() {
+        use std::os::unix::fs::symlink;
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("instructions-victim.md");
+        fs::write(&victim, "keep").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("instructions-a.md"), "x").unwrap();
+        fs::write(dir.path().join("instructions-b.md"), "x").unwrap();
+        fs::write(dir.path().join("notes.md"), "x").unwrap();
+        fs::write(dir.path().join("instructions-c.txt"), "x").unwrap();
+        fs::create_dir(dir.path().join("instructions-d.md")).unwrap();
+        fs::write(
+            dir.path()
+                .join("instructions-d.md")
+                .join("instructions-e.md"),
+            "x",
+        )
+        .unwrap();
+        symlink(&victim, dir.path().join("instructions-link.md")).unwrap();
+        assert_eq!(sweep_instruction_files(dir.path()), 2);
+        let mut left: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "instructions-c.txt",
+                "instructions-d.md",
+                "instructions-link.md",
+                "notes.md"
+            ]
+        );
+        assert!(victim.is_file());
+        assert!(dir
+            .path()
+            .join("instructions-d.md")
+            .join("instructions-e.md")
+            .is_file());
+        assert_eq!(sweep_instruction_files(&dir.path().join("missing")), 0);
     }
 
     #[test]

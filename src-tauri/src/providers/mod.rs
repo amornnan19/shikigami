@@ -2,6 +2,7 @@ mod claude_code;
 mod probe;
 mod search;
 
+pub use probe::is_allowed_variable;
 use probe::ProbeOutput;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -93,6 +94,15 @@ fn parse_version(line: &str, prefix: &str) -> Option<[u32; 3]> {
 static FLAG_SUPPORT: OnceLock<Mutex<HashMap<(PathBuf, String), bool>>> = OnceLock::new();
 
 pub async fn help_lists_flag(executable: &Path, dirs: &[PathBuf], flag: &str) -> bool {
+    help_lists_flag_within(executable, dirs, flag, PROBE_TIMEOUT).await
+}
+
+async fn help_lists_flag_within(
+    executable: &Path,
+    dirs: &[PathBuf],
+    flag: &str,
+    limit: Duration,
+) -> bool {
     let cache = FLAG_SUPPORT.get_or_init(Mutex::default);
     let key = (executable.to_path_buf(), flag.to_owned());
     let known = cache
@@ -103,9 +113,10 @@ pub async fn help_lists_flag(executable: &Path, dirs: &[PathBuf], flag: &str) ->
     if let Some(listed) = known {
         return listed;
     }
-    let listed = probe::run(executable, &["--help"], dirs, PROBE_TIMEOUT)
-        .await
-        .is_some_and(|output| output.stdout.contains(flag));
+    let Some(output) = probe::run_allowlisted(executable, &["--help"], dirs, limit).await else {
+        return false;
+    };
+    let listed = output.stdout.contains(flag);
     cache
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -301,6 +312,38 @@ esac"#,
         assert!(help_lists_flag(&path, &dirs(&dir), "--system-prompt-snapshot").await);
         assert!(!help_lists_flag(&path, &dirs(&dir), "--other-flag").await);
         assert_eq!(fs::read_to_string(counter).unwrap().lines().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_help_probe_runs_with_the_allowlisted_environment_only() {
+        std::env::set_var("SHIKIGAMI_PROBE_LEAK_CHECK", "leaked");
+        let dir = tempfile::tempdir().unwrap();
+        fake(
+            dir.path(),
+            "claude",
+            "if [ -z \"$SHIKIGAMI_PROBE_LEAK_CHECK\" ]; then echo '--clean-environment'; fi",
+        );
+        let path = dir.path().join("claude");
+        assert!(help_lists_flag(&path, &dirs(&dir), "--clean-environment").await);
+        std::env::remove_var("SHIKIGAMI_PROBE_LEAK_CHECK");
+    }
+
+    #[tokio::test]
+    async fn a_help_probe_that_times_out_is_not_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("seen");
+        fake(
+            dir.path(),
+            "claude",
+            &format!(
+                "if [ ! -f {m} ]; then /usr/bin/touch {m}; /bin/sleep 5; fi\necho '--late-flag'",
+                m = marker.display()
+            ),
+        );
+        let path = dir.path().join("claude");
+        let short = Duration::from_millis(400);
+        assert!(!help_lists_flag_within(&path, &dirs(&dir), "--late-flag", short).await);
+        assert!(help_lists_flag_within(&path, &dirs(&dir), "--late-flag", LIMIT).await);
     }
 
     #[tokio::test]

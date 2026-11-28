@@ -61,6 +61,9 @@ user-level settings, hooks, plugins, output styles or MCP servers. For Claude Co
 `--setting-sources project --strict-mcp-config --permission-mode manual --permission-prompts none`.
 A CLI started in a folder the user picked (a group folder) loads no setting sources
 (`--setting-sources ""`); Shikigami passes that folder's CLAUDE.md text itself.
+A turn that fails before spawn for a reason that belongs to the agent (sign-in, missing CLI) starts no
+other queued work addressed to that agent; only a chat-level failure (a missing folder) lets the
+agent's other chats proceed.
 Keep the CLI's own sign-in working.
 Build an agent CLI's environment from an allowlist (HOME, USER, LOGNAME, SHELL, TMPDIR, LANG, LC_*,
 TERM, PATH); never pass the app's whole environment.
