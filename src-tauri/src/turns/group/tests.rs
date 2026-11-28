@@ -636,7 +636,21 @@ fn a_hard_linked_member_instruction_file_is_left_out_of_a_group_turn() {
     fs::remove_file(&own).unwrap();
     fs::hard_link(&outside, &own).unwrap();
     let launch = fx.started("g", "hello");
-    assert_eq!(launch.group.as_ref().unwrap().instructions, "");
+    let group = launch.group.as_ref().unwrap();
+    assert_eq!(group.instructions, "");
+    assert_eq!(
+        group.member_notice.as_deref(),
+        Some("The workspace's CLAUDE.md was not loaded (it has more than one hard link).")
+    );
+}
+
+#[test]
+fn a_usable_member_instruction_file_gives_no_notice() {
+    let fx = Fixture::new();
+    let launch = fx.started("g", "hello");
+    let group = launch.group.as_ref().unwrap();
+    assert_eq!(group.instructions, "Ada rules\n");
+    assert_eq!(group.member_notice, None);
 }
 
 #[tokio::test]
@@ -1445,6 +1459,27 @@ async fn a_refused_folder_instructions_file_is_reported_as_a_notice_of_the_turn(
     assert_eq!(
         fx.value::<String>("SELECT status FROM turns WHERE id = ?1", &[&turn_id]),
         "completed"
+    );
+}
+
+#[tokio::test]
+async fn a_members_unusable_workspace_instruction_file_is_reported_as_a_notice_of_the_group_turn() {
+    let fx = Fixture::new();
+    fx.install("");
+    fs::write(
+        fx.workspaces.path().join("Ada").join("CLAUDE.md"),
+        [0xff, 0xfe],
+    )
+    .unwrap();
+    let launch = fx.started("g", "hello");
+    let turn_id = launch.turn_id.clone();
+    fx.run(launch).await;
+    assert_eq!(
+        fx.value::<String>(
+            "SELECT content FROM messages WHERE turn_id = ?1 AND role = 'notice'",
+            &[&turn_id]
+        ),
+        "The workspace's CLAUDE.md was not loaded (it is not UTF-8 text)."
     );
 }
 

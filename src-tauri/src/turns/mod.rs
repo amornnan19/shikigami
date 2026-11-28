@@ -373,6 +373,7 @@ pub struct GroupRun {
     pub context_changed: bool,
     pub input: String,
     pub folder_notice: Option<String>,
+    pub member_notice: Option<String>,
     pub access: group::AccessLevel,
 }
 
@@ -539,12 +540,13 @@ fn launch_of_group(
     if !registry.begin(&begun.agent_id, &begun.begun.turn_id) {
         return None;
     }
-    let instructions = instructions::read_for_turn(
+    let (instructions, member_notice) = match instructions::read_for_turn(
         Path::new(&begun.begun.agent.workspace_path),
         instructions::MAX_BYTES,
-    )
-    .map(|read| read.text)
-    .unwrap_or_default();
+    ) {
+        Ok(read) => (read.text, None),
+        Err(error) => (String::new(), Some(workspace_notice(&error))),
+    };
     let (folder_instructions, folder_notice) = match instructions::read_for_turn(
         Path::new(&begun.folder),
         group::FOLDER_INSTRUCTIONS_MAX_BYTES,
@@ -566,6 +568,7 @@ fn launch_of_group(
         context_changed: context_stale && begun.stored_context_hash.is_some(),
         input: begun.input,
         folder_notice,
+        member_notice,
         access: begun.access,
     };
     let text = run.stdin(&begun.begun.session);
@@ -963,7 +966,8 @@ pub fn sweep_temp_files(dir: &Path) -> usize {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             let ours = (name.starts_with("instructions-") && name.ends_with(".md"))
-                || (name.starts_with("settings-") && name.ends_with(".json"));
+                || (name.starts_with("settings-") && name.ends_with(".json"))
+                || name.starts_with("key-");
             ours && entry.file_type().is_ok_and(|kind| kind.is_file())
         })
         .filter(|entry| std::fs::remove_file(entry.path()).is_ok())
@@ -1700,6 +1704,10 @@ mod tests {
         fs::write(dir.path().join("settings-a.json"), "x").unwrap();
         fs::write(dir.path().join("settings-b.md"), "x").unwrap();
         fs::write(dir.path().join("other-c.json"), "x").unwrap();
+        fs::write(dir.path().join("key-0a1b"), "sk-ant-left-over").unwrap();
+        fs::write(dir.path().join("key-helper-0a1b.sh"), "x").unwrap();
+        fs::write(dir.path().join("mykey-1"), "x").unwrap();
+        fs::create_dir(dir.path().join("key-dir")).unwrap();
         symlink(&settings_victim, dir.path().join("settings-link.json")).unwrap();
         fs::write(dir.path().join("instructions-a.md"), "x").unwrap();
         fs::write(dir.path().join("instructions-b.md"), "x").unwrap();
@@ -1714,7 +1722,7 @@ mod tests {
         )
         .unwrap();
         symlink(&victim, dir.path().join("instructions-link.md")).unwrap();
-        assert_eq!(sweep_temp_files(dir.path()), 3);
+        assert_eq!(sweep_temp_files(dir.path()), 5);
         let mut left: Vec<String> = fs::read_dir(dir.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
@@ -1726,6 +1734,8 @@ mod tests {
                 "instructions-c.txt",
                 "instructions-d.md",
                 "instructions-link.md",
+                "key-dir",
+                "mykey-1",
                 "notes.md",
                 "other-c.json",
                 "settings-b.md",

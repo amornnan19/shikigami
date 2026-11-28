@@ -82,6 +82,13 @@ pub fn arguments(
     args
 }
 
+pub fn is_model_or_tool_event(line: &str) -> bool {
+    serde_json::from_str::<Value>(line)
+        .ok()
+        .and_then(|value| value.get("type").and_then(Value::as_str).map(str::to_owned))
+        .is_some_and(|kind| matches!(kind.as_str(), "assistant" | "user" | "stream_event"))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepStart {
     pub id: String,
@@ -739,12 +746,18 @@ mod tests {
 
     #[test]
     fn an_init_event_reports_its_tools_before_the_session_and_a_missing_list_is_empty() {
-        let with =
-            parse(r#"{"type":"system","subtype":"init","session_id":"s","tools":["Read","Bash"]}"#);
+        let with = parse(
+            r#"{"type":"system","subtype":"init","session_id":"s","tools":["Read","Edit","Write","Bash"]}"#,
+        );
         assert_eq!(
             with,
             [
-                Parsed::Tools(vec!["Read".to_owned(), "Bash".to_owned()]),
+                Parsed::Tools(vec![
+                    "Read".to_owned(),
+                    "Edit".to_owned(),
+                    "Write".to_owned(),
+                    "Bash".to_owned()
+                ]),
                 Parsed::Session("s".to_owned())
             ]
         );
