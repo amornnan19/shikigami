@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
+import vectorsText from "../../../src-tauri/tests/fixtures/mention-vectors.json?raw";
 import type { GroupMember } from "./api";
-import { findMentions, splitReply, suggestionAt } from "./mentions";
+import { findMentions, suggestionAt } from "./mentions";
 
 const members: GroupMember[] = [
   { agentId: "a", name: "Ada", color: "red" },
@@ -45,20 +46,14 @@ describe("findMentions", () => {
   });
 });
 
-describe("splitReply", () => {
-  it("splits a reply at hand-off lines of other members", () => {
-    expect(
-      splitReply("Done.\n@Bo check the README\nand more\n@Test Agent run it", members, "a"),
-    ).toEqual([
-      { type: "text", text: "Done." },
-      { type: "hand-off", member: members[1], text: "check the README\nand more" },
-      { type: "hand-off", member: members[3], text: "run it" },
-    ]);
-  });
-
-  it("keeps a reply without hand-offs whole and ignores self, code and prose mentions", () => {
-    for (const text of ["plain", "@Ada me\nmore", "I told @Bo", "```\n@Bo no\n```", "@Zed who"]) {
-      expect(splitReply(text, members, "a")).toEqual([{ type: "text", text }]);
+describe("shared vectors", () => {
+  it("give the same mentions as the Rust parser", () => {
+    const vectors: Array<{ text: string; members: string[]; mentions: string[] }> =
+      JSON.parse(vectorsText);
+    for (const vector of vectors) {
+      const team = vector.members.map((name) => ({ agentId: name, name, color: "red" }));
+      const found = findMentions(vector.text, team).map((mention) => mention.member.name);
+      expect(found, JSON.stringify(vector.text)).toEqual(vector.mentions);
     }
   });
 });
@@ -76,11 +71,20 @@ describe("suggestionAt", () => {
     expect(suggestionAt("@te more", 3, members)?.start).toBe(0);
   });
 
+  it("lists the member whose name equals the query first and keeps the list open", () => {
+    expect(suggestionAt("@Test", 5, members)?.members.map((member) => member.agentId)).toEqual([
+      "t",
+      "ta",
+    ]);
+    expect(suggestionAt("@Bo", 3, members)?.members.map((member) => member.agentId)).toEqual(["b"]);
+  });
+
   it("offers nothing without a fresh @, a match or on the same line", () => {
     expect(suggestionAt("hello", 5, members)).toBeNull();
     expect(suggestionAt("mail@", 5, members)).toBeNull();
     expect(suggestionAt("@zz", 3, members)).toBeNull();
-    expect(suggestionAt("@Bo", 3, members)).toBeNull();
+    expect(suggestionAt("@Bo ", 4, members)).toBeNull();
+    expect(suggestionAt("@bo  ", 5, members)).toBeNull();
     expect(suggestionAt("@B\nx", 4, members)).toBeNull();
   });
 });

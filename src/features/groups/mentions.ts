@@ -1,17 +1,13 @@
 import type { GroupMember } from "./api";
 
 const BOUNDARY_PUNCTUATION = ",.:;!?)]";
-const WORD_CHARACTER = /[\p{L}\p{N}]/u;
+const WORD_CHARACTER = /[\p{Alphabetic}\p{N}]/u;
 
 export interface Mention {
   start: number;
   end: number;
   member: GroupMember;
 }
-
-export type ReplySegment =
-  | { type: "text"; text: string }
-  | { type: "hand-off"; member: GroupMember; text: string };
 
 function markInlineCode(text: string, start: number, end: number, ignored: boolean[]) {
   const runAt = (from: number) => {
@@ -61,20 +57,42 @@ function lineRanges(text: string): Array<[number, number]> {
   }
 }
 
+function fenceOf(line: string): { marker: string; length: number; rest: string } | null {
+  const trimmed = line.trimStart();
+  const marker = trimmed[0];
+  if (marker !== "`" && marker !== "~") return null;
+  let length = 0;
+  while (trimmed[length] === marker) length += 1;
+  return length >= 3 ? { marker, length, rest: trimmed.slice(length) } : null;
+}
+
 function ignoredMask(text: string): boolean[] {
   const ignored = new Array<boolean>(text.length).fill(false);
-  let inFence = false;
+  let open: { marker: string; length: number } | null = null;
   for (const [start, end] of lineRanges(text)) {
-    if (text.slice(start, end).trimStart().startsWith("```")) {
+    const fence = fenceOf(text.slice(start, end));
+    if (open) {
       ignored.fill(true, start, end);
-      inFence = !inFence;
-    } else if (inFence) {
+      if (
+        fence &&
+        fence.marker === open.marker &&
+        fence.length >= open.length &&
+        fence.rest.trim() === ""
+      ) {
+        open = null;
+      }
+    } else if (fence) {
       ignored.fill(true, start, end);
+      open = { marker: fence.marker, length: fence.length };
     } else {
       markInlineCode(text, start, end, ignored);
     }
   }
   return ignored;
+}
+
+function lastCodePoint(text: string, at: number): string | undefined {
+  return Array.from(text.slice(Math.max(0, at - 2), at)).at(-1);
 }
 
 function mentionAt(
@@ -84,7 +102,7 @@ function mentionAt(
   members: GroupMember[],
 ): Mention | null {
   if (text[at] !== "@" || ignored[at]) return null;
-  const before = text[at - 1];
+  const before = lastCodePoint(text, at);
   if (before !== undefined && WORD_CHARACTER.test(before)) return null;
   let best: Mention | null = null;
   for (const member of members) {
@@ -117,54 +135,6 @@ export function findMentions(text: string, members: GroupMember[]): Mention[] {
   return found;
 }
 
-interface Pending {
-  member: GroupMember;
-  lines: string[];
-}
-
-export function splitReply(
-  text: string,
-  members: GroupMember[],
-  ownAgentId: string | null,
-): ReplySegment[] {
-  const ignored = ignoredMask(text);
-  const segments: ReplySegment[] = [];
-  const state: { pending: Pending | null; before: string[] } = { pending: null, before: [] };
-  for (const [start, end] of lineRanges(text)) {
-    let first = start;
-    while (first < end && /\s/.test(text[first] ?? "")) first += 1;
-    const mention = first < end ? mentionAt(text, ignored, first, members) : null;
-    if (mention && mention.member.agentId !== ownAgentId) {
-      if (state.pending) {
-        segments.push({
-          type: "hand-off",
-          member: state.pending.member,
-          text: state.pending.lines.join("\n"),
-        });
-      }
-      if (state.before.length > 0) {
-        segments.push({ type: "text", text: state.before.join("\n") });
-        state.before = [];
-      }
-      const rest = text.slice(mention.end, end).replace(/^[\s,:;]+/, "");
-      state.pending = { member: mention.member, lines: [rest] };
-    } else if (state.pending) {
-      state.pending.lines.push(text.slice(start, end));
-    } else {
-      state.before.push(text.slice(start, end));
-    }
-  }
-  if (state.pending) {
-    segments.push({
-      type: "hand-off",
-      member: state.pending.member,
-      text: state.pending.lines.join("\n"),
-    });
-  }
-  if (state.before.length > 0) segments.push({ type: "text", text: state.before.join("\n") });
-  return segments;
-}
-
 export interface Suggestion {
   start: number;
   query: string;
@@ -184,8 +154,13 @@ export function suggestionAt(
   const query = head.slice(at + 1);
   if (query.includes("\n")) return null;
   const lowered = query.toLowerCase();
+  const trimmed = lowered.trimEnd();
+  if (trimmed !== lowered && members.some((member) => member.name.toLowerCase() === trimmed)) {
+    return null;
+  }
   const matching = members.filter((member) => member.name.toLowerCase().startsWith(lowered));
   if (matching.length === 0) return null;
-  if (matching.length === 1 && matching[0]?.name === query) return null;
-  return { start: at, query, members: matching };
+  const exact = matching.filter((member) => member.name.toLowerCase() === lowered);
+  const rest = matching.filter((member) => member.name.toLowerCase() !== lowered);
+  return { start: at, query, members: [...exact, ...rest] };
 }

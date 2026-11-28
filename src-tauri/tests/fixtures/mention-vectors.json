@@ -1,0 +1,14 @@
+[
+  { "text": "@bo list", "members": ["Ada", "Bo"], "mentions": ["Bo"] },
+  { "text": "ดี@Bo hi", "members": ["Bo"], "mentions": [] },
+  { "text": "สวัสดี @Bo hi", "members": ["Bo"], "mentions": ["Bo"] },
+  { "text": "𝒜@Bo hi", "members": ["Bo"], "mentions": [] },
+  { "text": "😀@Bo hi", "members": ["Bo"], "mentions": ["Bo"] },
+  { "text": "x1@Bo hi", "members": ["Bo"], "mentions": [] },
+  { "text": "(@Bo) and @Ada.", "members": ["Ada", "Bo"], "mentions": ["Bo", "Ada"] },
+  { "text": "@Test Agent go", "members": ["Test", "Test Agent"], "mentions": ["Test Agent"] },
+  { "text": "~~~\n@Bo hidden\n~~~\n@Ada shown", "members": ["Ada", "Bo"], "mentions": ["Ada"] },
+  { "text": "```\n~~~\n@Bo hidden\n```", "members": ["Bo"], "mentions": [] },
+  { "text": "````\n```\n@Bo hidden\n```\n````\n@Bo shown", "members": ["Bo"], "mentions": ["Bo"] },
+  { "text": "run `ask @Bo please` now", "members": ["Bo"], "mentions": [] }
+]

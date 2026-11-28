@@ -1,20 +1,62 @@
 use super::*;
-use crate::turns::group::hand_offs::{LIMIT_NOTICE, MAX_TURNS};
+use crate::turns::group::hand_offs::{LIMIT_NOTICE, MAX_TURNS, STOPPED_NOTICE};
 
 impl Fixture {
-    fn add_cy(&self) {
-        let workspace = self.workspaces.path().join("Cy");
+    fn add_agent(&self, id: &str, name: &str, position: i64) {
+        let workspace = self.workspaces.path().join(name);
         fs::create_dir_all(&workspace).unwrap();
         self.db.with_connection(|c| {
             c.execute(
                 "INSERT INTO agents (id, name, color, provider, model, workspace_path, created_at, last_activity_at)
-                 VALUES ('c', 'Cy', 'red', 'claude-code', 'haiku', ?1, 1, 1)",
-                [workspace.to_string_lossy()],
+                 VALUES (?1, ?2, 'red', 'claude-code', 'haiku', ?3, 1, 1)",
+                params![id, name, workspace.to_string_lossy()],
             )
             .unwrap();
-            c.execute("INSERT INTO group_members VALUES ('g', 'c', 2, 1)", [])
-                .unwrap();
+            c.execute(
+                "INSERT INTO group_members VALUES ('g', ?1, ?2, 1)",
+                params![id, position],
+            )
+            .unwrap();
         });
+    }
+
+    fn add_cy(&self) {
+        self.add_agent("c", "Cy", 2);
+    }
+
+    fn add_dee(&self) {
+        self.add_agent("d", "Dee", 3);
+    }
+
+    fn marks(&self, turn_id: &str) -> Vec<(String, String)> {
+        let page = self
+            .db
+            .with_connection(|c| store::group_conversation(c, "g", None))
+            .unwrap();
+        page.turns
+            .into_iter()
+            .find(|turn| turn.id == turn_id)
+            .unwrap()
+            .hand_offs
+            .into_iter()
+            .map(|mark| (mark.agent_id, mark.task))
+            .collect()
+    }
+
+    fn order(&self, launch: Launch, replies: &[(&str, &str)]) -> Vec<String> {
+        let mut seen = vec![launch.agent_id.clone()];
+        let mut current = launch;
+        for (status, reply) in replies {
+            self.finish_with(&current, status, reply);
+            match self.next(&current) {
+                Some(next) => {
+                    seen.push(next.agent_id.clone());
+                    current = next;
+                }
+                None => break,
+            }
+        }
+        seen
     }
 
     fn finish_with(&self, launch: &Launch, status: &str, reply: &str) {
@@ -209,25 +251,93 @@ fn several_hand_off_lines_queue_in_order_and_the_agent_continues_once_after_both
             entry("c", "hand-off", "part two")
         ]
     );
-    let bo = fx.next(&first).unwrap();
-    fx.finish_with(&bo, "completed", "one done");
     assert_eq!(
-        fx.entries(),
+        fx.marks(&first.turn_id),
         [
-            entry("c", "hand-off", "part two"),
-            entry("a", "continuation", "Continue with Bo's answer.")
+            ("b".to_owned(), "part one".to_owned()),
+            ("c".to_owned(), "part two".to_owned())
         ]
     );
+    let bo = fx.next(&first).unwrap();
+    fx.finish_with(&bo, "completed", "one done");
+    assert_eq!(fx.entries(), [entry("c", "hand-off", "part two")]);
     let cy = fx.next(&bo).unwrap();
     assert_eq!(cy.agent_id, "c");
     fx.finish_with(&cy, "completed", "two done");
     assert_eq!(
         fx.entries(),
-        [entry("a", "continuation", "Continue with Bo's answer.")]
+        [entry("a", "continuation", "Continue with Cy's answer.")]
     );
     let ada = fx.next(&cy).unwrap();
     assert!(ada.text.contains("Bo: one done"));
     assert!(ada.text.contains("Cy: two done"));
+}
+
+#[test]
+fn a_nested_hand_off_returns_depth_first_each_agent_continuing_for_the_one_above() {
+    let fx = Fixture::new();
+    fx.add_cy();
+    let first = fx.started("g", "hello");
+    let order = fx.order(
+        first,
+        &[
+            ("completed", "@Bo ask Cy"),
+            ("completed", "@Cy dig"),
+            ("completed", "dug"),
+            ("completed", "Bo wraps up"),
+            ("completed", "Ada wraps up"),
+        ],
+    );
+    assert_eq!(order, ["a", "b", "c", "b", "a"]);
+    assert!(fx.entries().is_empty());
+    assert_eq!(fx.turn_count(), 5);
+}
+
+#[test]
+fn a_continuation_for_the_top_agent_carries_the_final_answer_of_the_agent_below() {
+    let fx = Fixture::new();
+    fx.add_cy();
+    let first = fx.started("g", "hello");
+    fx.finish_with(&first, "completed", "@Bo ask Cy");
+    let bo = fx.next(&first).unwrap();
+    fx.finish_with(&bo, "completed", "@Cy dig");
+    let cy = fx.next(&bo).unwrap();
+    fx.finish_with(&cy, "completed", "dug");
+    assert_eq!(
+        fx.entries(),
+        [entry("b", "continuation", "Continue with Cy's answer.")]
+    );
+    let bo_again = fx.next(&cy).unwrap();
+    fx.finish_with(&bo_again, "completed", "Bo's final answer");
+    assert_eq!(
+        fx.entries(),
+        [entry("a", "continuation", "Continue with Bo's answer.")]
+    );
+    let ada = fx.next(&bo_again).unwrap();
+    assert!(ada.text.contains("Bo: Bo's final answer"));
+    assert!(input(&ada).ends_with("Continue with Bo's answer."));
+}
+
+#[test]
+fn siblings_with_a_nested_hand_off_run_b_d_b_c_a() {
+    let fx = Fixture::new();
+    fx.add_cy();
+    fx.add_dee();
+    let first = fx.started("g", "hello");
+    let order = fx.order(
+        first,
+        &[
+            ("completed", "@Bo part one\n@Cy part two"),
+            ("completed", "@Dee help"),
+            ("completed", "helped"),
+            ("completed", "one done"),
+            ("completed", "two done"),
+            ("completed", "all done"),
+        ],
+    );
+    assert_eq!(order, ["a", "b", "d", "b", "c", "a"]);
+    assert!(fx.entries().is_empty());
+    assert_eq!(fx.turn_count(), 6);
 }
 
 #[test]
@@ -377,6 +487,7 @@ fn at_the_limit_no_hand_off_is_queued_the_notice_comes_once_and_user_entries_sta
         }
     });
     fx.finish_with(&first, "completed", "@Bo one\n@Cy two");
+    assert!(fx.marks(&first.turn_id).is_empty());
     assert_eq!(fx.notices(), [LIMIT_NOTICE]);
     assert_eq!(fx.entries(), [entry("a", "user", "later user message")]);
 }
@@ -414,6 +525,7 @@ fn a_third_hand_off_between_the_same_two_agents_is_not_queued_and_posts_a_notice
     let third = fx.next(&second).unwrap();
     assert_eq!(third.agent_id, "a");
     fx.finish_with(&third, "completed", "@Bo once more");
+    assert!(fx.marks(&third.turn_id).is_empty());
     assert_eq!(
         fx.notices(),
         ["Ada and Bo keep handing work back; that hand-off was not started."]
@@ -438,7 +550,7 @@ fn two_hand_offs_in_a_row_between_the_same_agents_are_allowed() {
 #[test]
 fn the_hand_off_path_takes_the_lower_access_level_of_the_two_agents() {
     assert_eq!(
-        super::super::access_for_hand_off("a", "b"),
+        super::super::access_for_hand_off(AccessLevel::STANDARD, "b"),
         AccessLevel::STANDARD
     );
     assert_eq!(
@@ -449,11 +561,166 @@ fn the_hand_off_path_takes_the_lower_access_level_of_the_two_agents() {
         super::super::lower_access(AccessLevel::STANDARD, AccessLevel(0)),
         AccessLevel(0)
     );
+}
+
+#[test]
+fn a_lower_access_level_carries_down_a_two_hop_chain() {
+    let fx = Fixture::new();
+    fx.add_cy();
+    super::super::set_test_level("b", AccessLevel(0));
+    let first = fx.started("g", "hello");
+    assert_eq!(first.group.as_ref().unwrap().access, AccessLevel::STANDARD);
+    fx.finish_with(&first, "completed", "@Bo ask Cy");
+    let bo = fx.next(&first).unwrap();
+    assert_eq!(bo.group.as_ref().unwrap().access, AccessLevel(0));
+    fx.finish_with(&bo, "completed", "@Cy dig");
+    let cy = fx.next(&bo).unwrap();
+    assert_eq!(cy.agent_id, "c");
+    assert_eq!(cy.group.as_ref().unwrap().access, AccessLevel(0));
+    fx.finish_with(&cy, "completed", "dug");
+    let bo_again = fx.next(&cy).unwrap();
+    assert_eq!(bo_again.group.as_ref().unwrap().access, AccessLevel(0));
+    fx.finish_with(&bo_again, "completed", "done");
+    let ada = fx.next(&bo_again).unwrap();
+    assert_eq!(ada.group.as_ref().unwrap().access, AccessLevel(0));
+}
+
+#[tokio::test]
+async fn the_carried_access_level_reaches_the_cli_arguments_through_a_two_hop_chain() {
+    let fx = Fixture::new();
+    fx.add_cy();
+    super::super::set_test_level("b", AccessLevel(0));
+    let script = |reply: &str| {
+        BASIC
+            .replace("\"text\":\"po\"", &format!("\"text\":\"{reply}\""))
+            .replace("\"text\":\"ng\"", "\"text\":\"\"")
+            .replace("\"text\":\"pong\"", &format!("\"text\":\"{reply}\""))
+            .replace("\"result\":\"pong\"", &format!("\"result\":\"{reply}\""))
+    };
+    fs::write(fx.records.path().join("s0.jsonl"), script("@Bo ask Cy")).unwrap();
+    fs::write(fx.records.path().join("s1.jsonl"), script("@Cy dig")).unwrap();
+    let records = fx.records.path().display();
+    fx.install(&format!(
+        "[ \"$n\" = 0 ] && cat \"{records}/s0.jsonl\" && exit 0\n[ \"$n\" = 1 ] && cat \"{records}/s1.jsonl\" && exit 0"
+    ));
+    let first = fx.started("g", "hello");
+    fx.run(first).await;
+    let bo = fx.after_one("a", Some("g")).unwrap();
+    assert_eq!(bo.agent_id, "b");
+    fx.run(bo).await;
+    let cy = fx.after_one("b", Some("g")).unwrap();
+    assert_eq!(cy.agent_id, "c");
+    fx.run(cy).await;
+    let mode = |n: usize| {
+        let args = fx.args(n);
+        let at = args
+            .iter()
+            .position(|arg| arg == "--permission-mode")
+            .unwrap();
+        args[at + 1].clone()
+    };
+    assert_eq!(mode(0), "manual");
+    assert_eq!(mode(1), "manual-lowest");
+    assert_eq!(mode(2), "manual-lowest");
+}
+
+#[test]
+fn a_stopped_turn_drops_every_waiting_hand_off_of_its_message_and_says_so() {
+    let fx = Fixture::new();
+    fx.add_cy();
+    let first = fx.started("g", "hello");
+    fx.finish_with(&first, "completed", "@Bo part one\n@Cy part two");
+    let bo = fx.next(&first).unwrap();
+    fx.finish_with(&bo, "stopped", "partial");
+    assert!(fx.entries().is_empty());
+    assert_eq!(
+        fx.marks(&first.turn_id),
+        [("b".to_owned(), "part one".to_owned())]
+    );
+    assert_eq!(fx.notices(), [STOPPED_NOTICE]);
+    assert!(fx.next(&bo).is_none());
+    assert_eq!(fx.turn_count(), 2);
+}
+
+#[test]
+fn stopping_a_nested_chain_drops_the_entries_above_it_and_keeps_user_entries() {
+    let fx = Fixture::new();
+    fx.add_cy();
+    fx.add_dee();
+    let first = fx.started("g", "@Ada start, then @Bo user entry");
+    fx.queued("g", "another message");
+    fx.finish_with(&first, "completed", "@Cy dig\n@Dee also");
+    let cy = fx.next(&first).unwrap();
+    assert_eq!(cy.agent_id, "c");
+    fx.finish_with(&cy, "completed", "@Bo deeper");
+    let bo = fx.next(&cy).unwrap();
+    assert_eq!(bo.agent_id, "b");
+    fx.finish_with(&bo, "stopped", "partial");
+    assert_eq!(
+        fx.entries(),
+        [
+            entry("b", "user", "@Ada start, then @Bo user entry"),
+            entry("a", "user", "another message")
+        ]
+    );
+    assert_eq!(fx.notices(), [STOPPED_NOTICE]);
+    let user = fx.next(&bo).unwrap();
+    assert_eq!(user.agent_id, "b");
+}
+
+#[test]
+fn stopping_a_turn_with_nothing_waiting_posts_no_notice() {
     let fx = Fixture::new();
     let first = fx.started("g", "hello");
-    fx.finish_with(&first, "completed", "@Bo check");
+    fx.finish_with(&first, "stopped", "partial");
+    assert!(fx.notices().is_empty());
+}
+
+#[test]
+fn a_message_addresses_at_most_eight_members_and_the_first_turn_says_so() {
+    let fx = Fixture::new();
+    for n in 3..=9 {
+        fx.add_agent(&format!("m{n}"), &format!("M{n}"), n);
+    }
+    let text = "@Ada @Bo @M3 @M4 @M5 @M6 @M7 @M8 @M9";
+    let first = fx.started("g", text);
+    assert_eq!(first.agent_id, "a");
+    assert_eq!(fx.entries().len(), 7);
+    assert!(fx.entries().iter().all(|(agent, _, _)| agent != "m9"));
+    assert_eq!(fx.notices(), [TRUNCATED_NOTICE]);
+}
+
+#[test]
+fn the_user_message_is_stored_once_and_reaches_each_agent_once() {
+    let fx = Fixture::new();
+    let first = fx.started("g", "@Bo look then @Ada decide");
+    assert_eq!(first.agent_id, "b");
+    fx.finish_with(&first, "completed", "looked");
     let second = fx.next(&first).unwrap();
-    assert_eq!(second.group.as_ref().unwrap().access, AccessLevel::STANDARD);
+    assert_eq!(second.agent_id, "a");
+    assert_eq!(
+        fx.value::<i64>(
+            "SELECT COUNT(*) FROM messages WHERE group_id = 'g' AND role = 'user'",
+            &[]
+        ),
+        1
+    );
+    assert_eq!(second.text.matches("look then @Ada decide").count(), 1);
+    assert!(second.text.contains("Bo: looked"));
+    fx.finish_with(&second, "completed", "decided");
+    let page = fx
+        .db
+        .with_connection(|c| store::group_conversation(c, "g", None))
+        .unwrap();
+    let bubbles: Vec<&str> = page
+        .turns
+        .iter()
+        .map(|turn| turn.user_message.as_str())
+        .collect();
+    assert_eq!(bubbles, ["@Bo look then @Ada decide", ""]);
+    fx.add_cy();
+    let later = fx.started("g", "@Cy once more");
+    assert_eq!(later.text.matches("look then @Ada decide").count(), 1);
 }
 
 #[tokio::test]

@@ -132,9 +132,30 @@ describe("mentions and hand-offs in a group chat", () => {
     await browser.saveScreenshot(join(artifacts, "group-mentions-hand-off.png"));
   });
 
+  it("returns a nested hand-off depth first, each agent continuing for the one above", async () => {
+    const before = invocations();
+    const shown = await browser.execute(
+      (selector: string) => document.querySelectorAll(selector).length,
+      `${groupView} article`,
+    );
+    scriptFakeReply(before + 1, "Delegating.\n@Bo please ask Cy");
+    scriptFakeReply(before + 2, "Asking.\n@Cy dig in");
+    await send("@Ada nested work");
+    await expect(articles()).toBeElementsArrayOfSize(shown + 5, { wait: 30000 });
+    await idle();
+    expect(invocations()).toBe(before + 5);
+    const turns = stdins().slice(-5);
+    expect(turns[3]).toContain("Cy: pong");
+    expect(turns[3]?.trimEnd().endsWith("Continue with Cy's answer.")).toBe(true);
+    expect(turns[4]).toContain("Bo: pong");
+    expect(turns[4]?.trimEnd().endsWith("Continue with Bo's answer.")).toBe(true);
+    await scrollToEnd();
+    await browser.saveScreenshot(join(artifacts, "group-mentions-nested.png"));
+  });
+
   it("stops a chain that keeps handing off after eight agent turns with the limit notice", async () => {
     const before = invocations();
-    const targets = ["Bo", "Cy", "Ada", "Bo", "Bo", "Cy", "Cy", "Cy"];
+    const targets = ["Bo", "Cy", "Ada", "Bo", "Cy", "Ada", "Bo", "Cy"];
     targets.forEach((name, index) => {
       scriptFakeReply(before + index + 1, `Passing it on.\n@${name} keep going`);
     });
@@ -157,7 +178,7 @@ describe("mentions and hand-offs in a group chat", () => {
       (selector: string) => document.querySelectorAll(selector).length,
       `${groupView} article`,
     );
-    scriptFakeReply(before + 1, "Starting.\n@Bo SLOW work");
+    scriptFakeReply(before + 1, "Starting.\n@Bo SLOW work\n@Cy then check it");
     await send("@Ada begin");
     await expect($(stopButton)).toBeEnabled({ wait: 20000 });
     await expect(articles()).toBeElementsArrayOfSize(shown + 2, { wait: 20000 });
@@ -173,7 +194,9 @@ describe("mentions and hand-offs in a group chat", () => {
     expect(invocations()).toBe(before + 2);
     await expect(articles()).toBeElementsArrayOfSize(shown + 2);
     await expect($(queue)).not.toExist();
-    await scrollToEnd();
+    const dropped = $(groupView).$("p=Stopped. Hand-offs from this message were dropped.");
+    await dropped.scrollIntoView({ block: "center" });
+    await expect(dropped).toBeDisplayed();
     await browser.saveScreenshot(join(artifacts, "group-mentions-stopped.png"));
   });
 });

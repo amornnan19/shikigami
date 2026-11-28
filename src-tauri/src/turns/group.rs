@@ -18,11 +18,39 @@ impl AccessLevel {
     pub const STANDARD: Self = Self(1);
 
     pub fn permission_mode(self) -> &'static str {
+        #[cfg(test)]
+        if self < Self::STANDARD {
+            return "manual-lowest";
+        }
         "manual"
+    }
+
+    fn value(self) -> i64 {
+        i64::from(self.0)
+    }
+
+    fn from_value(value: i64) -> Self {
+        Self(u8::try_from(value).unwrap_or(0))
     }
 }
 
-fn access_level_of(_agent_id: &str) -> AccessLevel {
+#[cfg(test)]
+thread_local! {
+    static TEST_LEVELS: std::cell::RefCell<std::collections::HashMap<String, AccessLevel>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+#[cfg(test)]
+fn set_test_level(agent_id: &str, level: AccessLevel) {
+    TEST_LEVELS.with(|levels| levels.borrow_mut().insert(agent_id.to_owned(), level));
+}
+
+fn access_level_of(agent_id: &str) -> AccessLevel {
+    #[cfg(test)]
+    if let Some(level) = TEST_LEVELS.with(|levels| levels.borrow().get(agent_id).copied()) {
+        return level;
+    }
+    let _ = agent_id;
     AccessLevel::STANDARD
 }
 
@@ -30,8 +58,8 @@ fn lower_access(first: AccessLevel, second: AccessLevel) -> AccessLevel {
     first.min(second)
 }
 
-pub fn access_for_hand_off(from_agent_id: &str, to_agent_id: &str) -> AccessLevel {
-    lower_access(access_level_of(from_agent_id), access_level_of(to_agent_id))
+pub fn access_for_hand_off(causing: AccessLevel, to_agent_id: &str) -> AccessLevel {
+    lower_access(causing, access_level_of(to_agent_id))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,21 +87,32 @@ impl EntryKind {
     }
 }
 
+pub const MAX_ADDRESSED: usize = 8;
+pub const TRUNCATED_NOTICE: &str = "Only the first 8 mentioned agents were addressed.";
+
 #[derive(Debug, Clone)]
 pub struct Origin {
     pub kind: EntryKind,
     pub from_agent_id: Option<String>,
     pub root: Option<String>,
     pub hop: i64,
+    pub return_to: Option<String>,
+    pub parent_turn_id: Option<String>,
+    pub access: AccessLevel,
+    pub truncated: bool,
 }
 
 impl Origin {
-    fn user(root: &str) -> Self {
+    fn user(root: &str, addressed: &str, truncated: bool) -> Self {
         Self {
             kind: EntryKind::User,
             from_agent_id: None,
             root: Some(root.to_owned()),
             hop: 0,
+            return_to: None,
+            parent_turn_id: None,
+            access: access_level_of(addressed),
+            truncated,
         }
     }
 }
@@ -126,12 +165,14 @@ fn facts(connection: &Connection, group_id: &str) -> Result<GroupFacts, BeginErr
     })
 }
 
-fn resolve_addressed(members: &[Member], lead: String, text: &str) -> Vec<String> {
+fn resolve_addressed(members: &[Member], lead: String, text: &str) -> (Vec<String>, bool) {
     let mut addressed = mentions::addressed(text, members);
     if addressed.is_empty() {
         addressed.push(lead);
     }
-    addressed
+    let truncated = addressed.len() > MAX_ADDRESSED;
+    addressed.truncate(MAX_ADDRESSED);
+    (addressed, truncated)
 }
 
 pub fn addressed_agents(
@@ -141,7 +182,7 @@ pub fn addressed_agents(
 ) -> Result<Vec<String>, BeginError> {
     let members = groups::store::members_of(connection, group_id)?;
     let lead = lead_of(connection, group_id)?;
-    Ok(resolve_addressed(&members, lead, text))
+    Ok(resolve_addressed(&members, lead, text).0)
 }
 
 pub fn lead_of(connection: &Connection, group_id: &str) -> Result<String, BeginError> {
@@ -198,6 +239,7 @@ fn unseen_lines(
     group_id: &str,
     agent_id: &str,
     after_rowid: i64,
+    exclude_root: Option<&str>,
 ) -> rusqlite::Result<Vec<String>> {
     let mut statement = connection.prepare(
         "SELECT m.role, m.content, a.name, t.kind FROM messages m
@@ -207,21 +249,26 @@ fn unseen_lines(
            AND m.author_agent_id IS NOT ?2
            AND m.content <> ''
            AND NOT (m.role = 'user' AND t.kind = 'continuation')
+           AND NOT (?4 IS NOT NULL AND m.role = 'user' AND t.kind = 'user'
+                    AND COALESCE(t.root_message_id = ?4, 0))
          ORDER BY m.seq",
     )?;
-    let rows = statement.query_map(params![group_id, agent_id, after_rowid], |row| {
-        let role: String = row.get(0)?;
-        let content: String = row.get(1)?;
-        let name: Option<String> = row.get(2)?;
-        let kind: Option<String> = row.get(3)?;
-        let from_user = role == "user" && kind.as_deref().is_none_or(|kind| kind == "user");
-        let author = match name {
-            _ if from_user => "User".to_owned(),
-            Some(name) => name,
-            None => "Former member".to_owned(),
-        };
-        Ok(format!("{author}: {content}"))
-    })?;
+    let rows = statement.query_map(
+        params![group_id, agent_id, after_rowid, exclude_root],
+        |row| {
+            let role: String = row.get(0)?;
+            let content: String = row.get(1)?;
+            let name: Option<String> = row.get(2)?;
+            let kind: Option<String> = row.get(3)?;
+            let from_user = role == "user" && kind.as_deref().is_none_or(|kind| kind == "user");
+            let author = match name {
+                _ if from_user => "User".to_owned(),
+                Some(name) => name,
+                None => "Former member".to_owned(),
+            };
+            Ok(format!("{author}: {content}"))
+        },
+    )?;
     rows.collect()
 }
 
@@ -263,11 +310,17 @@ fn begin_in(
         return Err(BeginError::Busy);
     }
     let (session, last_seen, stored_context_hash) = session_of(transaction, addressed, group_id)?;
-    let unseen = unseen_lines(transaction, group_id, addressed, last_seen)?;
+    let user_root = origin
+        .root
+        .as_deref()
+        .filter(|_| origin.kind == EntryKind::User);
+    let unseen = unseen_lines(transaction, group_id, addressed, last_seen, user_root)?;
+    let access = access_for_hand_off(origin.access, addressed);
     let turn_id = uuid::Uuid::now_v7().to_string();
     transaction.execute(
-        "INSERT INTO turns (id, agent_id, group_id, status, started_at, root_message_id, hop, kind, from_agent_id)
-         VALUES (?1, ?2, ?3, 'running', ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO turns (id, agent_id, group_id, status, started_at, root_message_id, hop, kind,
+                            from_agent_id, return_to, parent_turn_id, access)
+         VALUES (?1, ?2, ?3, 'running', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             turn_id,
             addressed,
@@ -276,28 +329,57 @@ fn begin_in(
             origin.root,
             origin.hop,
             origin.kind.as_str(),
-            origin.from_agent_id
+            origin.from_agent_id,
+            origin.return_to,
+            origin.parent_turn_id,
+            access.value()
         ],
     )?;
-    let author = (origin.kind == EntryKind::HandOff)
-        .then_some(origin.from_agent_id.as_deref())
-        .flatten();
-    transaction.execute(
-        "INSERT INTO messages (id, agent_id, turn_id, group_id, author_agent_id, role, content, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'user', ?6, ?7)",
-        params![
-            uuid::Uuid::now_v7().to_string(),
-            addressed,
-            turn_id,
-            group_id,
-            author,
-            text,
-            now
-        ],
-    )?;
+    let message_stored: bool = match user_root {
+        Some(root) => transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages m JOIN turns t ON t.id = m.turn_id
+                           WHERE t.group_id = ?1 AND t.root_message_id = ?2 AND t.kind = 'user'
+                             AND m.role = 'user' AND t.id <> ?3)",
+            params![group_id, root, turn_id],
+            |row| row.get(0),
+        )?,
+        None => false,
+    };
+    if !message_stored {
+        let author = (origin.kind == EntryKind::HandOff)
+            .then_some(origin.from_agent_id.as_deref())
+            .flatten();
+        transaction.execute(
+            "INSERT INTO messages (id, agent_id, turn_id, group_id, author_agent_id, role, content, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'user', ?6, ?7)",
+            params![
+                uuid::Uuid::now_v7().to_string(),
+                addressed,
+                turn_id,
+                group_id,
+                author,
+                text,
+                now
+            ],
+        )?;
+    }
+    if origin.truncated {
+        transaction.execute(
+            "INSERT INTO messages (id, agent_id, turn_id, group_id, author_agent_id, role, content, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?2, 'notice', ?5, ?6)",
+            params![
+                uuid::Uuid::now_v7().to_string(),
+                addressed,
+                turn_id,
+                group_id,
+                TRUNCATED_NOTICE,
+                now
+            ],
+        )?;
+    }
     let message_seq: i64 = transaction.query_row(
-        "SELECT seq FROM messages WHERE rowid = last_insert_rowid()",
-        [],
+        "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE group_id = ?1",
+        [group_id],
         |row| row.get(0),
     )?;
     transaction.execute(
@@ -328,10 +410,7 @@ fn begin_in(
         input: compose_input(&unseen, text),
         previous_seen: last_seen,
         stored_context_hash,
-        access: match &origin.from_agent_id {
-            Some(from) => access_for_hand_off(from, addressed),
-            None => access_level_of(addressed),
-        },
+        access,
     })
 }
 
@@ -362,8 +441,9 @@ fn enqueue_at(
 ) -> rusqlite::Result<QueuedMessage> {
     let id = uuid::Uuid::now_v7().to_string();
     connection.execute(
-        "INSERT INTO group_queue (id, group_id, addressed_agent_id, content, from_agent_id, root_message_id, hop, kind, position, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        "INSERT INTO group_queue (id, group_id, addressed_agent_id, content, from_agent_id, root_message_id, hop, kind,
+                                 return_to, parent_turn_id, access, truncated, position, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             id,
             group_id,
@@ -373,6 +453,10 @@ fn enqueue_at(
             origin.root,
             origin.hop,
             origin.kind.as_str(),
+            origin.return_to,
+            origin.parent_turn_id,
+            origin.access.value(),
+            origin.truncated,
             position,
             now
         ],
@@ -394,18 +478,19 @@ pub fn begin_or_queue(
     let transaction = connection.unchecked_transaction()?;
     let facts = facts(&transaction, group_id)?;
     let lead = lead_of(&transaction, group_id)?;
-    let addressed = resolve_addressed(&facts.members, lead, text);
-    let origin = Origin::user(&uuid::Uuid::now_v7().to_string());
+    let (addressed, truncated) = resolve_addressed(&facts.members, lead, text);
+    let root = uuid::Uuid::now_v7().to_string();
     let backlog: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM group_queue WHERE group_id = ?1)",
         [group_id],
         |row| row.get(0),
     )?;
-    let mut entries = addressed.iter();
+    let mut entries = addressed.iter().enumerate();
     let mut started = None;
     let mut first_queued = None;
     if !backlog {
-        if let Some(first) = entries.next() {
+        if let Some((_, first)) = entries.next() {
+            let origin = Origin::user(&root, first, truncated);
             match begin_in(&transaction, group_id, first, text, &origin, now) {
                 Ok(begun) => started = Some(begun),
                 Err(BeginError::Busy) => {
@@ -416,7 +501,8 @@ pub fn begin_or_queue(
             }
         }
     }
-    for entry in entries {
+    for (index, entry) in entries {
+        let origin = Origin::user(&root, entry, truncated && backlog && index == 0);
         let queued = enqueue(&transaction, group_id, entry, text, &origin, now)?;
         first_queued.get_or_insert(queued);
     }
@@ -467,7 +553,8 @@ fn advance_in(
 ) -> Result<Option<GroupBegun>, BeginError> {
     let head: Option<(String, String, String, Origin)> = transaction
         .query_row(
-            "SELECT id, addressed_agent_id, content, kind, from_agent_id, root_message_id, hop
+            "SELECT id, addressed_agent_id, content, kind, from_agent_id, root_message_id, hop,
+                    return_to, parent_turn_id, access, truncated
              FROM group_queue WHERE group_id = ?1
              ORDER BY position LIMIT 1",
             [group_id],
@@ -481,6 +568,10 @@ fn advance_in(
                         from_agent_id: row.get(4)?,
                         root: row.get(5)?,
                         hop: row.get(6)?,
+                        return_to: row.get(7)?,
+                        parent_turn_id: row.get(8)?,
+                        access: AccessLevel::from_value(row.get(9)?),
+                        truncated: row.get(10)?,
                     },
                 ))
             },
@@ -639,10 +730,10 @@ pub fn finish_turn(connection: &Connection, finish: &Finish) -> rusqlite::Result
         "UPDATE groups SET last_activity_at = ?2 WHERE id = ?1",
         params![group_id, now],
     )?;
-    let notices = if status == "completed" {
-        hand_offs::queue_after(&transaction, turn_id, now)?
-    } else {
-        Vec::new()
+    let notices = match status {
+        "completed" => hand_offs::queue_after(&transaction, turn_id, now)?,
+        "stopped" => hand_offs::drop_after_stop(&transaction, turn_id, now)?,
+        _ => Vec::new(),
     };
     transaction.commit()?;
     Ok(notices)

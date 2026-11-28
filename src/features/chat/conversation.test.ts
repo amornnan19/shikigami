@@ -12,6 +12,7 @@ function turn(id: string): Conversation["turns"][number] {
     endedAt: null,
     kind: "user",
     fromAgentId: null,
+    handOffs: [],
     userMessage: id,
     items: [],
   };
