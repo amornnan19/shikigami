@@ -280,6 +280,7 @@ pub fn queue_after(
             agent_id: Some(turn.agent_id.clone()),
             name: name_of(connection, &turn.agent_id)?,
             finished: true,
+            notice: None,
         };
         settle_for(connection, &turn, turn_id, answer, now, &mut notices)?;
     }
@@ -295,9 +296,13 @@ pub fn unfinished_after(
     let Some(turn) = finished_turn(connection, turn_id)? else {
         return Ok(notices);
     };
+    let name = name_of(connection, &turn.agent_id)?;
     let answer = Answer {
         agent_id: Some(turn.agent_id.clone()),
-        name: name_of(connection, &turn.agent_id)?,
+        notice: Some(format!(
+            "{name} did not finish; continuing without its answer."
+        )),
+        name,
         finished: false,
     };
     settle_for(connection, &turn, turn_id, answer, now, &mut notices)?;
@@ -315,6 +320,72 @@ pub fn settle_interrupted(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+pub enum Dropped {
+    Departed,
+    Removed,
+}
+
+pub fn drop_waiting(
+    connection: &Connection,
+    queued_id: &str,
+    why: Dropped,
+    now: i64,
+) -> rusqlite::Result<Option<String>> {
+    type Row = (String, String, Option<String>, String, i64, i64);
+    let row: Option<Row> = connection
+        .query_row(
+            "DELETE FROM group_queue WHERE id = ?1
+             RETURNING group_id, kind, parent_turn_id, addressed_agent_id, hop, access",
+            [queued_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((group_id, kind, parent, agent_id, hop, access)) = row else {
+        return Ok(None);
+    };
+    if EntryKind::parse(&kind) == EntryKind::User {
+        return Ok(Some(group_id));
+    }
+    let name = name_of(connection, &agent_id)?;
+    let notice = match why {
+        Dropped::Departed => format!("{name} did not finish; continuing without its answer."),
+        Dropped::Removed => format!("{name}'s task was removed; continuing without its answer."),
+    };
+    let answer = Answer {
+        agent_id: Some(agent_id),
+        name,
+        finished: false,
+        notice: Some(notice),
+    };
+    let settled = settle(
+        connection,
+        &group_id,
+        parent.clone(),
+        answer,
+        hop,
+        AccessLevel::from_value(access),
+        now,
+    )?;
+    if matches!(settled, Settled::LimitReached) {
+        if let Some(parent_id) = parent {
+            if let Some(turn) = finished_turn(connection, &parent_id)? {
+                post_limit_notice(connection, &turn, &parent_id, now, &mut Vec::new())?;
+            }
+        }
+    }
+    Ok(Some(group_id))
+}
+
 pub fn drop_for_departed(
     connection: &Connection,
     group_id: Option<&str>,
@@ -324,43 +395,18 @@ pub fn drop_for_departed(
     if group_id.is_none() {
         connection.execute("DELETE FROM group_members WHERE agent_id = ?1", [agent_id])?;
     }
-    type Waiting = (String, String, Option<String>, i64, i64);
-    let waiting: Vec<Waiting> = {
+    let waiting: Vec<String> = {
         let mut statement = connection.prepare(
-            "SELECT id, group_id, parent_turn_id, hop, access
-             FROM group_queue
+            "SELECT id FROM group_queue
              WHERE addressed_agent_id = ?1 AND kind IN ('hand-off', 'continuation')
                AND (?2 IS NULL OR group_id = ?2)
              ORDER BY position",
         )?;
-        let rows = statement.query_map(params![agent_id, group_id], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-            ))
-        })?;
+        let rows = statement.query_map(params![agent_id, group_id], |row| row.get(0))?;
         rows.collect::<rusqlite::Result<_>>()?
     };
-    let name = name_of(connection, agent_id)?;
-    for (id, entry_group, parent, hop, access) in waiting {
-        connection.execute("DELETE FROM group_queue WHERE id = ?1", [&id])?;
-        let answer = Answer {
-            agent_id: Some(agent_id.to_owned()),
-            name: name.clone(),
-            finished: false,
-        };
-        settle(
-            connection,
-            &entry_group,
-            parent,
-            answer,
-            hop,
-            AccessLevel::from_value(access),
-            now,
-        )?;
+    for id in waiting {
+        drop_waiting(connection, &id, Dropped::Departed, now)?;
     }
     Ok(())
 }
@@ -369,6 +415,7 @@ struct Answer {
     agent_id: Option<String>,
     name: String,
     finished: bool,
+    notice: Option<String>,
 }
 
 enum Settled {
@@ -411,16 +458,32 @@ fn settle(
 ) -> rusqlite::Result<Settled> {
     let mut parent = first_parent;
     let mut answer = first_answer;
+    let mut carried: Vec<String> = Vec::new();
     while let Some(parent_id) = parent.take() {
-        type Row = (Option<String>, Option<String>, Option<String>, bool);
+        type Row = (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            bool,
+            Option<String>,
+        );
         let row: Option<Row> = connection
             .query_row(
-                "SELECT agent_id, root_message_id, parent_turn_id, deferred FROM turns WHERE id = ?1",
+                "SELECT agent_id, root_message_id, parent_turn_id, deferred, pending_notice
+                 FROM turns WHERE id = ?1",
                 [&parent_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .optional()?;
-        let Some((agent_id, root, grandparent, deferred)) = row else {
+        let Some((agent_id, root, grandparent, deferred, pending)) = row else {
             break;
         };
         if !deferred {
@@ -433,10 +496,25 @@ fn settle(
             [&parent_id],
             |row| row.get(0),
         )?;
+        let mut notices: Vec<String> = pending
+            .iter()
+            .flat_map(|text| text.split('\n'))
+            .map(str::to_owned)
+            .collect();
+        notices.append(&mut carried);
+        notices.extend(answer.notice.clone());
         if open {
+            let joined = (!notices.is_empty()).then(|| notices.join("\n"));
+            connection.execute(
+                "UPDATE turns SET pending_notice = ?2 WHERE id = ?1",
+                params![parent_id, joined],
+            )?;
             break;
         }
-        connection.execute("UPDATE turns SET deferred = 0 WHERE id = ?1", [&parent_id])?;
+        connection.execute(
+            "UPDATE turns SET deferred = 0, pending_notice = NULL WHERE id = ?1",
+            [&parent_id],
+        )?;
         let root = root.unwrap_or_else(|| parent_id.clone());
         let present: bool = match &agent_id {
             Some(agent) => connection.query_row(
@@ -450,16 +528,10 @@ fn settle(
             if turns_of_root(connection, group_id, &root)? >= MAX_TURNS {
                 return Ok(Settled::LimitReached);
             }
-            let (text, notice) = if answer.finished {
-                (format!("Continue with {}'s answer.", answer.name), None)
+            let text = if answer.finished {
+                format!("Continue with {}'s answer.", answer.name)
             } else {
-                (
-                    format!("Continue without {}'s answer.", answer.name),
-                    Some(format!(
-                        "{} did not finish; continuing without its answer.",
-                        answer.name
-                    )),
-                )
+                format!("Continue without {}'s answer.", answer.name)
             };
             let origin = Origin {
                 kind: EntryKind::Continuation,
@@ -469,18 +541,23 @@ fn settle(
                 parent_turn_id: grandparent,
                 owes_turn_id: Some(parent_id),
                 access,
-                notice,
+                notice: (!notices.is_empty()).then(|| notices.join("\n")),
             };
             let position = place_at_head(connection, group_id, 0)?;
             enqueue_at(connection, group_id, agent, &text, &origin, position, now)?;
             return Ok(Settled::Queued);
         }
+        carried = notices;
+        let name = match &agent_id {
+            Some(agent) => name_of(connection, agent)?,
+            None => "Former member".to_owned(),
+        };
         answer = Answer {
             agent_id: None,
-            name: match &agent_id {
-                Some(agent) => name_of(connection, agent)?,
-                None => "Former member".to_owned(),
-            },
+            notice: Some(format!(
+                "{name} did not finish; continuing without its answer."
+            )),
+            name,
             finished: false,
         };
         parent = grandparent;

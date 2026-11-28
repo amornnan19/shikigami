@@ -1301,7 +1301,7 @@ pub async fn remove_group_queued(app: AppHandle, queued_id: String) -> Result<()
         let db = remove_app
             .try_state::<Database>()
             .ok_or_else(TurnError::unavailable)?;
-        db.with_connection(|connection| group::remove_queued(connection, &queued_id))
+        db.with_connection(|connection| group::remove_queued(connection, &queued_id, now_millis()))
             .map_err(TurnError::database)
     })
     .await

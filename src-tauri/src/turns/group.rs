@@ -381,7 +381,7 @@ fn begin_in(
             ],
         )?;
     }
-    if let Some(notice) = &origin.notice {
+    for notice in origin.notice.iter().flat_map(|text| text.split('\n')) {
         transaction.execute(
             "INSERT INTO messages (id, agent_id, turn_id, group_id, author_agent_id, role, content, created_at)
              VALUES (?1, ?2, ?3, ?4, ?2, 'notice', ?5, ?6)",
@@ -610,8 +610,13 @@ fn advance_in(
         match lead {
             Some(lead) => addressed = lead,
             None => {
-                transaction.execute("DELETE FROM group_queue WHERE id = ?1", [&queued_id])?;
-                return Ok(None);
+                hand_offs::drop_waiting(
+                    transaction,
+                    &queued_id,
+                    hand_offs::Dropped::Departed,
+                    now,
+                )?;
+                return advance_in(transaction, group_id, now);
             }
         }
     }
@@ -683,14 +688,16 @@ pub fn edit_queued(
         .optional()
 }
 
-pub fn remove_queued(connection: &Connection, queued_id: &str) -> rusqlite::Result<Option<String>> {
-    connection
-        .query_row(
-            "DELETE FROM group_queue WHERE id = ?1 RETURNING group_id",
-            [queued_id],
-            |row| row.get(0),
-        )
-        .optional()
+pub fn remove_queued(
+    connection: &Connection,
+    queued_id: &str,
+    now: i64,
+) -> rusqlite::Result<Option<String>> {
+    let transaction = connection.unchecked_transaction()?;
+    let group_id =
+        hand_offs::drop_waiting(&transaction, queued_id, hand_offs::Dropped::Removed, now)?;
+    transaction.commit()?;
+    Ok(group_id)
 }
 
 pub fn set_session(

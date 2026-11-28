@@ -1005,3 +1005,154 @@ fn a_parent_that_is_no_longer_owed_gets_no_second_continuation() {
     crafted(&fx, 0, 0);
     assert!(fx.entries().is_empty());
 }
+
+impl Fixture {
+    fn remove_queued_entry(&self, index: usize) {
+        let queued = self.db.with_connection(|c| list_queue(c, "g")).unwrap();
+        self.db
+            .with_connection(|c| remove_queued(c, &queued[index].id, 60))
+            .unwrap();
+    }
+}
+
+#[test]
+fn removing_a_waiting_hand_off_lets_the_parent_continue_once_with_a_notice() {
+    let fx = Fixture::new();
+    fx.add_cy();
+    let first = fx.started("g", "hello");
+    fx.finish_with(&first, "completed", "@Bo part one\n@Cy part two");
+    let bo = fx.next(&first).unwrap();
+    fx.finish_with(&bo, "completed", "one done");
+    assert_eq!(fx.entries(), [entry("c", "hand-off", "part two")]);
+    fx.remove_queued_entry(0);
+    assert_eq!(
+        fx.entries(),
+        [entry("a", "continuation", "Continue without Cy's answer.")]
+    );
+    let ada = fx.next(&bo).unwrap();
+    assert_eq!(ada.agent_id, "a");
+    assert!(ada.text.contains("Bo: one done"));
+    assert_eq!(
+        fx.notices(),
+        ["Cy's task was removed; continuing without its answer."]
+    );
+    fx.finish_with(&ada, "completed", "done");
+    assert!(fx.next(&ada).is_none());
+    assert_eq!(fx.turn_count(), 3);
+}
+
+#[test]
+fn removing_a_waiting_continuation_in_a_nested_chain_lets_the_grandparent_continue() {
+    let fx = Fixture::new();
+    fx.add_cy();
+    let first = fx.started("g", "hello");
+    fx.finish_with(&first, "completed", "@Bo ask Cy");
+    let bo = fx.next(&first).unwrap();
+    fx.finish_with(&bo, "completed", "@Cy dig");
+    let cy = fx.next(&bo).unwrap();
+    fx.finish_with(&cy, "completed", "dug");
+    assert_eq!(
+        fx.entries(),
+        [entry("b", "continuation", "Continue with Cy's answer.")]
+    );
+    fx.remove_queued_entry(0);
+    assert_eq!(
+        fx.entries(),
+        [entry("a", "continuation", "Continue without Bo's answer.")]
+    );
+    let ada = fx.next(&cy).unwrap();
+    assert_eq!(ada.agent_id, "a");
+    assert_eq!(
+        fx.notices(),
+        ["Bo's task was removed; continuing without its answer."]
+    );
+}
+
+#[test]
+fn removing_a_user_entry_settles_nothing() {
+    let fx = Fixture::new();
+    let first = fx.started("g", "hello");
+    fx.queued("g", "waiting");
+    fx.remove_queued_entry(0);
+    assert!(fx.entries().is_empty());
+    fx.end(&first, "completed");
+}
+
+#[test]
+fn a_departed_child_that_leaves_the_parent_open_hands_its_notice_to_the_eventual_continuation() {
+    let fx = Fixture::new();
+    fx.add_cy();
+    fx.add_dee();
+    let first = fx.started("g", "hello");
+    fx.finish_with(&first, "completed", "@Bo one\n@Cy two\n@Dee three");
+    fx.db.with_connection(|c| {
+        crate::groups::store::replace_members(
+            c,
+            "g",
+            &["a".to_owned(), "c".to_owned(), "d".to_owned()],
+            60,
+        )
+        .unwrap();
+        super::super::drop_for_departed(c, Some("g"), "b", 60).unwrap();
+    });
+    assert_eq!(fx.entries().len(), 2);
+    let cy = fx.next(&first).unwrap();
+    assert_eq!(cy.agent_id, "c");
+    fx.finish_with(&cy, "failed", "");
+    let dee = fx.next(&cy).unwrap();
+    assert_eq!(dee.agent_id, "d");
+    fx.finish_with(&dee, "completed", "three done");
+    let ada = fx.next(&dee).unwrap();
+    assert_eq!(ada.agent_id, "a");
+    assert_eq!(
+        fx.notices(),
+        [
+            "Bo did not finish; continuing without its answer.",
+            "Cy did not finish; continuing without its answer."
+        ]
+    );
+}
+
+#[test]
+fn a_departed_child_at_the_limit_posts_the_limit_notice() {
+    let fx = Fixture::new();
+    fx.add_cy();
+    let first = fx.started("g", "hello");
+    fx.finish_with(&first, "completed", "@Bo one");
+    fx.db.with_connection(|c| {
+        for n in 0..7 {
+            c.execute(
+                "INSERT INTO turns (id, agent_id, group_id, status, started_at, root_message_id)
+                 SELECT ?1, 'c', 'g', 'completed', 5, root_message_id FROM turns WHERE id = ?2",
+                params![format!("old{n}"), first.turn_id],
+            )
+            .unwrap();
+        }
+        crate::groups::store::replace_members(c, "g", &["a".to_owned(), "c".to_owned()], 60)
+            .unwrap();
+        super::super::drop_for_departed(c, Some("g"), "b", 60).unwrap();
+    });
+    assert!(fx.entries().is_empty());
+    assert_eq!(fx.notices(), [LIMIT_NOTICE]);
+}
+
+#[test]
+fn a_hand_off_dropped_because_the_group_has_no_lead_settles_its_parent_and_the_queue_goes_on() {
+    let fx = Fixture::new();
+    fx.add_cy();
+    let first = fx.started("g", "hello");
+    fx.finish_with(&first, "completed", "@Bo check");
+    fx.db.with_connection(|c| {
+        c.execute("UPDATE groups SET lead_agent_id = NULL WHERE id = 'g'", [])
+            .unwrap();
+        c.execute("DELETE FROM group_members WHERE agent_id = 'b'", [])
+            .unwrap();
+    });
+    let launch = start_next_group(&fx.db, &fx.registry, &fx.dirs(), "g").unwrap();
+    assert_eq!(launch.agent_id, "a");
+    assert_eq!(
+        fx.notices(),
+        ["Bo did not finish; continuing without its answer."]
+    );
+    assert!(fx.entries().is_empty());
+}
