@@ -615,6 +615,28 @@ fn a_missing_oversized_or_linked_folder_instructions_file_is_left_out() {
     );
     assert!(!linked.text.contains("do not leak"));
     assert!(!linked.text.contains("Instructions from the group folder"));
+    fx.end(&linked, "completed");
+    fs::remove_file(fx.folder.path().join("CLAUDE.md")).unwrap();
+    fs::write(&secret, "hard linked text").unwrap();
+    fs::hard_link(&secret, fx.folder.path().join("CLAUDE.md")).unwrap();
+    let hard = fx.started("g", "fourth");
+    assert_eq!(
+        hard.group.as_ref().unwrap().folder_notice.as_deref(),
+        Some("The group folder's CLAUDE.md was not loaded (it has more than one hard link).")
+    );
+    assert!(!hard.text.contains("hard linked text"));
+}
+
+#[test]
+fn a_hard_linked_member_instruction_file_is_left_out_of_a_group_turn() {
+    let fx = Fixture::new();
+    let own = fx.workspaces.path().join("Ada").join("CLAUDE.md");
+    let outside = fx.workspaces.path().join("outside.md");
+    fs::write(&outside, "linked rules\n").unwrap();
+    fs::remove_file(&own).unwrap();
+    fs::hard_link(&outside, &own).unwrap();
+    let launch = fx.started("g", "hello");
+    assert_eq!(launch.group.as_ref().unwrap().instructions, "");
 }
 
 #[tokio::test]

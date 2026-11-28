@@ -1,8 +1,13 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { $, $$, browser, expect } from "@wdio/globals";
-import { fakeClaudeCwds, fakeClaudeRecordSeparator, fakeClaudeSettings } from "../fake-providers";
+import {
+  fakeClaudeCwds,
+  fakeClaudeRecordSeparator,
+  fakeClaudeSettings,
+  fakeClaudeToolMarker,
+} from "../fake-providers";
 
 const artifacts = join(import.meta.dirname, "..", "artifacts");
 const agentView = 'section[aria-label="Agent"]';
@@ -17,6 +22,7 @@ type TurnSettings = {
     autoAllowBashIfSandboxed: boolean;
     network: { allowedDomains: string[]; strictAllowlist: boolean };
     filesystem: { allowWrite: string[]; denyRead: string[]; denyWrite: string[] };
+    credentials: { envVars: { name: string; mode: string }[] };
   };
   permissions: {
     allow: string[];
@@ -65,6 +71,10 @@ describe("the sandbox", () => {
     }
     expect(sandbox?.filesystem.denyRead).not.toContain(folder);
     expect(settings?.permissions.blockReadsOutsideWorkingDirectories).toBe(true);
+    expect(settings?.permissions.deny).toContain("NotebookEdit");
+    expect(settings?.sandbox.credentials.envVars).toEqual([
+      { name: "ANTHROPIC_API_KEY", mode: "deny" },
+    ]);
     expect(settings?.permissions.ask).toEqual(["WebFetch", "WebSearch"]);
     expect(sandbox?.filesystem.denyRead).toContain("/Volumes");
     expect(settings?.permissions.allow).toEqual([`Read(/${folder}/**)`, `Edit(/${folder}/**)`]);
@@ -82,5 +92,15 @@ describe("the sandbox", () => {
     await expect($('aside[aria-label="Agents"] [aria-label="Needs attention"]')).toBeExisting();
     await expect($$(`${agentView} article`)).toBeElementsArrayOfSize(2);
     await browser.saveScreenshot(join(artifacts, "sandbox-unavailable.png"));
+  });
+
+  it("stops a CLI that ignores the settings before any tool runs", async () => {
+    await $(messageBox).setValue("IGNORESETTINGS please");
+    await browser.keys("Enter");
+    const turn = $(`${agentView} article:nth-of-type(3)`);
+    await expect(turn).toHaveText(expect.stringContaining(sandboxMessage), { wait: 30000 });
+    await browser.pause(2500);
+    expect(existsSync(fakeClaudeToolMarker)).toBe(false);
+    await browser.saveScreenshot(join(artifacts, "sandbox-settings-ignored.png"));
   });
 });

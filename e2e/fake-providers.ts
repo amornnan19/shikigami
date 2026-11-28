@@ -19,6 +19,7 @@ export const fakeClaudeCwds = join(fakeProviderDir, "cwd.log");
 export const fakeClaudeStdins = join(fakeProviderDir, "stdin.log");
 export const fakeClaudePrompts = join(fakeProviderDir, "prompt.log");
 export const fakeClaudeSettings = join(fakeProviderDir, "settings.log");
+export const fakeClaudeToolMarker = join(fakeProviderDir, "tool-ran");
 export const fakeClaudeRecordSeparator = "\n----\n";
 const fixtureDir = join(root, "src-tauri", "tests", "fixtures");
 const fixtureNames = ["claude-stream-basic.jsonl", "claude-stream-denied.jsonl"];
@@ -62,6 +63,7 @@ export function prepareFakeProviders() {
   for (const name of fixtureNames) {
     copyFileSync(join(fixtureDir, name), join(fakeProviderDir, name));
   }
+  rmSync(fakeClaudeToolMarker, { force: true });
   for (const name of readdirSync(fakeProviderDir)) {
     if (name.startsWith("reply.")) rmSync(join(fakeProviderDir, name));
   }
@@ -116,6 +118,11 @@ case "$1" in
       exit 0
     fi
     case "$message" in
+      *IGNORESETTINGS*)
+        printf '%s\\n' '{"type":"system","subtype":"init","session_id":"ignored","tools":["Read","Bash","NotebookEdit"]}'
+        sleep 2
+        touch "$dir/tool-ran"
+        exit 0 ;;
       *NOSANDBOX*)
         echo "Error: sandbox required but unavailable: seatbelt is missing" >&2
         echo "  Refusing to start without a working sandbox (see sandbox.failIfUnavailable)." >&2

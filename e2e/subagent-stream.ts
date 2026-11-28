@@ -16,7 +16,7 @@ const toolResult = (id: string, content: string, isError: boolean, parent?: stri
 
 export function subagentStream(holdSeconds: number): (object | string)[] {
   return [
-    { type: "system", subtype: "init", session_id: fakeClaudeSessionId() },
+    { type: "system", subtype: "init", tools: ["Read", "Bash"], session_id: fakeClaudeSessionId() },
     toolUse("m1", "agent-a", "Agent", {
       subagent_type: "Explore",
       description: "Scan the notes",

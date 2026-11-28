@@ -397,14 +397,28 @@ impl GroupRun {
     }
 }
 
+fn unusable_reason(error: &crate::agents::AgentError, limit_kib: u64) -> String {
+    match error.code {
+        "too-large" => format!("it is larger than {limit_kib} KiB"),
+        "not-text" => "it is not UTF-8 text".to_owned(),
+        "not-a-file" => "it is not a regular file".to_owned(),
+        "linked" => "it has more than one hard link".to_owned(),
+        _ => "it could not be read".to_owned(),
+    }
+}
+
 fn folder_notice(error: &crate::agents::AgentError) -> String {
-    let reason = match error.code {
-        "too-large" => "it is larger than 64 KiB",
-        "not-text" => "it is not UTF-8 text",
-        "not-a-file" => "it is not a regular file",
-        _ => "it could not be read",
-    };
-    format!("The group folder's CLAUDE.md was not loaded ({reason}).")
+    format!(
+        "The group folder's CLAUDE.md was not loaded ({}).",
+        unusable_reason(error, group::FOLDER_INSTRUCTIONS_MAX_BYTES / 1024)
+    )
+}
+
+fn workspace_notice(error: &crate::agents::AgentError) -> String {
+    format!(
+        "The workspace's CLAUDE.md was not loaded ({}).",
+        unusable_reason(error, instructions::MAX_BYTES / 1024)
+    )
 }
 
 pub struct Launch {
@@ -417,6 +431,7 @@ pub struct Launch {
     pub session: claude_code::Session,
     pub text: String,
     pub instructions: String,
+    pub notice: Option<String>,
     pub started_at: i64,
     pub environment: Vec<(OsString, OsString)>,
     pub stall_timeout: Duration,
@@ -487,9 +502,13 @@ fn launch_of(
     if !registry.begin(agent_id, &begun.turn_id) {
         return None;
     }
-    let instructions = instructions::read(Path::new(&begun.agent.workspace_path))
-        .map(|read| read.text)
-        .unwrap_or_default();
+    let (instructions, notice) = match instructions::read_for_turn(
+        Path::new(&begun.agent.workspace_path),
+        instructions::MAX_BYTES,
+    ) {
+        Ok(read) => (read.text, None),
+        Err(error) => (String::new(), Some(workspace_notice(&error))),
+    };
     Some(Launch {
         agent_id: agent_id.to_owned(),
         turn_id: begun.turn_id,
@@ -500,6 +519,7 @@ fn launch_of(
         session: begun.session,
         text,
         instructions,
+        notice,
         started_at,
         environment: std::env::vars_os().collect(),
         stall_timeout: stall_timeout(),
@@ -519,10 +539,13 @@ fn launch_of_group(
     if !registry.begin(&begun.agent_id, &begun.begun.turn_id) {
         return None;
     }
-    let instructions = instructions::read(Path::new(&begun.begun.agent.workspace_path))
-        .map(|read| read.text)
-        .unwrap_or_default();
-    let (folder_instructions, folder_notice) = match instructions::read_up_to(
+    let instructions = instructions::read_for_turn(
+        Path::new(&begun.begun.agent.workspace_path),
+        instructions::MAX_BYTES,
+    )
+    .map(|read| read.text)
+    .unwrap_or_default();
+    let (folder_instructions, folder_notice) = match instructions::read_for_turn(
         Path::new(&begun.folder),
         group::FOLDER_INSTRUCTIONS_MAX_BYTES,
     ) {
@@ -556,6 +579,7 @@ fn launch_of_group(
         session: begun.begun.session,
         text,
         instructions: String::new(),
+        notice: None,
         started_at,
         environment: std::env::vars_os().collect(),
         stall_timeout: stall_timeout(),
@@ -1612,6 +1636,48 @@ mod tests {
         let launch = fx.send("a", "hi").unwrap();
         assert_eq!(launch.instructions, "Ada rules\n");
         assert!(launch.group.is_none());
+    }
+
+    #[test]
+    fn a_one_to_one_instruction_file_that_cannot_be_used_gives_a_notice_and_no_text() {
+        use std::os::unix::fs::symlink;
+        type Prepare = fn(&Path);
+        let cases: [(&str, Prepare); 4] = [
+            ("it is larger than 256 KiB", |dir| {
+                fs::write(dir.join("CLAUDE.md"), "x".repeat(256 * 1024 + 1)).unwrap();
+            }),
+            ("it is not a regular file", |dir| {
+                fs::write(dir.join("real.md"), "x").unwrap();
+                symlink(dir.join("real.md"), dir.join("CLAUDE.md")).unwrap();
+            }),
+            ("it has more than one hard link", |dir| {
+                fs::write(dir.join("real.md"), "secret rules").unwrap();
+                fs::hard_link(dir.join("real.md"), dir.join("CLAUDE.md")).unwrap();
+            }),
+            ("it is not UTF-8 text", |dir| {
+                fs::write(dir.join("CLAUDE.md"), [0xff, 0xfe]).unwrap();
+            }),
+        ];
+        for (reason, prepare_file) in cases {
+            let fx = Fixture::new("claude-code");
+            let workspace = tempfile::tempdir().unwrap();
+            prepare_file(workspace.path());
+            fx.db
+                .with_connection(|c| {
+                    c.execute(
+                        "UPDATE agents SET workspace_path = ?1",
+                        [workspace.path().to_string_lossy()],
+                    )
+                })
+                .unwrap();
+            let launch = fx.send("a", "hi").unwrap();
+            assert_eq!(
+                launch.notice.as_deref(),
+                Some(format!("The workspace's CLAUDE.md was not loaded ({reason}).").as_str()),
+                "{reason}"
+            );
+            assert_eq!(launch.instructions, "", "{reason}");
+        }
     }
 
     #[test]
