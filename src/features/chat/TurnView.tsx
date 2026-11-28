@@ -3,6 +3,7 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  Clock,
   LoaderCircle,
   Square,
   X,
@@ -290,7 +291,16 @@ export function TurnView({
   );
   const sender = members?.find((member) => member.agentId === turn.fromAgentId);
   return (
-    <article className="flex flex-col gap-2">
+    <article data-turn-id={turn.id} className="flex flex-col gap-2">
+      {turn.routineName !== null && (
+        <p
+          data-part="routine-marker"
+          className="ml-auto flex items-center gap-1 text-xs text-muted-foreground"
+        >
+          <Clock className="size-3" aria-hidden="true" />
+          Routine: {turn.routineName}
+        </p>
+      )}
       {turn.kind === "continuation" ? (
         <p className="my-1 text-center text-xs text-muted-foreground">{turn.userMessage}</p>
       ) : turn.kind === "hand-off" ? (

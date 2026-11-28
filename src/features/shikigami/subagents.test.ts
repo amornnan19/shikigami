@@ -179,6 +179,7 @@ describe("group status and the room count", () => {
       kind: "user",
       fromAgentId: null,
       handOffs: [],
+      routineName: null,
       userMessage: "",
       items,
     });

@@ -168,6 +168,41 @@ pub fn list_for_agent(
     )
 }
 
+pub fn list_due(connection: &Connection, now_ms: i64) -> Result<Vec<Stored>, RoutineError> {
+    query(
+        connection,
+        &format!(
+            "SELECT {COLUMNS} FROM routines
+             WHERE active = 1 AND done = 0 AND next_run_at IS NOT NULL AND next_run_at <= ?1
+             ORDER BY next_run_at, name, id"
+        ),
+        params![now_ms],
+    )
+}
+
+pub fn earliest_next_run(connection: &Connection) -> rusqlite::Result<Option<i64>> {
+    connection.query_row(
+        "SELECT MIN(next_run_at) FROM routines WHERE active = 1 AND done = 0",
+        [],
+        |row| row.get(0),
+    )
+}
+
+pub fn advance(
+    connection: &Connection,
+    id: &str,
+    next_run_at: Option<i64>,
+    done: bool,
+) -> Result<(), RoutineError> {
+    connection
+        .execute(
+            "UPDATE routines SET next_run_at = ?2, done = done OR ?3 WHERE id = ?1",
+            params![id, next_run_at, done],
+        )
+        .map(|_| ())
+        .map_err(RoutineError::database)
+}
+
 pub fn list_all(connection: &Connection) -> Result<Vec<Stored>, RoutineError> {
     query(
         connection,

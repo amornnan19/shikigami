@@ -13,6 +13,7 @@ function turn(id: string): Conversation["turns"][number] {
     kind: "user",
     fromAgentId: null,
     handOffs: [],
+    routineName: null,
     userMessage: id,
     items: [],
   };

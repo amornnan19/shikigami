@@ -91,7 +91,7 @@ pub fn run() {
                     let _ = routines::refresh_next_runs(
                         database,
                         &routines::zone(),
-                        jiff::Timestamp::now(),
+                        routines::clock::now(),
                     );
                 });
             if !data_dir.as_os_str().is_empty() {
@@ -122,6 +122,12 @@ pub fn run() {
                 home: app.path().home_dir().ok(),
             });
             app.manage(DataDir(data_dir));
+            if app.try_state::<db::Database>().is_some() {
+                app.manage(std::sync::Arc::new(
+                    routines::scheduler::Scheduler::default(),
+                ));
+                tauri::async_runtime::spawn(routines::scheduler::run(app.handle().clone()));
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -167,6 +173,8 @@ pub fn run() {
             routines::update_routine,
             routines::set_routine_active,
             routines::delete_routine,
+            routines::list_routine_runs,
+            routines::run_routine_now,
             routines::routine_time_zone
         ])
         .build(app_context())

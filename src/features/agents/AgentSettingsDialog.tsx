@@ -10,6 +10,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { openTurn } from "@/features/chat/openTurn";
 import { RoutinesSection } from "@/features/routines/RoutinesSection";
 import {
   authChoiceOf,
@@ -246,7 +247,14 @@ export function AgentSettingsDialog({
         <ModelSection agent={agent} />
         <SignInSection agent={agent} />
         <Section label="Routines">
-          <RoutinesSection agent={agent} onChangeSignIn={focusSignIn} />
+          <RoutinesSection
+            agent={agent}
+            onChangeSignIn={focusSignIn}
+            onOpenTurn={(turnId) => {
+              onOpenChange(false);
+              openTurn(turnId);
+            }}
+          />
         </Section>
         <InstructionsSection agentId={agent.id} />
         <DeleteSection agent={agent} running={running} onDeleted={onDeleted} />

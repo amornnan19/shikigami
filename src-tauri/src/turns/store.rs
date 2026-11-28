@@ -3,6 +3,7 @@ use serde::Serialize;
 
 use super::claude_code::{self, Session};
 use crate::approvals::ApprovalView;
+use crate::routines::runs::{self, Mark};
 
 pub const PAGE_SIZE: usize = 20;
 
@@ -74,6 +75,7 @@ pub struct TurnView {
     pub kind: String,
     pub from_agent_id: Option<String>,
     pub hand_offs: Vec<HandOffView>,
+    pub routine_name: Option<String>,
     pub user_message: String,
     pub items: Vec<ItemView>,
 }
@@ -132,7 +134,7 @@ pub fn begin_turn(
     now: i64,
 ) -> Result<Begun, BeginError> {
     let transaction = connection.unchecked_transaction()?;
-    let begun = begin_in(&transaction, agent_id, text, now)?;
+    let begun = begin_in(&transaction, agent_id, text, now, None)?;
     transaction.commit()?;
     Ok(begun)
 }
@@ -144,27 +146,79 @@ pub fn begin_or_queue(
     now: i64,
 ) -> Result<Sent, BeginError> {
     let transaction = connection.unchecked_transaction()?;
+    let sent = send_in(&transaction, agent_id, text, now, None, false)?;
+    transaction.commit()?;
+    Ok(sent)
+}
+
+pub fn begin_or_queue_routine(
+    connection: &Connection,
+    agent_id: &str,
+    text: &str,
+    now: i64,
+    mark: &Mark,
+    hold: bool,
+) -> Result<Option<Sent>, BeginError> {
+    let transaction = connection.unchecked_transaction()?;
+    let sent = if runs::is_active(&transaction, &mark.routine_id)? {
+        runs::record_ended(&transaction, mark, "skipped", Some(runs::REASON_OVERLAP))?;
+        None
+    } else {
+        Some(send_in(
+            &transaction,
+            agent_id,
+            text,
+            now,
+            Some(mark),
+            hold,
+        )?)
+    };
+    transaction.commit()?;
+    Ok(sent)
+}
+
+fn send_in(
+    transaction: &Connection,
+    agent_id: &str,
+    text: &str,
+    now: i64,
+    mark: Option<&Mark>,
+    hold: bool,
+) -> Result<Sent, BeginError> {
+    let routine = mark.map(|mark| (mark.routine_id.as_str(), mark.routine_name.as_str()));
     let backlog: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM queued_messages WHERE agent_id = ?1)",
         [agent_id],
         |row| row.get(0),
     )?;
-    let sent = if backlog {
-        let queued = enqueue(&transaction, agent_id, text, now)?;
-        let started = advance_in(&transaction, agent_id, now)?;
-        Sent::Queued { queued, started }
-    } else {
-        match begin_in(&transaction, agent_id, text, now) {
-            Ok(begun) => Sent::Started(begun),
-            Err(BeginError::Busy) => Sent::Queued {
-                queued: enqueue(&transaction, agent_id, text, now)?,
-                started: None,
-            },
-            Err(error) => return Err(error),
+    let queue = |started: bool| -> Result<Sent, BeginError> {
+        let queued = enqueue(transaction, agent_id, text, now, routine)?;
+        if let Some(mark) = mark {
+            runs::record_queued(transaction, mark, &queued.id)?;
         }
+        let started = if started {
+            advance_in(transaction, agent_id, now)?
+        } else {
+            None
+        };
+        Ok(Sent::Queued { queued, started })
     };
-    transaction.commit()?;
-    Ok(sent)
+    if hold {
+        return queue(false);
+    }
+    if backlog {
+        return queue(mark.is_none());
+    }
+    match begin_in(transaction, agent_id, text, now, routine) {
+        Ok(begun) => {
+            if let Some(mark) = mark {
+                runs::record_running(transaction, mark, &begun.turn_id)?;
+            }
+            Ok(Sent::Started(begun))
+        }
+        Err(BeginError::Busy) => queue(false),
+        Err(error) => Err(error),
+    }
 }
 
 fn begin_in(
@@ -172,6 +226,7 @@ fn begin_in(
     agent_id: &str,
     text: &str,
     now: i64,
+    routine: Option<(&str, &str)>,
 ) -> Result<Begun, BeginError> {
     let agent = agent(transaction, agent_id)?.ok_or(BeginError::NotFound)?;
     let running: bool = transaction.query_row(
@@ -195,8 +250,15 @@ fn begin_in(
         }
     };
     transaction.execute(
-        "INSERT INTO turns (id, agent_id, status, started_at) VALUES (?1, ?2, 'running', ?3)",
-        params![turn_id, agent_id, now],
+        "INSERT INTO turns (id, agent_id, status, started_at, routine_id, routine_name)
+         VALUES (?1, ?2, 'running', ?3, ?4, ?5)",
+        params![
+            turn_id,
+            agent_id,
+            now,
+            routine.map(|(id, _)| id),
+            routine.map(|(_, name)| name)
+        ],
     )?;
     transaction.execute(
         "INSERT INTO messages (id, agent_id, turn_id, role, content, created_at)
@@ -225,6 +287,7 @@ fn enqueue(
     agent_id: &str,
     text: &str,
     now: i64,
+    routine: Option<(&str, &str)>,
 ) -> rusqlite::Result<QueuedMessage> {
     let id = uuid::Uuid::now_v7().to_string();
     let position: i64 = connection.query_row(
@@ -233,9 +296,17 @@ fn enqueue(
         |row| row.get(0),
     )?;
     connection.execute(
-        "INSERT INTO queued_messages (id, agent_id, content, position, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![id, agent_id, text, position, now],
+        "INSERT INTO queued_messages (id, agent_id, content, position, created_at, routine_id, routine_name)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            id,
+            agent_id,
+            text,
+            position,
+            now,
+            routine.map(|(id, _)| id),
+            routine.map(|(_, name)| name)
+        ],
     )?;
     Ok(QueuedMessage {
         id,
@@ -286,14 +357,22 @@ pub fn edit_queued(
         .optional()
 }
 
-pub fn remove_queued(connection: &Connection, queued_id: &str) -> rusqlite::Result<Option<String>> {
-    connection
+pub fn remove_queued(
+    connection: &Connection,
+    queued_id: &str,
+    now: i64,
+) -> rusqlite::Result<Option<String>> {
+    let transaction = connection.unchecked_transaction()?;
+    let removed = transaction
         .query_row(
             "DELETE FROM queued_messages WHERE id = ?1 RETURNING agent_id",
             [queued_id],
             |row| row.get(0),
         )
-        .optional()
+        .optional()?;
+    runs::removed_from_queue(&transaction, queued_id, now)?;
+    transaction.commit()?;
+    Ok(removed)
 }
 
 fn advance_in(
@@ -309,19 +388,21 @@ fn advance_in(
     if running {
         return Ok(None);
     }
-    let next: Option<(String, String)> = transaction
+    let next: Option<(String, String, Option<String>, Option<String>)> = transaction
         .query_row(
-            "SELECT id, content FROM queued_messages WHERE agent_id = ?1
-             ORDER BY position LIMIT 1",
+            "SELECT id, content, routine_id, routine_name FROM queued_messages
+             WHERE agent_id = ?1 ORDER BY position LIMIT 1",
             [agent_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
-    let Some((queued_id, text)) = next else {
+    let Some((queued_id, text, routine_id, routine_name)) = next else {
         return Ok(None);
     };
-    transaction.execute("DELETE FROM queued_messages WHERE id = ?1", [queued_id])?;
-    let begun = begin_in(transaction, agent_id, &text, now)?;
+    transaction.execute("DELETE FROM queued_messages WHERE id = ?1", [&queued_id])?;
+    let routine = routine_id.as_deref().zip(routine_name.as_deref());
+    let begun = begin_in(transaction, agent_id, &text, now, routine)?;
+    runs::link_turn(transaction, &queued_id, &begun.turn_id)?;
     Ok(Some(Advanced { begun, text }))
 }
 
@@ -476,6 +557,7 @@ pub fn finish_turn_rows(
         "UPDATE turns SET status = ?2, error = ?3, ended_at = ?4 WHERE id = ?1",
         params![turn_id, status, error, now],
     )?;
+    runs::finish_turn(connection, turn_id, status, now)?;
     connection.execute(
         "UPDATE agents SET last_activity_at = ?2 WHERE id = ?1",
         params![agent_id, now],
@@ -496,6 +578,7 @@ pub fn sweep_interrupted(connection: &Connection, now: i64) -> rusqlite::Result<
         [],
     )?;
     crate::approvals::store::sweep_pending(&transaction, now)?;
+    runs::interrupt_running(&transaction, now)?;
     let count = transaction.execute(
         "UPDATE turns SET status = 'interrupted', ended_at = ?1 WHERE status = 'running'",
         [now],
@@ -514,6 +597,7 @@ struct TurnRow {
     ended_at: Option<i64>,
     kind: String,
     from_agent_id: Option<String>,
+    routine_name: Option<String>,
 }
 
 fn load_items(connection: &Connection, turn_id: &str) -> rusqlite::Result<(String, Vec<ItemView>)> {
@@ -615,7 +699,7 @@ fn page(
     before_turn_id: Option<&str>,
 ) -> rusqlite::Result<ConversationPage> {
     let mut statement = connection.prepare(&format!(
-        "SELECT id, agent_id, status, error, started_at, ended_at, kind, from_agent_id FROM turns
+        "SELECT id, agent_id, status, error, started_at, ended_at, kind, from_agent_id, routine_name FROM turns
          WHERE {filter}
            AND (?2 IS NULL OR rowid < (SELECT rowid FROM turns WHERE id = ?2))
          ORDER BY rowid DESC LIMIT ?3"
@@ -633,6 +717,7 @@ fn page(
                     ended_at: row.get(5)?,
                     kind: row.get(6)?,
                     from_agent_id: row.get(7)?,
+                    routine_name: row.get(8)?,
                 })
             },
         )?
@@ -654,6 +739,7 @@ fn page(
                 ended_at: row.ended_at,
                 kind: row.kind,
                 from_agent_id: row.from_agent_id,
+                routine_name: row.routine_name,
                 hand_offs,
                 user_message,
                 items,

@@ -1,4 +1,7 @@
+pub(crate) mod clock;
+pub(crate) mod runs;
 pub(crate) mod schedule;
+pub(crate) mod scheduler;
 mod store;
 pub(crate) mod validate;
 
@@ -9,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
 use crate::db::Database;
+use crate::turns::{self, TurnRegistry};
+use runs::{Mark, RunKind, RunView};
 use schedule::Schedule;
 use store::Stored;
 
@@ -125,7 +130,7 @@ pub struct Routine {
     pub next_run_text: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
-    pub last_run: Option<serde_json::Value>,
+    pub last_run: Option<RunView>,
 }
 
 pub fn zone() -> TimeZone {
@@ -143,6 +148,17 @@ pub fn zone() -> TimeZone {
 pub fn zone_name(zone: &TimeZone) -> String {
     zone.iana_name()
         .map_or_else(|| "your Mac's time zone".to_string(), str::to_string)
+}
+
+fn with_last(
+    connection: &Connection,
+    mut routine: Routine,
+    zone: &TimeZone,
+    now: Timestamp,
+) -> Result<Routine, RoutineError> {
+    routine.last_run =
+        runs::last(connection, &routine.id, zone, now).map_err(RoutineError::database)?;
+    Ok(routine)
 }
 
 fn timestamp_of(ms: i64) -> Timestamp {
@@ -205,12 +221,28 @@ fn check_not_past(
     }
 }
 
-pub fn list(db: &Database, zone: &TimeZone, agent_id: &str) -> Result<Vec<Routine>, RoutineError> {
+pub fn list(
+    db: &Database,
+    zone: &TimeZone,
+    now: Timestamp,
+    agent_id: &str,
+) -> Result<Vec<Routine>, RoutineError> {
     db.with_connection(|connection| {
-        Ok(store::list_for_agent(connection, agent_id)?
+        store::list_for_agent(connection, agent_id)?
             .into_iter()
-            .map(|stored| view(stored, zone))
-            .collect())
+            .map(|stored| with_last(connection, view(stored, zone), zone, now))
+            .collect()
+    })
+}
+
+pub fn history(
+    db: &Database,
+    zone: &TimeZone,
+    now: Timestamp,
+    routine_id: &str,
+) -> Result<Vec<RunView>, RoutineError> {
+    db.with_connection(|connection| {
+        runs::list(connection, routine_id, zone, now).map_err(RoutineError::database)
     })
 }
 
@@ -282,7 +314,7 @@ pub fn update(
             ..existing
         };
         store::update(connection, &stored, &validate::to_dto(&stored.schedule))?;
-        Ok(view(stored, zone))
+        with_last(connection, view(stored, zone), zone, now)
     })
 }
 
@@ -308,7 +340,7 @@ pub fn set_active(
             stored.next_run_at,
             stored.updated_at,
         )?;
-        Ok(view(stored, zone))
+        with_last(connection, view(stored, zone), zone, now)
     })
 }
 
@@ -326,6 +358,12 @@ pub fn refresh_next_runs(
 ) -> Result<(), RoutineError> {
     db.with_connection(|connection: &Connection| {
         for routine in store::list_all(connection)? {
+            if routine
+                .next_run_at
+                .is_some_and(|at| at <= now.as_millisecond())
+            {
+                continue;
+            }
             let next = next_run(&routine.schedule, routine.active, routine.done, now, zone);
             if next != routine.next_run_at {
                 store::set_next_run(connection, &routine.id, next)?;
@@ -343,7 +381,7 @@ fn unavailable() -> RoutineError {
 pub async fn list_routines(app: AppHandle, agent_id: String) -> Result<Vec<Routine>, RoutineError> {
     tauri::async_runtime::spawn_blocking(move || {
         let db = app.try_state::<Database>().ok_or_else(unavailable)?;
-        list(&db, &zone(), &agent_id)
+        list(&db, &zone(), clock::now(), &agent_id)
     })
     .await
     .map_err(RoutineError::database)?
@@ -355,12 +393,15 @@ pub async fn create_routine(
     agent_id: String,
     input: RoutineInput,
 ) -> Result<Routine, RoutineError> {
-    tauri::async_runtime::spawn_blocking(move || {
+    let wake_app = app.clone();
+    let routine = tauri::async_runtime::spawn_blocking(move || {
         let db = app.try_state::<Database>().ok_or_else(unavailable)?;
-        create(&db, &zone(), Timestamp::now(), &agent_id, input)
+        create(&db, &zone(), clock::now(), &agent_id, input)
     })
     .await
-    .map_err(RoutineError::database)?
+    .map_err(RoutineError::database)??;
+    scheduler::wake(&wake_app);
+    Ok(routine)
 }
 
 #[tauri::command]
@@ -369,12 +410,15 @@ pub async fn update_routine(
     routine_id: String,
     input: RoutineInput,
 ) -> Result<Routine, RoutineError> {
-    tauri::async_runtime::spawn_blocking(move || {
+    let wake_app = app.clone();
+    let routine = tauri::async_runtime::spawn_blocking(move || {
         let db = app.try_state::<Database>().ok_or_else(unavailable)?;
-        update(&db, &zone(), Timestamp::now(), &routine_id, input)
+        update(&db, &zone(), clock::now(), &routine_id, input)
     })
     .await
-    .map_err(RoutineError::database)?
+    .map_err(RoutineError::database)??;
+    scheduler::wake(&wake_app);
+    Ok(routine)
 }
 
 #[tauri::command]
@@ -383,19 +427,85 @@ pub async fn set_routine_active(
     routine_id: String,
     active: bool,
 ) -> Result<Routine, RoutineError> {
+    let wake_app = app.clone();
+    let routine = tauri::async_runtime::spawn_blocking(move || {
+        let db = app.try_state::<Database>().ok_or_else(unavailable)?;
+        set_active(&db, &zone(), clock::now(), &routine_id, active)
+    })
+    .await
+    .map_err(RoutineError::database)??;
+    scheduler::wake(&wake_app);
+    Ok(routine)
+}
+
+#[tauri::command]
+pub async fn delete_routine(app: AppHandle, routine_id: String) -> Result<(), RoutineError> {
+    let delete_app = app.clone();
+    let agent_id = tauri::async_runtime::spawn_blocking(move || {
+        let db = delete_app.try_state::<Database>().ok_or_else(unavailable)?;
+        let agent_id = db.with_connection(|connection| {
+            store::get(connection, &routine_id).map(|found| found.map(|routine| routine.agent_id))
+        })?;
+        delete(&db, &routine_id)?;
+        Ok::<_, RoutineError>(agent_id)
+    })
+    .await
+    .map_err(RoutineError::database)??;
+    if let Some(agent_id) = agent_id {
+        turns::emit_queue_changed(&app, &agent_id);
+    }
+    scheduler::wake(&app);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn list_routine_runs(
+    app: AppHandle,
+    routine_id: String,
+) -> Result<Vec<RunView>, RoutineError> {
     tauri::async_runtime::spawn_blocking(move || {
         let db = app.try_state::<Database>().ok_or_else(unavailable)?;
-        set_active(&db, &zone(), Timestamp::now(), &routine_id, active)
+        history(&db, &zone(), clock::now(), &routine_id)
     })
     .await
     .map_err(RoutineError::database)?
 }
 
 #[tauri::command]
-pub async fn delete_routine(app: AppHandle, routine_id: String) -> Result<(), RoutineError> {
+pub async fn run_routine_now(
+    app: AppHandle,
+    routine_id: String,
+) -> Result<Option<RunView>, RoutineError> {
+    let load_app = app.clone();
+    let lookup = routine_id.clone();
+    let stored = tauri::async_runtime::spawn_blocking(move || {
+        let db = load_app.try_state::<Database>().ok_or_else(unavailable)?;
+        let registry = load_app
+            .try_state::<TurnRegistry>()
+            .ok_or_else(unavailable)?;
+        if registry.is_closing() {
+            return Err(RoutineError::new("shutting-down", "Shikigami is closing."));
+        }
+        db.with_connection(|connection| store::get(connection, &lookup))?
+            .ok_or_else(RoutineError::not_found)
+    })
+    .await
+    .map_err(RoutineError::database)??;
+    let now = clock::now();
+    let mark = Mark::new(
+        &stored.id,
+        &stored.name,
+        RunKind::Manual,
+        None,
+        now.as_millisecond(),
+    );
+    let run_id = mark.run_id.clone();
+    turns::start_routine(app.clone(), stored.agent_id, stored.task, mark).await;
+    scheduler::wake(&app);
     tauri::async_runtime::spawn_blocking(move || {
         let db = app.try_state::<Database>().ok_or_else(unavailable)?;
-        delete(&db, &routine_id)
+        db.with_connection(|connection| runs::get(connection, &run_id, &zone(), now))
+            .map_err(RoutineError::database)
     })
     .await
     .map_err(RoutineError::database)?

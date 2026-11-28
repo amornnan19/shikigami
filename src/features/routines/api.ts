@@ -6,6 +6,31 @@ export type Schedule =
   | { kind: "hourly"; time: string; everyHours: number; days: number }
   | { kind: "weekly"; weekday: number; time: string };
 
+export type RunKind = "scheduled" | "manual" | "late";
+
+export type RunOutcome =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "stopped"
+  | "interrupted"
+  | "skipped"
+  | "missed";
+
+export interface RoutineRun {
+  id: string;
+  routineId: string;
+  scheduledFor: number | null;
+  turnId: string | null;
+  kind: RunKind;
+  outcome: RunOutcome;
+  reason: string | null;
+  createdAt: number;
+  endedAt: number | null;
+  timeText: string;
+}
+
 export interface Routine {
   id: string;
   agentId: string;
@@ -19,7 +44,7 @@ export interface Routine {
   nextRunText: string | null;
   createdAt: number;
   updatedAt: number;
-  lastRun: null;
+  lastRun: RoutineRun | null;
 }
 
 export interface RoutineInput {
@@ -29,6 +54,7 @@ export interface RoutineInput {
 }
 
 export const routinesKey = (agentId: string) => ["routines", agentId];
+export const runsKey = (routineId: string) => ["routine-runs", routineId];
 export const TIME_ZONE_KEY = ["routine-time-zone"];
 
 export function listRoutines(agentId: string) {
@@ -53,4 +79,12 @@ export function deleteRoutine(routineId: string) {
 
 export function getRoutineTimeZone() {
   return invoke<string>("routine_time_zone");
+}
+
+export function listRoutineRuns(routineId: string) {
+  return invoke<RoutineRun[]>("list_routine_runs", { routineId });
+}
+
+export function runRoutineNow(routineId: string) {
+  return invoke<RoutineRun | null>("run_routine_now", { routineId });
 }

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { Routine, Schedule } from "./api";
-import { formOf, inputOf, scheduleOf, statusOf } from "./form";
+import type { Routine, RoutineRun, Schedule } from "./api";
+import { formOf, inputOf, lastRunOf, outcomeOf, scheduleOf, statusOf } from "./form";
 
 function routine(patch: Partial<Routine>, schedule: Schedule): Routine {
   return {
@@ -51,5 +51,60 @@ describe("routine form", () => {
     expect(statusOf(routine({ active: false, nextRunText: null }, schedule))).toBe("Paused");
     expect(statusOf(routine({ done: true, active: false }, schedule))).toBe("Done");
     expect(statusOf(routine({ nextRunText: null }, schedule))).toBe("No upcoming run");
+  });
+
+  it("describes how a run went, with the reason for a skip", () => {
+    const run = (patch: Partial<RoutineRun>): RoutineRun => ({
+      id: "u",
+      routineId: "r",
+      scheduledFor: 1,
+      turnId: null,
+      kind: "scheduled",
+      outcome: "completed",
+      reason: null,
+      createdAt: 1,
+      endedAt: 2,
+      timeText: "08:00",
+      ...patch,
+    });
+    expect(outcomeOf(run({}))).toBe("Completed");
+    expect(outcomeOf(run({ outcome: "interrupted" }))).toBe("Interrupted");
+    expect(outcomeOf(run({ outcome: "queued" }))).toBe("Waiting in the queue");
+    expect(outcomeOf(run({ outcome: "skipped", reason: "the last run had not finished" }))).toBe(
+      "Skipped: the last run had not finished.",
+    );
+    expect(outcomeOf(run({ outcome: "missed" }))).toBe("Missed");
+    expect(outcomeOf(run({ kind: "late" }))).toBe("Ran late");
+    expect(outcomeOf(run({ kind: "late", outcome: "failed" }))).toBe("Ran late, failed");
+  });
+
+  it("shows the last run with its time, except for skips and misses", () => {
+    const schedule: Schedule = { kind: "daily", time: "08:00", days: 127 };
+    const last = (patch: Partial<RoutineRun>) =>
+      routine(
+        {
+          lastRun: {
+            id: "u",
+            routineId: "r",
+            scheduledFor: 1,
+            turnId: null,
+            kind: "scheduled",
+            outcome: "completed",
+            reason: null,
+            createdAt: 1,
+            endedAt: 2,
+            timeText: "08:00",
+            ...patch,
+          },
+        },
+        schedule,
+      );
+    expect(lastRunOf(routine({}, schedule))).toBeNull();
+    expect(lastRunOf(last({}))).toBe("Last run: Completed 08:00");
+    expect(lastRunOf(last({ kind: "late", timeText: "09:14" }))).toBe("Last run: Ran late 09:14");
+    expect(lastRunOf(last({ outcome: "missed" }))).toBe("Last run: Missed");
+    expect(lastRunOf(last({ outcome: "skipped", reason: "the Mac was asleep" }))).toBe(
+      "Last run: Skipped: the Mac was asleep.",
+    );
   });
 });

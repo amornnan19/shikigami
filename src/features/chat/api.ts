@@ -60,6 +60,7 @@ export interface Turn {
   kind: TurnKind;
   fromAgentId: string | null;
   handOffs: HandOff[];
+  routineName: string | null;
   userMessage: string;
   items: Item[];
 }

@@ -1,4 +1,4 @@
-import type { Routine, RoutineInput, Schedule } from "./api";
+import type { Routine, RoutineInput, RoutineRun, Schedule } from "./api";
 
 export type Kind = Schedule["kind"];
 
@@ -85,6 +85,34 @@ export function statusOf(routine: Routine) {
   if (routine.done) return "Done";
   if (!routine.active) return "Paused";
   return routine.nextRunText ? `Next: ${routine.nextRunText}` : "No upcoming run";
+}
+
+const OUTCOME_TEXT = {
+  queued: "Waiting in the queue",
+  running: "Running",
+  completed: "Completed",
+  failed: "Failed",
+  stopped: "Stopped",
+  interrupted: "Interrupted",
+  missed: "Missed",
+};
+
+export const KIND_TEXT = { scheduled: "Scheduled", manual: "Run now", late: "Ran late" };
+
+export function outcomeOf(run: RoutineRun) {
+  if (run.outcome === "skipped") return `Skipped: ${run.reason ?? "no reason recorded"}.`;
+  const text = OUTCOME_TEXT[run.outcome];
+  if (run.kind !== "late") return text;
+  return run.outcome === "completed" || run.outcome === "running" || run.outcome === "queued"
+    ? "Ran late"
+    : `Ran late, ${text.toLowerCase()}`;
+}
+
+export function lastRunOf(routine: Routine) {
+  const run = routine.lastRun;
+  if (!run) return null;
+  const withTime = run.outcome !== "skipped" && run.outcome !== "missed";
+  return `Last run: ${outcomeOf(run)}${withTime ? ` ${run.timeText}` : ""}`;
 }
 
 export const NAME_CODES = ["name-empty", "name-too-long", "name-invalid", "name-taken"];

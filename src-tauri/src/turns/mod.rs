@@ -1,6 +1,8 @@
 mod claude_code;
 mod group;
 mod redact;
+#[cfg(test)]
+mod routine_runs;
 mod runner;
 mod store;
 
@@ -23,6 +25,7 @@ use crate::approvals::{self, ApprovalView};
 use crate::auth;
 use crate::db::Database;
 use crate::providers::{self, CLAUDE_CODE_ID};
+use crate::routines::runs::{self, Mark};
 use crate::secrets::{SecretStore, SharedStore};
 use store::{BeginError, ConversationPage, QueuedMessage, Sent, StepView};
 
@@ -97,7 +100,7 @@ fn emit_group_queue_changed(app: &AppHandle, group_id: &str) {
     let _ = Emitter::emit(app, GROUP_QUEUE_EVENT_NAME, GroupQueueChanged { group_id });
 }
 
-fn emit_queue_changed(app: &AppHandle, agent_id: &str) {
+pub(crate) fn emit_queue_changed(app: &AppHandle, agent_id: &str) {
     let _ = Emitter::emit(app, QUEUE_EVENT_NAME, QueueChanged { agent_id });
 }
 
@@ -663,23 +666,15 @@ enum Prepared {
     },
 }
 
-fn prepare(
-    db: &Database,
+fn prepared_from(
     registry: &TurnRegistry,
     dirs: &[PathBuf],
     agent_id: &str,
+    executable: PathBuf,
+    sent: Sent,
     text: &str,
+    started_at: i64,
 ) -> Result<Prepared, TurnError> {
-    if registry.is_closing() {
-        return Err(TurnError::shutting_down());
-    }
-    validate(text)?;
-    let executable = executable_of(db, dirs, agent_id)?;
-    let started_at = now_millis();
-    let sent = db
-        .with_connection(|connection| store::begin_or_queue(connection, agent_id, text, started_at))
-        .map_err(begin_error)?;
-    registry.release(agent_id);
     match sent {
         Sent::Started(begun) => launch_of(
             registry,
@@ -710,6 +705,63 @@ fn prepare(
             Ok(Prepared::Queued { queued, launch })
         }
     }
+}
+
+fn prepare(
+    db: &Database,
+    registry: &TurnRegistry,
+    dirs: &[PathBuf],
+    agent_id: &str,
+    text: &str,
+) -> Result<Prepared, TurnError> {
+    if registry.is_closing() {
+        return Err(TurnError::shutting_down());
+    }
+    validate(text)?;
+    let executable = executable_of(db, dirs, agent_id)?;
+    let started_at = now_millis();
+    let sent = db
+        .with_connection(|connection| store::begin_or_queue(connection, agent_id, text, started_at))
+        .map_err(begin_error)?;
+    registry.release(agent_id);
+    prepared_from(registry, dirs, agent_id, executable, sent, text, started_at)
+}
+
+fn prepare_routine(
+    db: &Database,
+    registry: &TurnRegistry,
+    dirs: &[PathBuf],
+    agent_id: &str,
+    text: &str,
+    mark: &Mark,
+) -> Result<Option<Prepared>, TurnError> {
+    if registry.is_closing() {
+        return Err(TurnError::shutting_down());
+    }
+    let executable = match executable_of(db, dirs, agent_id) {
+        Ok(executable) => executable,
+        Err(error) => {
+            let _ = db.with_connection(|connection| {
+                runs::record_ended(connection, mark, "failed", Some(&error.message))
+            });
+            return Err(error);
+        }
+    };
+    let started_at = now_millis();
+    let hold = registry.is_held(agent_id);
+    let sent = db
+        .with_connection(|connection| {
+            if registry.is_closing() {
+                return Err(BeginError::Refused {
+                    code: "shutting-down",
+                    message: "Shikigami is closing.".to_owned(),
+                });
+            }
+            store::begin_or_queue_routine(connection, agent_id, text, started_at, mark, hold)
+        })
+        .map_err(begin_error)?;
+    sent.map(|sent| prepared_from(registry, dirs, agent_id, executable, sent, text, started_at))
+        .transpose()
 }
 
 fn key_for_agent(db: &Database, store: &dyn SecretStore, agent_id: &str) -> runner::ApiKey {
@@ -1174,6 +1226,38 @@ pub async fn send_message(
     }
 }
 
+pub async fn start_routine(app: AppHandle, agent_id: String, text: String, mark: Mark) {
+    let prepare_app = app.clone();
+    let queue_agent = agent_id.clone();
+    let prepared = tauri::async_runtime::spawn_blocking(move || {
+        let db = prepare_app.try_state::<Database>()?;
+        let registry = prepare_app.try_state::<TurnRegistry>()?;
+        prepare_routine(
+            &db,
+            &registry,
+            &providers::search_dirs(),
+            &agent_id,
+            &text,
+            &mark,
+        )
+        .ok()
+        .flatten()
+    })
+    .await;
+    match prepared {
+        Ok(Some(Prepared::Started(launch))) => {
+            tauri::async_runtime::spawn(drive(app, launch, Chain::default()));
+        }
+        Ok(Some(Prepared::Queued { launch, .. })) => {
+            emit_queue_changed(&app, &queue_agent);
+            if let Some(launch) = launch {
+                tauri::async_runtime::spawn(drive(app, launch, Chain::default()));
+            }
+        }
+        _ => {}
+    }
+}
+
 #[tauri::command]
 pub async fn resume_queue(app: AppHandle, agent_id: String) -> Result<(), TurnError> {
     let resume_app = app.clone();
@@ -1259,7 +1343,7 @@ pub async fn remove_queued(app: AppHandle, queued_id: String) -> Result<(), Turn
         let db = remove_app
             .try_state::<Database>()
             .ok_or_else(TurnError::unavailable)?;
-        db.with_connection(|connection| store::remove_queued(connection, &queued_id))
+        db.with_connection(|connection| store::remove_queued(connection, &queued_id, now_millis()))
             .map_err(TurnError::database)
     })
     .await
@@ -1616,7 +1700,7 @@ mod tests {
         assert_eq!(edited.position, 0);
         let removed = fx
             .db
-            .with_connection(|c| store::remove_queued(c, &three.id))
+            .with_connection(|c| store::remove_queued(c, &three.id, 9))
             .unwrap();
         assert_eq!(removed.as_deref(), Some("a"));
         assert_eq!(fx.queued(), [("two, edited".into(), 0)]);
@@ -1631,7 +1715,7 @@ mod tests {
         );
         let removed_twice = fx
             .db
-            .with_connection(|c| store::remove_queued(c, &three.id))
+            .with_connection(|c| store::remove_queued(c, &three.id, 9))
             .unwrap();
         assert!(removed_twice.is_none());
     }
@@ -2134,7 +2218,7 @@ mod tests {
         });
         let queued_id = fx.queued_id();
         fx.db
-            .with_connection(|c| store::remove_queued(c, &queued_id))
+            .with_connection(|c| store::remove_queued(c, &queued_id, 9))
             .unwrap();
         assert!(resume(&fx.db, &fx.registry, &fx.dirs(), "a")
             .unwrap()
