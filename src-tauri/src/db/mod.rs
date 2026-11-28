@@ -108,7 +108,7 @@ mod tests {
                  VALUES ('t', 'a', 'running', NULL, 1, NULL);
                  INSERT INTO messages (id, agent_id, turn_id, role, content, created_at)
                  VALUES ('m', 'a', 't', 'user', 'hi', 1);
-                 INSERT INTO steps VALUES ('s', 't', 0, 'tool', 'x', NULL, 'running', 1);
+                 INSERT INTO steps (id, turn_id, position, kind, title, detail, status, created_at) VALUES ('s', 't', 0, 'tool', 'x', NULL, 'running', 1);
                  INSERT INTO queued_messages VALUES ('q', 'a', 'later', 0, 1);
                  INSERT INTO groups VALUES ('g', 'Team', '/g', 'a', 1, 1);
                  INSERT INTO group_members VALUES ('g', 'a', 0, 1);",
@@ -121,7 +121,7 @@ mod tests {
     fn fresh_database_migrates_to_the_latest_version_with_all_tables() {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(dir.path()).unwrap();
-        assert_eq!(schema_version(&db), 8);
+        assert_eq!(schema_version(&db), 9);
         for table in [
             "agents",
             "turns",
@@ -159,7 +159,7 @@ mod tests {
             .unwrap();
         drop(connection);
         let db = Database::open(dir.path()).unwrap();
-        assert_eq!(schema_version(&db), 8);
+        assert_eq!(schema_version(&db), 9);
         assert_eq!(count(&db, "agents"), 1);
         assert_eq!(count(&db, "turns"), 1);
         assert_eq!(count(&db, "settings"), 0);
@@ -170,8 +170,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         drop(Database::open(dir.path()).unwrap());
         let db = Database::open(dir.path()).unwrap();
-        assert_eq!(schema_version(&db), 8);
-        assert_eq!(count(&db, "refinery_schema_history"), 8);
+        assert_eq!(schema_version(&db), 9);
+        assert_eq!(count(&db, "refinery_schema_history"), 9);
     }
 
     #[test]
@@ -284,7 +284,12 @@ mod tests {
             )
             .unwrap(),
             refinery::Migration::unapplied(
-                "V9__broken",
+                "V9__subagent_steps",
+                include_str!("../../migrations/V9__subagent_steps.sql"),
+            )
+            .unwrap(),
+            refinery::Migration::unapplied(
+                "V10__broken",
                 "CREATE TABLE probe (x INTEGER); INSERT INTO missing_table VALUES (1);",
             )
             .unwrap(),
@@ -298,7 +303,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
         let probe_tables: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE name = 'probe'",
@@ -383,7 +388,12 @@ mod tests {
             )
             .unwrap(),
             refinery::Migration::unapplied(
-                "V9__rebuild_agents",
+                "V9__subagent_steps",
+                include_str!("../../migrations/V9__subagent_steps.sql"),
+            )
+            .unwrap(),
+            refinery::Migration::unapplied(
+                "V10__rebuild_agents",
                 "CREATE TABLE agents_new (
                    id TEXT PRIMARY KEY,
                    name TEXT NOT NULL COLLATE NOCASE UNIQUE,
@@ -406,7 +416,7 @@ mod tests {
         let db = Database {
             connection: Mutex::new(connection),
         };
-        assert_eq!(schema_version(&db), 9);
+        assert_eq!(schema_version(&db), 10);
         for table in [
             "agents",
             "turns",
@@ -473,7 +483,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             version_two_database(dir.path(), old);
             let db = Database::open(dir.path()).unwrap();
-            assert_eq!(schema_version(&db), 8);
+            assert_eq!(schema_version(&db), 9);
             assert_eq!(
                 setting(&db, "claude.auth-mode").as_deref(),
                 expected,
@@ -533,7 +543,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         version_three_database(dir.path());
         let db = Database::open(dir.path()).unwrap();
-        assert_eq!(schema_version(&db), 8);
+        assert_eq!(schema_version(&db), 9);
         for table in ["agents", "turns", "messages", "queued_messages", "settings"] {
             assert_eq!(count(&db, table), 1, "{table}");
         }
@@ -595,7 +605,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         version_four_database(dir.path());
         let db = Database::open(dir.path()).unwrap();
-        assert_eq!(schema_version(&db), 8);
+        assert_eq!(schema_version(&db), 9);
         for table in [
             "turns",
             "messages",
@@ -647,7 +657,7 @@ mod tests {
                  INSERT INTO messages (id, agent_id, turn_id, group_id, author_agent_id, role, content, created_at)
                  VALUES ('m1', 'a', 't', 'g', NULL, 'user', 'hi', 1),
                         ('m2', 'a', 't', 'g', 'a', 'assistant', 'hello', 2);
-                 INSERT INTO steps VALUES ('s', 't', 0, 'tool', 'x', NULL, 'done', 1);
+                 INSERT INTO steps (id, turn_id, position, kind, title, detail, status, created_at) VALUES ('s', 't', 0, 'tool', 'x', NULL, 'done', 1);
                  INSERT INTO group_queue (id, group_id, addressed_agent_id, content, position, created_at)
                  VALUES ('q', 'g', 'a', 'later', 0, 1);
                  INSERT INTO agent_group_sessions (agent_id, group_id, provider_session_id, last_seen_seq) VALUES ('a', 'g', 'session', 2), ('b', 'g', NULL, 0);",
@@ -735,7 +745,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         version_five_database(dir.path());
         let db = Database::open(dir.path()).unwrap();
-        assert_eq!(schema_version(&db), 8);
+        assert_eq!(schema_version(&db), 9);
         for (table, rows) in [
             ("agents", 2),
             ("turns", 3),
@@ -946,5 +956,85 @@ mod tests {
         assert!(insert("api-key").is_ok());
         assert!(insert("subscription").is_ok());
         assert!(insert("oauth").is_err());
+    }
+
+    #[test]
+    fn the_subagent_steps_migration_keeps_every_step_of_a_version_eight_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut connection = Connection::open(dir.path().join(DATABASE_FILE)).unwrap();
+        configure(&connection).unwrap();
+        let sources = [
+            (
+                "V1__initial",
+                include_str!("../../migrations/V1__initial.sql"),
+            ),
+            (
+                "V2__settings",
+                include_str!("../../migrations/V2__settings.sql"),
+            ),
+            (
+                "V3__auth_mode",
+                include_str!("../../migrations/V3__auth_mode.sql"),
+            ),
+            (
+                "V4__groups",
+                include_str!("../../migrations/V4__groups.sql"),
+            ),
+            (
+                "V5__group_turns",
+                include_str!("../../migrations/V5__group_turns.sql"),
+            ),
+            (
+                "V6__group_history",
+                include_str!("../../migrations/V6__group_history.sql"),
+            ),
+            (
+                "V7__group_context",
+                include_str!("../../migrations/V7__group_context.sql"),
+            ),
+            (
+                "V8__group_hand_offs",
+                include_str!("../../migrations/V8__group_hand_offs.sql"),
+            ),
+        ];
+        let v8: Vec<_> = sources
+            .into_iter()
+            .map(|(name, sql)| refinery::Migration::unapplied(name, sql).unwrap())
+            .collect();
+        migrate(&mut connection, Runner::new(&v8)).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO agents (id, name, color, provider, model, workspace_path, created_at, last_activity_at)
+                 VALUES ('a', 'Ada', 'red', 'claude-code', 'm', '/a', 1, 1);
+                 INSERT INTO turns (id, agent_id, status, error, started_at, ended_at)
+                 VALUES ('t', 'a', 'completed', NULL, 1, 2);
+                 INSERT INTO steps (id, turn_id, position, kind, title, detail, status, created_at)
+                 VALUES ('s1', 't', 0, 'Bash', 'ls', 'out', 'done', 1),
+                        ('s2', 't', 1, 'Read', '/a', NULL, 'failed', 2);",
+            )
+            .unwrap();
+        drop(connection);
+        let db = Database::open(dir.path()).unwrap();
+        assert_eq!(schema_version(&db), 9);
+        assert_eq!(count(&db, "steps"), 2);
+        let orphans: i64 = db.with_connection(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM steps WHERE parent_step_id IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        });
+        assert_eq!(orphans, 0);
+        db.with_connection(|c| {
+            c.execute_batch(
+                "INSERT INTO steps (id, turn_id, position, kind, title, status, created_at, parent_step_id)
+                 VALUES ('s3', 't', 2, 'Bash', 'pwd', 'done', 3, 's1');",
+            )
+            .unwrap()
+        });
+        assert_eq!(count(&db, "steps"), 3);
+        db.with_connection(|c| c.execute("DELETE FROM steps WHERE id = 's1'", []).unwrap());
+        assert_eq!(count(&db, "steps"), 1);
     }
 }

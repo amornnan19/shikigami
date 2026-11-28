@@ -37,6 +37,11 @@ export function scriptFakeReply(call: number, text: string) {
   writeFileSync(join(fakeProviderDir, `reply.${call}.jsonl`), script);
 }
 
+export function scriptFakeStream(call: number, lines: (object | string)[]) {
+  const body = lines.map((line) => (typeof line === "string" ? line : JSON.stringify(line)));
+  writeFileSync(join(fakeProviderDir, `reply.${call}.jsonl`), `${body.join("\n")}\n`);
+}
+
 export function setFakeClaudeVersion(version: string) {
   writeFileSync(fakeClaudeVersionFile, `${version}\n`);
 }
@@ -89,8 +94,10 @@ case "$1" in
     call=$(wc -l < "$dir/invocations.log" | tr -d ' ')
     if [ -f "$dir/reply.$call.jsonl" ]; then
       while IFS= read -r line; do
-        printf '%s\\n' "$line"
-        sleep 0.03
+        case "$line" in
+          "#sleep "*) sleep "\${line#"#sleep "}" ;;
+          *) printf '%s\\n' "$line"; sleep 0.03 ;;
+        esac
       done < "$dir/reply.$call.jsonl"
       exit 0
     fi

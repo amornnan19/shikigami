@@ -36,6 +36,7 @@ impl From<rusqlite::Error> for BeginError {
 #[serde(rename_all = "camelCase")]
 pub struct StepView {
     pub id: String,
+    pub parent_step_id: Option<String>,
     pub kind: String,
     pub title: String,
     pub detail: Option<String>,
@@ -412,8 +413,8 @@ pub fn insert_step(
     created_at: i64,
 ) -> rusqlite::Result<()> {
     connection.execute(
-        "INSERT INTO steps (id, turn_id, position, kind, title, detail, status, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO steps (id, turn_id, position, kind, title, detail, status, created_at, parent_step_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             step.id,
             turn_id,
@@ -422,7 +423,8 @@ pub fn insert_step(
             step.title,
             step.detail,
             step.status,
-            created_at
+            created_at,
+            step.parent_step_id
         ],
     )?;
     Ok(())
@@ -532,7 +534,7 @@ fn load_items(connection: &Connection, turn_id: &str) -> rusqlite::Result<(Strin
         }
     }
     let mut steps = connection.prepare(
-        "SELECT id, kind, title, detail, status, created_at FROM steps WHERE turn_id = ?1 ORDER BY position",
+        "SELECT id, kind, title, detail, status, created_at, parent_step_id FROM steps WHERE turn_id = ?1 ORDER BY position",
     )?;
     let rows = steps.query_map([turn_id], |row| {
         Ok((
@@ -542,6 +544,7 @@ fn load_items(connection: &Connection, turn_id: &str) -> rusqlite::Result<(Strin
                 title: row.get(2)?,
                 detail: row.get(3)?,
                 status: row.get(4)?,
+                parent_step_id: row.get(6)?,
             },
             row.get::<_, i64>(5)?,
         ))
@@ -760,6 +763,7 @@ mod tests {
         db.with_connection(|c| {
             let step = StepView {
                 id: "s".into(),
+                parent_step_id: None,
                 kind: "Bash".into(),
                 title: "ls".into(),
                 detail: None,
@@ -816,6 +820,7 @@ mod tests {
             insert_message(c, "t1", "a", &begun.turn_id, "assistant", "first", 11).unwrap();
             let step = StepView {
                 id: "s1".into(),
+                parent_step_id: None,
                 kind: "Bash".into(),
                 title: "ls".into(),
                 detail: Some("out".into()),

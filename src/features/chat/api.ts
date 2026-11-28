@@ -10,6 +10,7 @@ export type StepStatus = "running" | "done" | "stopped" | "failed";
 export interface Step {
   type: "step";
   id: string;
+  parentStepId: string | null;
   kind: string;
   title: string;
   detail: string | null;

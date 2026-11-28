@@ -8,6 +8,7 @@ import { ResumeBar } from "@/features/chat/ResumeBar";
 import { groupScope } from "@/features/chat/scope";
 import { Transcript } from "@/features/chat/Transcript";
 import { useConversation, useQueue } from "@/features/chat/useConversation";
+import { figuresPerAgent } from "@/features/shikigami/subagents";
 import type { Group } from "./api";
 import { GroupAvatars } from "./GroupAvatars";
 import { GroupSettingsDialog } from "./GroupSettingsDialog";
@@ -32,12 +33,18 @@ export function GroupView({
   const last = turns.at(-1);
   const runningTurnId = last?.status === "running" ? last.id : null;
   const running = runningTurnId !== null;
+  const figuresByAgent = useMemo(() => figuresPerAgent(turns), [turns]);
   const blockedReason = group.attention?.message ?? null;
   const waiting = queue.data?.length ?? 0;
   return (
     <section aria-label="Group" className="flex h-screen min-w-0 flex-1 flex-col">
       <header className="flex items-center gap-3 border-b border-border px-6 py-4">
-        <GroupAvatars members={group.members} limit={5} className="size-8 text-sm" />
+        <GroupAvatars
+          members={group.members}
+          limit={5}
+          className="size-8 text-sm"
+          figures={figuresByAgent}
+        />
         <div className="flex min-w-0 flex-col">
           <h2 className="truncate text-lg font-semibold">{group.name}</h2>
           <span

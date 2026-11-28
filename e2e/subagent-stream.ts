@@ -1,0 +1,52 @@
+import { fakeClaudeSessionId } from "./fake-providers";
+
+const toolUse = (messageId: string, id: string, name: string, input: object, parent?: string) => ({
+  type: "assistant",
+  ...(parent ? { parent_tool_use_id: parent } : {}),
+  message: { id: messageId, content: [{ type: "tool_use", id, name, input }] },
+});
+
+const toolResult = (id: string, content: string, isError: boolean, parent?: string) => ({
+  type: "user",
+  ...(parent ? { parent_tool_use_id: parent } : {}),
+  message: {
+    content: [{ type: "tool_result", tool_use_id: id, content, is_error: isError }],
+  },
+});
+
+export function subagentStream(holdSeconds: number): (object | string)[] {
+  return [
+    { type: "system", subtype: "init", session_id: fakeClaudeSessionId() },
+    toolUse("m1", "agent-a", "Agent", {
+      subagent_type: "Explore",
+      description: "Scan the notes",
+      prompt: "Read notes.txt and summarise it.",
+    }),
+    toolUse("m2", "agent-b", "Agent", {
+      subagent_type: "Plan",
+      description: "Draft the outline",
+      prompt: "Plan the outline.",
+    }),
+    toolUse("m3", "inner-a", "Read", { file_path: "notes.txt" }, "agent-a"),
+    toolUse("m4", "inner-b", "Bash", { command: "ls -la" }, "agent-b"),
+    toolResult("inner-a", "group notes", false, "agent-a"),
+    `#sleep ${holdSeconds}`,
+    toolResult("inner-b", "permission denied", true, "agent-b"),
+    toolResult("agent-a", "Notes scanned.", false),
+    "#sleep 1",
+    toolResult("agent-b", "Could not draft the outline.", true),
+    {
+      type: "assistant",
+      message: {
+        id: "m5",
+        content: [{ type: "text", text: "The scan is done, the outline failed." }],
+      },
+    },
+    {
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "The scan is done, the outline failed.",
+    },
+  ];
+}

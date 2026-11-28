@@ -38,7 +38,14 @@ describe("applyEvent", () => {
   });
 
   it("starts and ends a step, and stops open steps when the turn ends", () => {
-    const step = { id: "s", kind: "Bash", title: "ls", detail: "{}", status: "running" };
+    const step = {
+      id: "s",
+      parentStepId: null,
+      kind: "Bash",
+      title: "ls",
+      detail: "{}",
+      status: "running",
+    };
     const started = apply(base, { kind: "step-started", step });
     const ended = apply(started, { kind: "step-ended", stepId: "s", status: "done", detail: "x" });
     expect(ended.turns[0]?.items[0]).toMatchObject({ status: "done", detail: "x" });

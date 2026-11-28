@@ -9,7 +9,17 @@ import {
 } from "lucide-react";
 import { useState } from "react";
 import { AgentAvatar } from "@/features/agents/AgentAvatar";
+import { tintClass } from "@/features/agents/colors";
 import type { GroupMember } from "@/features/groups/api";
+import { FigureTray } from "@/features/shikigami/FigureTray";
+import { PaperFigure } from "@/features/shikigami/PaperFigure";
+import {
+  buildTree,
+  groupStatusLabel,
+  isSubagent,
+  type StepNode,
+  subagentLabel,
+} from "@/features/shikigami/subagents";
 import { cn } from "@/lib/utils";
 import type { Step, StepStatus, TextItem, Turn } from "./api";
 import { Markdown, MentionChip, withMentions } from "./Markdown";
@@ -33,7 +43,74 @@ function StepIcon({ status }: { status: StepStatus }) {
   );
 }
 
-function Steps({ steps }: { steps: Step[] }) {
+function StepDetail({ step }: { step: Step }) {
+  if (!step.detail) return null;
+  return (
+    <pre className="mt-1 max-h-60 overflow-auto rounded-md border border-border bg-muted p-2 font-mono text-xs whitespace-pre-wrap break-all">
+      {step.detail}
+    </pre>
+  );
+}
+
+function StepRows({ nodes, tint }: { nodes: StepNode[]; tint: string }) {
+  return (
+    <ul className="mt-1 flex flex-col gap-2">
+      {nodes.map((node) =>
+        isSubagent(node.step) ? (
+          <SubagentGroup key={node.step.id} node={node} tint={tint} />
+        ) : (
+          <li key={node.step.id} className="min-w-0">
+            <div className="flex items-start gap-2">
+              <StepIcon status={node.step.status} />
+              <span className="font-medium text-foreground">{node.step.kind}</span>
+              <span className="min-w-0 truncate">{node.step.title}</span>
+            </div>
+            <StepDetail step={node.step} />
+          </li>
+        ),
+      )}
+    </ul>
+  );
+}
+
+function SubagentGroup({ node, tint }: { node: StepNode; tint: string }) {
+  const { step } = node;
+  const [chosen, setChosen] = useState<boolean | null>(null);
+  const open = chosen ?? step.status === "running";
+  const Chevron = open ? ChevronDown : ChevronRight;
+  const label = subagentLabel(step);
+  return (
+    <li data-subagent={step.id} data-status={step.status} className="min-w-0">
+      <button
+        type="button"
+        aria-expanded={open}
+        onClick={() => setChosen(!open)}
+        className="flex w-full items-start gap-2 rounded-md px-1 py-0.5 text-left outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        <Chevron className="mt-0.5 size-3.5 shrink-0" />
+        <span aria-hidden="true" className="mt-px block h-5 w-4 shrink-0">
+          <PaperFigure tintClass={step.status === "failed" ? "text-red-600" : tint} />
+        </span>
+        <span className="font-medium text-foreground">{label.type}</span>
+        <span className="min-w-0 flex-1 truncate">{label.task}</span>
+        <span
+          data-subagent-status=""
+          className={cn("shrink-0 text-xs", step.status === "failed" && "text-red-600")}
+        >
+          {groupStatusLabel(step.status)}
+        </span>
+      </button>
+      {open && (
+        <div className="mt-1 ml-2 border-l border-border pl-3">
+          {node.children.length > 0 && <StepRows nodes={node.children} tint={tint} />}
+          <StepDetail step={step} />
+        </div>
+      )}
+    </li>
+  );
+}
+
+function Steps({ steps, tint }: { steps: Step[]; tint: string }) {
   const [open, setOpen] = useState(false);
   const Chevron = open ? ChevronDown : ChevronRight;
   return (
@@ -48,22 +125,9 @@ function Steps({ steps }: { steps: Step[] }) {
         {steps.length === 1 ? "1 step" : `${steps.length} steps`}
       </button>
       {open && (
-        <ul className="mt-1 flex flex-col gap-2 pl-5">
-          {steps.map((step) => (
-            <li key={step.id} className="min-w-0">
-              <div className="flex items-start gap-2">
-                <StepIcon status={step.status} />
-                <span className="font-medium text-foreground">{step.kind}</span>
-                <span className="min-w-0 truncate">{step.title}</span>
-              </div>
-              {step.detail && (
-                <pre className="mt-1 max-h-60 overflow-auto rounded-md border border-border bg-muted p-2 font-mono text-xs whitespace-pre-wrap break-all">
-                  {step.detail}
-                </pre>
-              )}
-            </li>
-          ))}
-        </ul>
+        <div className="pl-5">
+          <StepRows nodes={buildTree(steps)} tint={tint} />
+        </div>
       )}
     </div>
   );
@@ -109,7 +173,7 @@ export function TurnView({ turn, members }: { turn: Turn; members?: GroupMember[
     : null;
   const reply = (
     <>
-      {steps.length > 0 && <Steps steps={steps} />}
+      {steps.length > 0 && <Steps steps={steps} tint={tintClass(author?.color ?? "slate")} />}
       {texts.map((item) => (
         <Markdown key={item.id} text={item.text} members={members} />
       ))}
@@ -149,10 +213,15 @@ export function TurnView({ turn, members }: { turn: Turn; members?: GroupMember[
         </p>
       ))}
       {author ? (
-        <div className="flex gap-3">
-          <AgentAvatar name={author.name} color={author.color} className="size-8" />
+        <div data-figure-scope="" className="flex gap-3">
+          <span data-figure-anchor="" className="shrink-0">
+            <AgentAvatar name={author.name} color={author.color} className="size-8" />
+          </span>
           <div className="flex min-w-0 flex-1 flex-col gap-2">
-            <span className="text-sm font-medium">{author.name}</span>
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-medium">{author.name}</span>
+              <FigureTray steps={steps} color={author.color} />
+            </div>
             {reply}
           </div>
         </div>
