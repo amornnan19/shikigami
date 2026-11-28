@@ -23,6 +23,7 @@ export const fakeClaudeToolMarker = join(fakeProviderDir, "tool-ran");
 export const fakeClaudeApprovalMarker = join(fakeProviderDir, "approved-ran");
 export const fakeClaudeApprovals = join(fakeProviderDir, "approvals.log");
 export const fakeClaudeEnv = join(fakeProviderDir, "env.log");
+export const fakeClaudeKeyLog = join(fakeProviderDir, "key.log");
 export const fakeClaudeSignedOut = join(fakeProviderDir, "signed-out");
 export const fakeClaudeRecordSeparator = "\n----\n";
 const fixtureDir = join(root, "src-tauri", "tests", "fixtures");
@@ -63,6 +64,7 @@ export function prepareFakeProviders() {
     fakeClaudeSettings,
     fakeClaudeApprovals,
     fakeClaudeEnv,
+    fakeClaudeKeyLog,
   ]) {
     writeFileSync(log, "");
   }
@@ -117,6 +119,8 @@ case "$1" in
       if [ "$prev" = "--settings" ]; then
         cat "$arg" >> "$dir/settings.log"
         printf '\\n----\\n' >> "$dir/settings.log"
+        helper=$(sed -n 's/.*"apiKeyHelper":"\\([^"]*\\)".*/\\1/p' "$arg" | sed "s/^'//; s/'$//")
+        printf 'env=%s helper=%s\\n' "\${ANTHROPIC_API_KEY:-none}" "$("$helper" 2>/dev/null || echo none)" >> "$dir/key.log"
       fi
       prev="$arg"
     done

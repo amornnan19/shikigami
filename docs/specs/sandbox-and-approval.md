@@ -1,7 +1,7 @@
 # Spec: sandbox and approval
 
 - Milestone: M2 MVP: sandbox and approval
-- Status: draft
+- Status: shipped (M2)
 
 ## Purpose
 
@@ -41,8 +41,8 @@ enforced, the agent does not run rather than run unprotected.
 
 ### What asks first
 
-- Every shell command. It runs inside the sandbox even when allowed: it can write only inside the
-  folder and the temporary folder, cannot read protected locations, and has no network.
+- Every shell command, even a harmless one. It runs inside the sandbox even when allowed: it can
+  write only inside the folder and the temporary folder, cannot read protected locations, and has no network.
 - Fetching a web page or searching the web.
 - Any other tool the agent's CLI offers that is not in the list above.
 
@@ -52,7 +52,8 @@ enforced, the agent does not run rather than run unprotected.
   git credentials, the macOS keychains, browser profiles, Mail and Messages data, shell history and
   shell configuration files, other agents' workspaces, and Shikigami's data folder.
 - Reading or listing anything outside the folder (for now it is refused, not asked about).
-- Writing outside the folder and the temporary folder.
+- Writing outside the folder and the temporary folder, and writing to `.claude`, `.git/hooks`,
+  `.git/config`, `.husky`, `.envrc` and `.mcp.json` inside the folder.
 - Network access from shell commands.
 - Running a command outside the sandbox.
 - A request for one of these is denied at once, without a card, and the agent is told why.
@@ -88,12 +89,23 @@ enforced, the agent does not run rather than run unprotected.
   command the agent runs.
 - Sign-in still works: a subscription sign-in is done through Anthropic's own flow; if agents need a
   sign-in of their own, Shikigami shows the exact command to run and never handles the credentials.
+- A saved API key reaches the CLI through a helper file that is deleted the first time it is read, so
+  it is in no environment or setting the agent can see. A key the provider rejects ends the turn as a
+  sign-in failure.
+- The agent's shell is bash, so the shell configuration of the user's own shell is not read.
+- Agents use their own Claude Code config folder inside Shikigami's data folder. With a Claude
+  subscription, that folder needs a one-time sign-in; Settings shows the command, a copy button and
+  Check again.
 
 ### Fail closed
 
 - If the sandbox cannot start (unsupported system, missing component), the turn does not run; it ends
   failed with "The sandbox could not start, so this agent did not run." and the agent shows needs
   attention.
+- A group folder under `/Volumes` or inside a protected location is refused when the group is made.
+- Claude Code older than 2.1.314 is refused: the turn does not run and the agent shows needs attention.
+- If the CLI does not apply the sandbox settings (they look ignored), the turn is stopped before any
+  tool runs.
 - A broken or unknown access setting is treated as the strictest behaviour.
 - If Shikigami cannot show an approval card (for example the app is shutting down), the request is
   denied.
