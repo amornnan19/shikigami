@@ -20,6 +20,8 @@ export const fakeClaudeStdins = join(fakeProviderDir, "stdin.log");
 export const fakeClaudePrompts = join(fakeProviderDir, "prompt.log");
 export const fakeClaudeSettings = join(fakeProviderDir, "settings.log");
 export const fakeClaudeToolMarker = join(fakeProviderDir, "tool-ran");
+export const fakeClaudeApprovalMarker = join(fakeProviderDir, "approved-ran");
+export const fakeClaudeApprovals = join(fakeProviderDir, "approvals.log");
 export const fakeClaudeRecordSeparator = "\n----\n";
 const fixtureDir = join(root, "src-tauri", "tests", "fixtures");
 const fixtureNames = ["claude-stream-basic.jsonl", "claude-stream-denied.jsonl"];
@@ -57,13 +59,19 @@ export function prepareFakeProviders() {
     fakeClaudeStdins,
     fakeClaudePrompts,
     fakeClaudeSettings,
+    fakeClaudeApprovals,
   ]) {
     writeFileSync(log, "");
   }
+  copyFileSync(
+    join(root, "e2e", "fake-approval-client.mjs"),
+    join(fakeProviderDir, "approval-client.mjs"),
+  );
   for (const name of fixtureNames) {
     copyFileSync(join(fixtureDir, name), join(fakeProviderDir, name));
   }
   rmSync(fakeClaudeToolMarker, { force: true });
+  rmSync(fakeClaudeApprovalMarker, { force: true });
   for (const name of readdirSync(fakeProviderDir)) {
     if (name.startsWith("reply.")) rmSync(join(fakeProviderDir, name));
   }
@@ -88,7 +96,7 @@ case "$1" in
     done
     echo "$safe" >> "$dir/invocations.log"
     case "$safe " in
-      *" --setting-sources  --strict-mcp-config --permission-mode manual --permission-prompts none "*) ;;
+      *" --setting-sources  --strict-mcp-config --permission-mode manual --permission-prompts host "*) ;;
       *) echo "Claude Code was not started isolated." >&2; exit 2 ;;
     esac
     case "$safe" in
@@ -96,7 +104,9 @@ case "$1" in
         echo "Claude Code was started with a widened permission." >&2; exit 2 ;;
     esac
     prev=""
+    mcp=""
     for arg in "$@"; do
+      if [ "$prev" = "--mcp-config" ]; then mcp="$arg"; fi
       if [ "$prev" = "--settings" ]; then
         cat "$arg" >> "$dir/settings.log"
         printf '\\n----\\n' >> "$dir/settings.log"
@@ -112,6 +122,10 @@ case "$1" in
       while IFS= read -r line; do
         case "$line" in
           "#sleep "*) sleep "\${line#"#sleep "}" ;;
+          "#approve "*)
+            out=$("${process.execPath}" "$dir/approval-client.mjs" "$mcp" "\${line#"#approve "}")
+            printf '%s\\n' "$out" >> "$dir/approvals.log"
+            case "$out" in *'"behavior":"allow"'*) touch "$dir/approved-ran" ;; esac ;;
           *) printf '%s\\n' "$line"; sleep 0.03 ;;
         esac
       done < "$dir/reply.$call.jsonl"

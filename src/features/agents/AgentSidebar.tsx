@@ -16,6 +16,18 @@ function StateDot({ state }: { state: AgentState }) {
       />
     );
   }
+  if (state === "waiting-for-you") {
+    return (
+      <span className="flex shrink-0 items-center gap-1.5 text-xs text-amber-700 dark:text-amber-400">
+        Needs you
+        <span
+          role="img"
+          aria-label="Waiting for you"
+          className="size-2 shrink-0 animate-pulse rounded-full bg-amber-500"
+        />
+      </span>
+    );
+  }
   if (state === "needs-attention") {
     return (
       <span

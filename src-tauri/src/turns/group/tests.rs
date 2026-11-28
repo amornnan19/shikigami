@@ -736,10 +736,10 @@ async fn a_group_turn_runs_in_the_group_folder_isolated_with_the_prompt_and_the_
     );
     assert!(!args.iter().any(|arg| arg == "--append-system-prompt"));
     assert_eq!(
-        args[args.len() - 4..args.len() - 2],
+        args[args.len() - 8..args.len() - 6],
         ["--system-prompt-snapshot", "off"]
     );
-    assert_eq!(args[args.len() - 2], "--settings");
+    assert_eq!(args[args.len() - 6], "--settings");
     assert!(args.contains(&"--session-id".to_owned()));
     let second_args = fx.args(1);
     assert_isolated(&second_args);

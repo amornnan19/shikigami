@@ -6,6 +6,7 @@ mod store;
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -13,10 +14,12 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
+use tokio::sync::mpsc;
 
 use crate::agents::instructions;
 use crate::agents::now_millis;
 use crate::api_key;
+use crate::approvals::{self, ApprovalView};
 use crate::auth;
 use crate::db::Database;
 use crate::providers::{self, CLAUDE_CODE_ID};
@@ -31,8 +34,11 @@ const EXIT_TERM_GRACE: Duration = Duration::from_secs(2);
 const EXIT_POLL: Duration = Duration::from_millis(25);
 pub const STALL_TIMEOUT: Duration = Duration::from_secs(300);
 pub const TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(900);
+pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(600);
 #[cfg(feature = "e2e")]
 const STALL_SECONDS_ENV: &str = "SHIKIGAMI_STALL_SECONDS";
+#[cfg(feature = "e2e")]
+const APPROVAL_SECONDS_ENV: &str = "SHIKIGAMI_APPROVAL_SECONDS";
 
 #[derive(Debug, Serialize)]
 pub struct TurnError {
@@ -124,6 +130,12 @@ pub enum TurnEvent {
         item_id: String,
         text: String,
     },
+    ApprovalRequested {
+        approval: ApprovalView,
+    },
+    ApprovalResolved {
+        approval: ApprovalView,
+    },
     Ended {
         status: String,
         error: Option<String>,
@@ -166,6 +178,7 @@ pub struct TurnRegistry {
     closing: AtomicBool,
     temp_dir: PathBuf,
     held: Mutex<HashSet<String>>,
+    signals: Mutex<HashMap<String, mpsc::UnboundedSender<approvals::Message>>>,
 }
 
 impl TurnRegistry {
@@ -174,6 +187,30 @@ impl TurnRegistry {
             temp_dir,
             ..Self::default()
         }
+    }
+
+    fn signals(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<String, mpsc::UnboundedSender<approvals::Message>>> {
+        self.signals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn open_signals(&self, turn_id: &str) -> mpsc::UnboundedReceiver<approvals::Message> {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        self.signals().insert(turn_id.to_owned(), sender);
+        receiver
+    }
+
+    fn close_signals(&self, turn_id: &str) {
+        self.signals().remove(turn_id);
+    }
+
+    pub(crate) fn send_signal(&self, turn_id: &str, message: approvals::Message) -> bool {
+        self.signals()
+            .get(turn_id)
+            .is_some_and(|sender| sender.send(message).is_ok())
     }
 
     fn held(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
@@ -215,7 +252,7 @@ impl TurnRegistry {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn is_closing(&self) -> bool {
+    pub(crate) fn is_closing(&self) -> bool {
         self.closing.load(Ordering::SeqCst)
     }
 
@@ -292,6 +329,7 @@ impl TurnRegistry {
             .get_mut(agent_id)
             .filter(|slot| slot.turn_id == turn_id)?;
         slot.stop_requested = true;
+        self.send_signal(turn_id, approvals::Message::Stop);
         if let Some(group) = slot.group {
             unsafe {
                 libc::killpg(group, libc::SIGTERM);
@@ -327,6 +365,9 @@ impl TurnRegistry {
 
     pub fn kill_all(&self, grace: Duration) {
         self.closing.store(true, Ordering::SeqCst);
+        for sender in self.signals().values() {
+            let _ = sender.send(approvals::Message::Shutdown);
+        }
         let groups: Vec<i32> = std::mem::take(&mut *self.slots())
             .into_values()
             .filter_map(|slot| slot.group)
@@ -437,6 +478,8 @@ pub struct Launch {
     pub environment: Vec<(OsString, OsString)>,
     pub stall_timeout: Duration,
     pub tool_stall_timeout: Duration,
+    pub approval_timeout: Duration,
+    pub relay_executable: PathBuf,
     pub group: Option<GroupRun>,
     pub sandbox: crate::sandbox::Scope,
 }
@@ -451,6 +494,22 @@ fn stall_timeout() -> Duration {
         return Duration::from_secs(seconds);
     }
     STALL_TIMEOUT
+}
+
+fn approval_timeout() -> Duration {
+    #[cfg(feature = "e2e")]
+    if let Some(seconds) = std::env::var(APPROVAL_SECONDS_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+    {
+        return Duration::from_secs(seconds);
+    }
+    APPROVAL_TIMEOUT
+}
+
+fn relay_executable() -> PathBuf {
+    std::env::current_exe().unwrap_or_default()
 }
 
 fn begin_error(error: BeginError) -> TurnError {
@@ -525,6 +584,8 @@ fn launch_of(
         environment: std::env::vars_os().collect(),
         stall_timeout: stall_timeout(),
         tool_stall_timeout: TOOL_STALL_TIMEOUT,
+        approval_timeout: approval_timeout(),
+        relay_executable: relay_executable(),
         group: None,
         sandbox: crate::sandbox::Scope::current(registry.data_dir()),
     })
@@ -587,6 +648,8 @@ fn launch_of_group(
         environment: std::env::vars_os().collect(),
         stall_timeout: stall_timeout(),
         tool_stall_timeout: TOOL_STALL_TIMEOUT,
+        approval_timeout: approval_timeout(),
+        relay_executable: relay_executable(),
         group: Some(run),
         sandbox: crate::sandbox::Scope::current(registry.data_dir()),
     })
@@ -967,8 +1030,12 @@ pub fn sweep_temp_files(dir: &Path) -> usize {
             let name = name.to_string_lossy();
             let ours = (name.starts_with("instructions-") && name.ends_with(".md"))
                 || (name.starts_with("settings-") && name.ends_with(".json"))
+                || (name.starts_with("mcp-") && name.ends_with(".json"))
+                || (name.starts_with("ap-") && name.ends_with(".s"))
                 || name.starts_with("key-");
-            ours && entry.file_type().is_ok_and(|kind| kind.is_file())
+            ours && entry
+                .file_type()
+                .is_ok_and(|kind| kind.is_file() || kind.is_socket())
         })
         .filter(|entry| std::fs::remove_file(entry.path()).is_ok())
         .count()
@@ -1722,7 +1789,11 @@ mod tests {
         )
         .unwrap();
         symlink(&victim, dir.path().join("instructions-link.md")).unwrap();
-        assert_eq!(sweep_temp_files(dir.path()), 5);
+        fs::write(dir.path().join("mcp-a.json"), "x").unwrap();
+        let _socket =
+            std::os::unix::net::UnixListener::bind(dir.path().join("ap-1234abcd.s")).unwrap();
+        fs::write(dir.path().join("ap-notes.txt"), "x").unwrap();
+        assert_eq!(sweep_temp_files(dir.path()), 7);
         let mut left: Vec<String> = fs::read_dir(dir.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
@@ -1731,6 +1802,7 @@ mod tests {
         assert_eq!(
             left,
             [
+                "ap-notes.txt",
                 "instructions-c.txt",
                 "instructions-d.md",
                 "instructions-link.md",
@@ -1750,6 +1822,32 @@ mod tests {
             .join("instructions-e.md")
             .is_file());
         assert_eq!(sweep_temp_files(&dir.path().join("missing")), 0);
+    }
+
+    #[test]
+    fn a_stop_request_and_a_shutdown_each_signal_the_open_turn_once() {
+        let registry = TurnRegistry::default();
+        assert!(registry.begin("a", "t1"));
+        let mut signals = registry.open_signals("t1");
+        registry.request_stop("a", "t1").unwrap();
+        assert_eq!(signals.try_recv().unwrap(), approvals::Message::Stop);
+        assert!(signals.try_recv().is_err());
+        registry.kill_all(Duration::ZERO);
+        assert_eq!(signals.try_recv().unwrap(), approvals::Message::Shutdown);
+        assert!(signals.try_recv().is_err());
+    }
+
+    #[test]
+    fn signals_reach_only_the_turn_that_is_open_and_stop_after_it_closes() {
+        let registry = TurnRegistry::default();
+        let mut first = registry.open_signals("t1");
+        let mut second = registry.open_signals("t2");
+        assert!(registry.send_signal("t1", approvals::Message::Stop));
+        assert_eq!(first.try_recv().unwrap(), approvals::Message::Stop);
+        assert!(second.try_recv().is_err());
+        registry.close_signals("t1");
+        assert!(!registry.send_signal("t1", approvals::Message::Stop));
+        assert!(!registry.send_signal("nobody", approvals::Message::Stop));
     }
 
     #[test]

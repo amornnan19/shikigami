@@ -82,6 +82,7 @@ impl AgentError {
 pub enum AgentState {
     Idle,
     Working,
+    WaitingForYou,
     NeedsAttention,
 }
 
@@ -140,6 +141,7 @@ struct Validated {
 
 struct Facts<'a> {
     has_running_turn: bool,
+    waiting_for_you: bool,
     newest_turn_status: Option<&'a str>,
     newest_turn_error: Option<&'a str>,
     folder_exists: bool,
@@ -183,7 +185,12 @@ fn derive_attention(facts: &Facts) -> Option<Attention> {
 
 fn derive_state(facts: &Facts) -> (AgentState, Option<Attention>) {
     if facts.has_running_turn {
-        return (AgentState::Working, None);
+        let state = if facts.waiting_for_you {
+            AgentState::WaitingForYou
+        } else {
+            AgentState::Working
+        };
+        return (state, None);
     }
     match derive_attention(facts) {
         Some(attention) => (AgentState::NeedsAttention, Some(attention)),
@@ -307,6 +314,7 @@ fn list(db: &Database, dirs: &[PathBuf], app: &AppAuth) -> Result<Vec<Agent>, Ag
         .map(|row| {
             let (state, attention) = derive_state(&Facts {
                 has_running_turn: row.has_running_turn,
+                waiting_for_you: row.waiting_for_you,
                 newest_turn_status: row.newest_turn_status.as_deref(),
                 newest_turn_error: row.newest_turn_error.as_deref(),
                 folder_exists: Path::new(&row.workspace_path).is_dir(),
@@ -907,6 +915,7 @@ mod tests {
     fn facts() -> Facts<'static> {
         Facts {
             has_running_turn: false,
+            waiting_for_you: false,
             newest_turn_status: None,
             newest_turn_error: None,
             folder_exists: true,
@@ -938,6 +947,17 @@ mod tests {
             ..facts()
         };
         assert_eq!(state_of(running), AgentState::Working);
+        let waiting = Facts {
+            has_running_turn: true,
+            waiting_for_you: true,
+            ..facts()
+        };
+        assert_eq!(derive_state(&waiting), (AgentState::WaitingForYou, None));
+        let waiting_without_a_turn = Facts {
+            waiting_for_you: true,
+            ..facts()
+        };
+        assert_eq!(state_of(waiting_without_a_turn), AgentState::Idle);
         let running_but_broken = Facts {
             has_running_turn: true,
             newest_turn_status: Some("failed"),
@@ -1074,6 +1094,44 @@ mod tests {
             .find(|agent| agent.name == "Recovered")
             .unwrap();
         assert_eq!(recovered.state, AgentState::NeedsAttention);
+    }
+
+    #[test]
+    fn an_agent_with_a_running_turn_and_an_open_card_waits_for_the_user() {
+        let fx = Fixture::new(&["claude"]);
+        let waiting = fx.create("Waiting", "claude-code").unwrap();
+        let idle = fx.create("Idle", "claude-code").unwrap();
+        insert_turn(&fx, "t1", &waiting.id, "running", 10);
+        insert_turn(&fx, "t2", &idle.id, "completed", 10);
+        let add = |id: &str, turn: &str, status: &str| {
+            fx.db.with_connection(|c| {
+                c.execute(
+                    "INSERT INTO approvals (id, turn_id, tool, summary, detail, status, created_at)
+                     VALUES (?1, ?2, 'Bash', 'ls', '{}', ?3, 1)",
+                    rusqlite::params![id, turn, status],
+                )
+                .unwrap()
+            });
+        };
+        let states = |fx: &Fixture| -> std::collections::HashMap<String, AgentState> {
+            fx.list()
+                .into_iter()
+                .map(|agent| (agent.name, agent.state))
+                .collect()
+        };
+        assert_eq!(states(&fx)["Waiting"], AgentState::Working);
+        add("p1", "t1", "pending");
+        add("p2", "t2", "denied");
+        assert_eq!(states(&fx)["Waiting"], AgentState::WaitingForYou);
+        assert_eq!(states(&fx)["Idle"], AgentState::Idle);
+        fx.db.with_connection(|c| {
+            c.execute(
+                "UPDATE approvals SET status = 'allowed' WHERE id = 'p1'",
+                [],
+            )
+            .unwrap()
+        });
+        assert_eq!(states(&fx)["Waiting"], AgentState::Working);
     }
 
     #[test]

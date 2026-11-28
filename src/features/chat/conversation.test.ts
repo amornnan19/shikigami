@@ -25,6 +25,34 @@ function apply(data: Conversation, event: object) {
 }
 
 describe("applyEvent", () => {
+  it("shows a card when it is requested and updates it in place when it is answered", () => {
+    const approval = {
+      id: "p1",
+      tool: "Bash",
+      summary: "ls -la",
+      detail: "{}",
+      reason: null,
+      status: "pending",
+      answeredBy: null,
+      createdAt: 5,
+      answeredAt: null,
+      folder: "/w",
+    };
+    const requested = apply(base, { kind: "approval-requested", approval });
+    expect(requested.turns[0]?.items).toEqual([{ ...approval, type: "approval" }]);
+    expect(apply(requested, { kind: "approval-requested", approval }).turns[0]?.items).toHaveLength(
+      1,
+    );
+    const answered = { ...approval, status: "allowed", answeredBy: "user", answeredAt: 9 };
+    const resolved = apply(requested, { kind: "approval-resolved", approval: answered });
+    expect(resolved.turns[0]?.items).toEqual([{ ...answered, type: "approval" }]);
+    expect(apply(base, { kind: "approval-resolved", approval: answered }).turns[0]?.items).toEqual([
+      { ...answered, type: "approval" },
+    ]);
+    const streamed = apply(resolved, { kind: "text-delta", itemId: "p1", text: "x" });
+    expect(streamed.turns[0]?.items).toEqual(resolved.turns[0]?.items);
+  });
+
   it("appends deltas to the item and creates it when unknown", () => {
     const first = apply(base, { kind: "text-delta", itemId: "i", text: "po" });
     const second = apply(first, { kind: "text-delta", itemId: "i", text: "ng" });

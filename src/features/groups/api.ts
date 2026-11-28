@@ -16,6 +16,7 @@ export interface Group {
   createdAt: number;
   lastActivityAt: number;
   attention: Attention | null;
+  waitingForYou: boolean;
 }
 
 export interface CreateGroupInput {

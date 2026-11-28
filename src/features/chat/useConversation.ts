@@ -28,6 +28,10 @@ export function useTurnEvents() {
         void client.invalidateQueries({ queryKey: ["agents"] });
         if (event.groupId) void client.invalidateQueries({ queryKey: ["groups"] });
       }
+      if (event.kind === "approval-requested" || event.kind === "approval-resolved") {
+        void client.invalidateQueries({ queryKey: ["agents"] });
+        if (event.groupId) void client.invalidateQueries({ queryKey: ["groups"] });
+      }
       client.setQueryData<Conversation>(eventKey(event), (data) =>
         data ? applyEvent(data, event) : data,
       );

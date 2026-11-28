@@ -9,7 +9,10 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
+use tokio::sync::mpsc;
 use tokio::time::timeout;
+
+mod approval;
 
 use super::claude_code::{self, Parsed, Session, StepStart, StreamParser};
 use super::group;
@@ -20,6 +23,7 @@ use super::{
 };
 use crate::agents::now_millis;
 use crate::api_key::ApiKeyError;
+use crate::approvals::{self, Channel, Inbound, Message};
 use crate::auth::AuthMode;
 use crate::db::Database;
 use crate::providers::{self, is_allowed_variable};
@@ -254,6 +258,14 @@ struct Runner<'a> {
     previous_seen: i64,
     context_hash: Option<String>,
     hash_stored: bool,
+    approval_timeout: Duration,
+    pending: HashMap<String, approval::Pending>,
+}
+
+#[derive(Clone, Copy)]
+struct ConfigFiles<'a> {
+    settings: &'a Path,
+    mcp: &'a Path,
 }
 
 struct TempFile(Option<PathBuf>);
@@ -719,7 +731,7 @@ impl Runner<'_> {
         key: &ApiKey,
         group_flags: Option<&claude_code::GroupFlags>,
         instructions_file: Option<&Path>,
-        settings_file: &Path,
+        files: ConfigFiles,
     ) -> Option<Command> {
         let search_path = env::join_paths(&launch.search_dirs).ok()?;
         let mut command = Command::new(&launch.executable);
@@ -731,7 +743,11 @@ impl Runner<'_> {
                 instructions_file,
             ))
             .arg("--settings")
-            .arg(settings_file)
+            .arg(files.settings)
+            .arg("--permission-prompt-tool")
+            .arg(approvals::PROMPT_TOOL)
+            .arg("--mcp-config")
+            .arg(files.mcp)
             .current_dir(&launch.workspace)
             .env_clear()
             .envs(
@@ -835,13 +851,37 @@ impl Runner<'_> {
             snapshot_off,
             access: group.access,
         });
+        let Ok(mut approvals) = Channel::bind(&self.registry.temp_dir()) else {
+            attempt.failure = Some("Could not start Claude Code.".to_owned());
+            return attempt;
+        };
+        let Ok(mcp) = TempFile::create(
+            &self.registry.temp_dir(),
+            "mcp",
+            "json",
+            &approvals::relay_config(
+                &launch.relay_executable,
+                approvals.path(),
+                approvals.token(),
+            ),
+        ) else {
+            attempt.failure = Some("Could not start Claude Code.".to_owned());
+            return attempt;
+        };
+        let Some(mcp_path) = mcp.path() else {
+            attempt.failure = Some("Could not start Claude Code.".to_owned());
+            return attempt;
+        };
         let Some(mut command) = self.command(
             launch,
             session,
             key,
             group_flags.as_ref(),
             instructions.path(),
-            settings_path,
+            ConfigFiles {
+                settings: settings_path,
+                mcp: mcp_path,
+            },
         ) else {
             attempt.failure = Some("Could not start Claude Code.".to_owned());
             return attempt;
@@ -882,23 +922,73 @@ impl Runner<'_> {
         let mut stderr_task = tokio::spawn(read_stderr(stderr));
 
         let mut parser = StreamParser::new(self.redactor.clone());
-        let mut reader = BufReader::new(stdout);
-        let mut buffer = Vec::new();
+        let (line_sender, mut lines) = mpsc::channel::<io::Result<Line>>(64);
+        let reader_task = tokio::spawn(async move {
+            let mut reader = BufReader::new(stdout);
+            let mut buffer = Vec::new();
+            loop {
+                let read = read_line(&mut reader, &mut buffer).await;
+                let last = !matches!(read, Ok(Line::Text(_)));
+                if line_sender.send(read).await.is_err() || last {
+                    break;
+                }
+            }
+        });
+        let mut signals = self.registry.open_signals(&self.turn_id);
+        let mut last_activity = tokio::time::Instant::now();
         loop {
             let limit = if self.step_inputs.is_empty() {
                 launch.stall_timeout
             } else {
                 launch.tool_stall_timeout
             };
-            let read = match timeout(limit, read_line(&mut reader, &mut buffer)).await {
-                Ok(read) => read,
-                Err(_) => {
-                    attempt.failure = Some(stall_message(limit));
-                    if let Some(group) = self.registry.terminate(&self.agent_id, &self.turn_id) {
-                        tokio::spawn(kill_group_after(group, EXIT_TERM_GRACE));
+            let had_pending = !self.pending.is_empty();
+            let wake = self
+                .next_approval_deadline()
+                .unwrap_or(last_activity + limit);
+            let read = tokio::select! {
+                line = lines.recv() => Some(line.unwrap_or(Ok(Line::End))),
+                inbound = approvals.next() => {
+                    match inbound {
+                        Some(Inbound::Request { conn, id, tool, input, .. }) => {
+                            self.open_approval(&approvals, conn, id, tool, input).await;
+                        }
+                        Some(Inbound::Closed { conn }) => {
+                            self.drop_connection(&approvals, conn).await;
+                        }
+                        None => std::future::pending().await,
                     }
-                    break;
+                    None
                 }
+                message = signals.recv() => {
+                    match message {
+                        Some(Message::Answer { approval_id, allow }) => {
+                            self.answer_approval(&approvals, &approval_id, allow).await;
+                        }
+                        Some(Message::Stop) => self.deny_approvals(&approvals, false).await,
+                        Some(Message::Shutdown) => self.deny_approvals(&approvals, true).await,
+                        None => std::future::pending().await,
+                    }
+                    None
+                }
+                () = tokio::time::sleep_until(wake) => {
+                    let now = tokio::time::Instant::now();
+                    self.expire_approvals(&approvals, now).await;
+                    if self.pending.is_empty() && !had_pending && now >= last_activity + limit {
+                        attempt.failure = Some(stall_message(limit));
+                        if let Some(group) = self.registry.terminate(&self.agent_id, &self.turn_id) {
+                            tokio::spawn(kill_group_after(group, EXIT_TERM_GRACE));
+                        }
+                        break;
+                    }
+                    None
+                }
+            };
+            if had_pending && self.pending.is_empty() || read.is_some() {
+                last_activity = tokio::time::Instant::now();
+            }
+            let Some(read) = read else {
+                continue;
             };
             match read {
                 Ok(Line::Text(line)) => {
@@ -933,7 +1023,10 @@ impl Runner<'_> {
                 }
             }
         }
-        drop(reader);
+        reader_task.abort();
+        let _ = reader_task.await;
+        let closing = self.registry.is_closing();
+        self.deny_approvals(&approvals, closing).await;
         if timeout(EXIT_GRACE, child.wait()).await.is_err() {
             self.registry.kill(&self.agent_id, &self.turn_id);
             let _ = child.wait().await;
@@ -999,6 +1092,7 @@ pub async fn run(
     let (agent_id, turn_id) = (launch.agent_id.clone(), launch.turn_id.clone());
     let end = run_turn(db, sink, registry, launch, key).await;
     registry.clear(&agent_id, &turn_id);
+    registry.close_signals(&turn_id);
     end
 }
 
@@ -1038,6 +1132,8 @@ async fn run_turn(
             .as_ref()
             .map(|group| group.context_hash.clone()),
         hash_stored: false,
+        approval_timeout: launch.approval_timeout,
+        pending: HashMap::new(),
     };
     runner.emit(TurnEvent::Started);
     if let Some(notice) = launch
@@ -1137,6 +1233,8 @@ async fn run_turn(
 
 #[cfg(test)]
 mod tests {
+    mod approval_flow;
+
     use super::super::{STALL_TIMEOUT, TOOL_STALL_TIMEOUT};
     use super::*;
     use crate::api_key::key_for_turn;
@@ -1268,6 +1366,8 @@ mod tests {
                 environment: self.environment.lock().unwrap().clone(),
                 stall_timeout: STALL_TIMEOUT,
                 tool_stall_timeout: TOOL_STALL_TIMEOUT,
+                approval_timeout: Duration::from_secs(600),
+                relay_executable: PathBuf::from("/nonexistent/shikigami"),
                 group: None,
                 sandbox: sandbox::Scope {
                     home: Some(PathBuf::from(TEST_HOME)),
@@ -1354,10 +1454,13 @@ mod tests {
         assert_isolated(&args);
         assert_eq!(args[12..14], ["--model", "haiku"]);
         assert_eq!(args[14], "--session-id");
-        assert_eq!(args.len(), 18);
+        assert_eq!(args.len(), 22);
         assert_eq!(args[15].len(), 36);
         assert_ne!(args[15], FIXTURE_SESSION);
         assert_eq!(args[16], "--settings");
+        assert_eq!(args[18], "--permission-prompt-tool");
+        assert_eq!(args[19], approvals::PROMPT_TOOL);
+        assert_eq!(args[20], "--mcp-config");
         assert!(!args.iter().any(|arg| arg.contains("pong")));
         assert_eq!(read(&world, "stdin.0"), "Reply with the word pong");
         assert_eq!(world.session().as_deref(), Some(FIXTURE_SESSION));

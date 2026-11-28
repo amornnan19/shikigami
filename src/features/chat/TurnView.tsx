@@ -24,7 +24,8 @@ import {
   withEffectiveStatus,
 } from "@/features/shikigami/subagents";
 import { cn } from "@/lib/utils";
-import type { Step, StepStatus, TextItem, Turn } from "./api";
+import { ApprovalCard } from "./ApprovalCard";
+import type { Approval, Step, StepStatus, TextItem, Turn } from "./api";
 import { Markdown, MentionChip, withMentions } from "./Markdown";
 
 const STATUS_LABEL: Record<StepStatus, string> = {
@@ -233,14 +234,17 @@ export function TurnView({
   turn,
   members,
   color,
+  name,
 }: {
   turn: Turn;
   members?: GroupMember[];
   color?: string;
+  name?: string;
 }) {
   const notices = turn.items.filter((item): item is TextItem => item.type === "notice");
   const steps = turn.items.filter((item): item is Step => item.type === "step");
   const texts = turn.items.filter((item): item is TextItem => item.type === "text");
+  const approvals = turn.items.filter((item): item is Approval => item.type === "approval");
   const author = members
     ? (members.find((member) => member.agentId === turn.agentId) ?? FORMER_MEMBER)
     : null;
@@ -252,12 +256,23 @@ export function TurnView({
       {texts.map((item) => (
         <Markdown key={item.id} text={item.text} members={members} />
       ))}
+      {approvals.map((approval) => (
+        <ApprovalCard
+          key={approval.id}
+          approval={approval}
+          name={author?.name ?? name ?? "Agent"}
+          color={author?.color ?? color ?? "slate"}
+        />
+      ))}
       <HandOffMarkers turn={turn} members={members} />
-      {turn.status === "running" && texts.length === 0 && steps.length === 0 && (
-        <p role="status" className="animate-pulse text-sm text-muted-foreground">
-          Working…
-        </p>
-      )}
+      {turn.status === "running" &&
+        texts.length === 0 &&
+        steps.length === 0 &&
+        approvals.length === 0 && (
+          <p role="status" className="animate-pulse text-sm text-muted-foreground">
+            Working…
+          </p>
+        )}
       {turn.error && <p className="text-sm text-red-600/80">{turn.error}</p>}
       {turn.status === "stopped" && <p className="text-sm text-muted-foreground">Stopped</p>}
       {turn.status === "interrupted" && (

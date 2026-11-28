@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { AuthMode } from "@/features/providers/api";
 
-export type AgentState = "idle" | "working" | "needs-attention";
+export type AgentState = "idle" | "working" | "waiting-for-you" | "needs-attention";
 
 export interface Attention {
   code: string;

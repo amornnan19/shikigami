@@ -16,6 +16,7 @@ pub struct AgentRow {
     pub newest_turn_status: Option<String>,
     pub newest_turn_error: Option<String>,
     pub auth_mode: Option<String>,
+    pub waiting_for_you: bool,
 }
 
 const NAME_COLUMN: &str = "agents.name";
@@ -132,7 +133,9 @@ pub fn list(connection: &Connection) -> rusqlite::Result<Vec<AgentRow>> {
                    ORDER BY t.started_at DESC, t.rowid DESC LIMIT 1),
                 (SELECT t.error FROM turns t WHERE t.agent_id = a.id AND t.group_id IS NULL
                    ORDER BY t.started_at DESC, t.rowid DESC LIMIT 1),
-                a.auth_mode
+                a.auth_mode,
+                EXISTS(SELECT 1 FROM approvals ap JOIN turns t ON t.id = ap.turn_id
+                       WHERE t.agent_id = a.id AND ap.status = 'pending')
          FROM agents a
          ORDER BY a.last_activity_at DESC, a.created_at DESC, a.rowid DESC",
     )?;
@@ -150,6 +153,7 @@ pub fn list(connection: &Connection) -> rusqlite::Result<Vec<AgentRow>> {
             newest_turn_status: row.get(9)?,
             newest_turn_error: row.get(10)?,
             auth_mode: row.get(11)?,
+            waiting_for_you: row.get(12)?,
         })
     })?;
     rows.collect()

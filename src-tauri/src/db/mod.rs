@@ -121,7 +121,7 @@ mod tests {
     fn fresh_database_migrates_to_the_latest_version_with_all_tables() {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(dir.path()).unwrap();
-        assert_eq!(schema_version(&db), 9);
+        assert_eq!(schema_version(&db), 10);
         for table in [
             "agents",
             "turns",
@@ -133,6 +133,7 @@ mod tests {
             "group_members",
             "group_queue",
             "agent_group_sessions",
+            "approvals",
         ] {
             assert_eq!(count(&db, table), 0, "{table}");
         }
@@ -159,7 +160,7 @@ mod tests {
             .unwrap();
         drop(connection);
         let db = Database::open(dir.path()).unwrap();
-        assert_eq!(schema_version(&db), 9);
+        assert_eq!(schema_version(&db), 10);
         assert_eq!(count(&db, "agents"), 1);
         assert_eq!(count(&db, "turns"), 1);
         assert_eq!(count(&db, "settings"), 0);
@@ -170,8 +171,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         drop(Database::open(dir.path()).unwrap());
         let db = Database::open(dir.path()).unwrap();
-        assert_eq!(schema_version(&db), 9);
-        assert_eq!(count(&db, "refinery_schema_history"), 9);
+        assert_eq!(schema_version(&db), 10);
+        assert_eq!(count(&db, "refinery_schema_history"), 10);
     }
 
     #[test]
@@ -289,7 +290,12 @@ mod tests {
             )
             .unwrap(),
             refinery::Migration::unapplied(
-                "V10__broken",
+                "V10__approvals",
+                include_str!("../../migrations/V10__approvals.sql"),
+            )
+            .unwrap(),
+            refinery::Migration::unapplied(
+                "V11__broken",
                 "CREATE TABLE probe (x INTEGER); INSERT INTO missing_table VALUES (1);",
             )
             .unwrap(),
@@ -303,7 +309,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
         let probe_tables: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE name = 'probe'",
@@ -393,7 +399,12 @@ mod tests {
             )
             .unwrap(),
             refinery::Migration::unapplied(
-                "V10__rebuild_agents",
+                "V10__approvals",
+                include_str!("../../migrations/V10__approvals.sql"),
+            )
+            .unwrap(),
+            refinery::Migration::unapplied(
+                "V11__rebuild_agents",
                 "CREATE TABLE agents_new (
                    id TEXT PRIMARY KEY,
                    name TEXT NOT NULL COLLATE NOCASE UNIQUE,
@@ -416,7 +427,7 @@ mod tests {
         let db = Database {
             connection: Mutex::new(connection),
         };
-        assert_eq!(schema_version(&db), 10);
+        assert_eq!(schema_version(&db), 11);
         for table in [
             "agents",
             "turns",
@@ -433,6 +444,92 @@ mod tests {
                 .unwrap()
         });
         assert_eq!(foreign_keys, 1);
+    }
+
+    #[test]
+    fn the_approvals_migration_keeps_a_version_nine_database_and_cascades_with_its_turn() {
+        const NAMES: [(&str, &str); 9] = [
+            (
+                "V1__initial",
+                include_str!("../../migrations/V1__initial.sql"),
+            ),
+            (
+                "V2__settings",
+                include_str!("../../migrations/V2__settings.sql"),
+            ),
+            (
+                "V3__auth_mode",
+                include_str!("../../migrations/V3__auth_mode.sql"),
+            ),
+            (
+                "V4__groups",
+                include_str!("../../migrations/V4__groups.sql"),
+            ),
+            (
+                "V5__group_turns",
+                include_str!("../../migrations/V5__group_turns.sql"),
+            ),
+            (
+                "V6__group_history",
+                include_str!("../../migrations/V6__group_history.sql"),
+            ),
+            (
+                "V7__group_context",
+                include_str!("../../migrations/V7__group_context.sql"),
+            ),
+            (
+                "V8__group_hand_offs",
+                include_str!("../../migrations/V8__group_hand_offs.sql"),
+            ),
+            (
+                "V9__subagent_steps",
+                include_str!("../../migrations/V9__subagent_steps.sql"),
+            ),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let mut connection = Connection::open(dir.path().join(DATABASE_FILE)).unwrap();
+        configure(&connection).unwrap();
+        let v9: Vec<_> = NAMES
+            .iter()
+            .map(|(name, sql)| refinery::Migration::unapplied(name, sql).unwrap())
+            .collect();
+        migrate(&mut connection, Runner::new(&v9)).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO agents (id, name, color, provider, model, workspace_path, created_at, last_activity_at)
+                 VALUES ('a', 'Ada', 'red', 'claude-code', 'm', '/w', 1, 1);
+                 INSERT INTO turns (id, agent_id, status, started_at) VALUES ('t', 'a', 'completed', 1);",
+            )
+            .unwrap();
+        drop(connection);
+        let db = Database::open(dir.path()).unwrap();
+        assert_eq!(schema_version(&db), 10);
+        assert_eq!(count(&db, "turns"), 1);
+        assert_eq!(count(&db, "approvals"), 0);
+        db.with_connection(|c| {
+            c.execute(
+                "INSERT INTO approvals (id, turn_id, tool, summary, detail, status, created_at)
+                 VALUES ('p', 't', 'Bash', 'ls', '{}', 'pending', 1)",
+                [],
+            )
+            .unwrap();
+            assert!(c
+                .execute(
+                    "INSERT INTO approvals (id, turn_id, tool, summary, detail, status, created_at)
+                     VALUES ('q', 't', 'Bash', 'ls', '{}', 'maybe', 1)",
+                    [],
+                )
+                .is_err());
+            assert!(c
+                .execute(
+                    "INSERT INTO approvals (id, turn_id, tool, summary, detail, status, answered_by, created_at)
+                     VALUES ('r', 't', 'Bash', 'ls', '{}', 'denied', 'nobody', 1)",
+                    [],
+                )
+                .is_err());
+            c.execute("DELETE FROM turns WHERE id = 't'", []).unwrap();
+        });
+        assert_eq!(count(&db, "approvals"), 0);
     }
 
     fn version_two_database(dir: &Path, old_switch: Option<&str>) {
@@ -483,7 +580,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             version_two_database(dir.path(), old);
             let db = Database::open(dir.path()).unwrap();
-            assert_eq!(schema_version(&db), 9);
+            assert_eq!(schema_version(&db), 10);
             assert_eq!(
                 setting(&db, "claude.auth-mode").as_deref(),
                 expected,
@@ -543,7 +640,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         version_three_database(dir.path());
         let db = Database::open(dir.path()).unwrap();
-        assert_eq!(schema_version(&db), 9);
+        assert_eq!(schema_version(&db), 10);
         for table in ["agents", "turns", "messages", "queued_messages", "settings"] {
             assert_eq!(count(&db, table), 1, "{table}");
         }
@@ -605,7 +702,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         version_four_database(dir.path());
         let db = Database::open(dir.path()).unwrap();
-        assert_eq!(schema_version(&db), 9);
+        assert_eq!(schema_version(&db), 10);
         for table in [
             "turns",
             "messages",
@@ -745,7 +842,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         version_five_database(dir.path());
         let db = Database::open(dir.path()).unwrap();
-        assert_eq!(schema_version(&db), 9);
+        assert_eq!(schema_version(&db), 10);
         for (table, rows) in [
             ("agents", 2),
             ("turns", 3),
@@ -1015,7 +1112,7 @@ mod tests {
             .unwrap();
         drop(connection);
         let db = Database::open(dir.path()).unwrap();
-        assert_eq!(schema_version(&db), 9);
+        assert_eq!(schema_version(&db), 10);
         assert_eq!(count(&db, "steps"), 2);
         let orphans: i64 = db.with_connection(|c| {
             c.query_row(

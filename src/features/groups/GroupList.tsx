@@ -39,6 +39,16 @@ export function GroupList({
             >
               <GroupAvatars members={group.members} />
               <span className="min-w-0 flex-1 truncate">{group.name}</span>
+              {group.waitingForYou && (
+                <span className="flex shrink-0 items-center gap-1.5 text-xs text-amber-700 dark:text-amber-400">
+                  Needs you
+                  <span
+                    role="img"
+                    aria-label="Waiting for you"
+                    className="size-2 shrink-0 animate-pulse rounded-full bg-amber-500"
+                  />
+                </span>
+              )}
               {group.attention && (
                 <span
                   role="img"

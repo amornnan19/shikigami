@@ -13,7 +13,9 @@ function withTurn(data: Conversation, turnId: string, change: (turn: Turn) => Tu
 function setText(items: Item[], itemId: string, change: (text: string) => string): Item[] {
   if (items.some((item) => item.id === itemId)) {
     return items.map((item) =>
-      item.id === itemId && item.type !== "step" ? { ...item, text: change(item.text) } : item,
+      item.id === itemId && (item.type === "text" || item.type === "notice")
+        ? { ...item, text: change(item.text) }
+        : item,
     );
   }
   return [...items, { type: "text", id: itemId, text: change("") }];
@@ -53,6 +55,22 @@ export function applyEvent(data: Conversation, event: TurnEvent): Conversation {
             ? { ...item, status: event.status, detail: event.detail, result: event.result }
             : item,
         ),
+      }));
+    case "approval-requested":
+      return withTurn(data, event.turnId, (turn) => ({
+        ...turn,
+        items: turn.items.some((item) => item.id === event.approval.id)
+          ? turn.items
+          : [...turn.items, { ...event.approval, type: "approval" }],
+      }));
+    case "approval-resolved":
+      return withTurn(data, event.turnId, (turn) => ({
+        ...turn,
+        items: turn.items.some((item) => item.id === event.approval.id)
+          ? turn.items.map((item) =>
+              item.id === event.approval.id ? { ...event.approval, type: "approval" } : item,
+            )
+          : [...turn.items, { ...event.approval, type: "approval" }],
       }));
     case "ended":
       return withTurn(data, event.turnId, (turn) => ({

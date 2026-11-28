@@ -1,5 +1,6 @@
 mod agents;
 pub mod api_key;
+pub mod approvals;
 mod auth;
 mod commands;
 pub mod db;
@@ -63,6 +64,10 @@ fn app_context() -> tauri::Context {
     tauri::generate_context!()
 }
 
+pub fn run_approval_relay(arguments: impl IntoIterator<Item = OsString>) -> Option<i32> {
+    approvals::run_relay(arguments)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default();
@@ -82,7 +87,9 @@ pub fn run() {
                 .and_then(|dir| open_database(&dir))
                 .and_then(|database| turns::sweep_interrupted(&database).map(|_| database));
             if !data_dir.as_os_str().is_empty() {
-                turns::sweep_temp_files(&data_dir.join("tmp"));
+                let temp = data_dir.join("tmp");
+                turns::sweep_temp_files(&temp);
+                turns::sweep_temp_files(&approvals::socket_dir(&temp));
             }
             match opened {
                 Ok(database) => {
@@ -132,6 +139,7 @@ pub fn run() {
             groups::delete_group,
             groups::pick_group_folder,
             groups::suggest_group_folder,
+            approvals::answer_approval,
             turns::send_message,
             turns::get_conversation,
             turns::stop_turn,
