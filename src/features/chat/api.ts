@@ -24,6 +24,11 @@ export interface TextItem {
 
 export type Item = Step | TextItem;
 
+export interface HandOff {
+  agentId: string;
+  task: string;
+}
+
 export interface Turn {
   id: string;
   agentId: string | null;
@@ -33,6 +38,7 @@ export interface Turn {
   endedAt: number | null;
   kind: TurnKind;
   fromAgentId: string | null;
+  handOffs: HandOff[];
   userMessage: string;
   items: Item[];
 }

@@ -10,7 +10,6 @@ import {
 import { useState } from "react";
 import { AgentAvatar } from "@/features/agents/AgentAvatar";
 import type { GroupMember } from "@/features/groups/api";
-import { splitReply } from "@/features/groups/mentions";
 import { cn } from "@/lib/utils";
 import type { Step, StepStatus, TextItem, Turn } from "./api";
 import { Markdown, MentionChip, withMentions } from "./Markdown";
@@ -75,25 +74,28 @@ const FORMER_MEMBER: Pick<GroupMember, "name" | "color"> = {
   color: "slate",
 };
 
-function Reply({ text, turn, members }: { text: string; turn: Turn; members?: GroupMember[] }) {
-  if (!members) return <Markdown text={text} />;
+function HandOffMarkers({ turn, members }: { turn: Turn; members?: GroupMember[] }) {
+  if (!members) return null;
   return (
     <>
-      {splitReply(text, members, turn.agentId).map((segment, index) =>
-        segment.type === "text" ? (
-          // biome-ignore lint/suspicious/noArrayIndexKey: segments have no identity of their own
-          <Markdown key={index} text={segment.text} members={members} />
-        ) : (
-          // biome-ignore lint/suspicious/noArrayIndexKey: segments have no identity of their own
-          <div key={index} data-hand-off={segment.member.agentId}>
-            <p className="my-1 flex items-center gap-1.5 text-xs text-muted-foreground">
-              <ArrowRight className="size-3.5" />
-              Handed to <MentionChip member={segment.member} />
-            </p>
-            <Markdown text={segment.text} members={members} />
-          </div>
-        ),
-      )}
+      {turn.handOffs.map((handOff, index) => {
+        const member = members.find((candidate) => candidate.agentId === handOff.agentId);
+        if (!member) return null;
+        return (
+          <p
+            // biome-ignore lint/suspicious/noArrayIndexKey: a turn can hand the same task to one member twice
+            key={index}
+            data-hand-off={member.agentId}
+            className="my-1 flex items-start gap-1.5 text-xs text-muted-foreground"
+          >
+            <ArrowRight className="mt-0.5 size-3.5 shrink-0" />
+            <span className="min-w-0">
+              Handed to <MentionChip member={member} />
+              <span className="ml-1 break-words">{handOff.task}</span>
+            </span>
+          </p>
+        );
+      })}
     </>
   );
 }
@@ -109,8 +111,9 @@ export function TurnView({ turn, members }: { turn: Turn; members?: GroupMember[
     <>
       {steps.length > 0 && <Steps steps={steps} />}
       {texts.map((item) => (
-        <Reply key={item.id} text={item.text} turn={turn} members={members} />
+        <Markdown key={item.id} text={item.text} members={members} />
       ))}
+      <HandOffMarkers turn={turn} members={members} />
       {turn.status === "running" && texts.length === 0 && steps.length === 0 && (
         <p role="status" className="animate-pulse text-sm text-muted-foreground">
           Working…
@@ -135,7 +138,7 @@ export function TurnView({ turn, members }: { turn: Turn; members?: GroupMember[
           </span>
           {members ? withMentions(turn.userMessage, members) : turn.userMessage}
         </div>
-      ) : (
+      ) : turn.userMessage === "" ? null : (
         <div className="ml-auto max-w-[80%] rounded-2xl bg-primary px-4 py-2 whitespace-pre-wrap break-words text-primary-foreground">
           {members ? withMentions(turn.userMessage, members) : turn.userMessage}
         </div>

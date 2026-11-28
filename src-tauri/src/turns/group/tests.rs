@@ -1394,7 +1394,7 @@ fn an_addressed_agent_that_left_the_group_is_refused_or_re_addressed_to_the_lead
     });
     let refused = fx
         .db
-        .with_connection(|c| begin_in(c, "g", "c", "hi", &Origin::user("r"), 5))
+        .with_connection(|c| begin_in(c, "g", "c", "hi", &Origin::user("r", "c", false), 5))
         .err()
         .unwrap();
     assert!(matches!(

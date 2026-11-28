@@ -1,7 +1,7 @@
 use rusqlite::{params, Connection, OptionalExtension};
 
 use super::super::store::{self, NewMessage};
-use super::{enqueue_at, EntryKind, Origin};
+use super::{enqueue_at, AccessLevel, EntryKind, Origin};
 use crate::groups::{self, mentions};
 
 pub const MAX_TURNS: i64 = 8;
@@ -14,13 +14,15 @@ pub struct Notice {
     pub text: String,
 }
 
+pub const STOPPED_NOTICE: &str = "Stopped. Hand-offs from this message were dropped.";
+
 struct Finished {
     group_id: String,
     agent_id: String,
     root: String,
     hop: i64,
-    kind: EntryKind,
-    from_agent_id: Option<String>,
+    return_to: Option<String>,
+    access: AccessLevel,
 }
 
 fn finished_turn(connection: &Connection, turn_id: &str) -> rusqlite::Result<Option<Finished>> {
@@ -29,12 +31,12 @@ fn finished_turn(connection: &Connection, turn_id: &str) -> rusqlite::Result<Opt
         Option<String>,
         Option<String>,
         i64,
-        String,
         Option<String>,
+        i64,
     );
     let row: Option<Row> = connection
         .query_row(
-            "SELECT group_id, agent_id, root_message_id, hop, kind, from_agent_id
+            "SELECT group_id, agent_id, root_message_id, hop, return_to, access
              FROM turns WHERE id = ?1",
             [turn_id],
             |row| {
@@ -50,14 +52,14 @@ fn finished_turn(connection: &Connection, turn_id: &str) -> rusqlite::Result<Opt
         )
         .optional()?;
     Ok(
-        row.and_then(|(group_id, agent_id, root, hop, kind, from_agent_id)| {
+        row.and_then(|(group_id, agent_id, root, hop, return_to, access)| {
             Some(Finished {
                 group_id: group_id?,
                 agent_id: agent_id?,
                 root: root.unwrap_or_else(|| turn_id.to_owned()),
                 hop,
-                kind: EntryKind::parse(&kind),
-                from_agent_id,
+                return_to,
+                access: AccessLevel::from_value(access),
             })
         }),
     )
@@ -124,21 +126,13 @@ fn is_ping_pong(history: &[(String, String)], from: &str, to: &str) -> bool {
     run + 1 >= PING_PONG_RUN
 }
 
-fn insert_position(connection: &Connection, group_id: &str, root: &str) -> rusqlite::Result<i64> {
-    let after: Option<i64> = connection.query_row(
-        "SELECT MAX(position) FROM group_queue
-         WHERE group_id = ?1 AND root_message_id = ?2 AND kind <> 'user'",
-        params![group_id, root],
+fn place_at_head(connection: &Connection, group_id: &str, offset: i64) -> rusqlite::Result<i64> {
+    let head: i64 = connection.query_row(
+        "SELECT COALESCE(MIN(position), 0) FROM group_queue WHERE group_id = ?1",
+        [group_id],
         |row| row.get(0),
     )?;
-    let at = match after {
-        Some(last) => last + 1,
-        None => connection.query_row(
-            "SELECT COALESCE(MIN(position), 0) FROM group_queue WHERE group_id = ?1",
-            [group_id],
-            |row| row.get(0),
-        )?,
-    };
+    let at = head + offset;
     connection.execute(
         "UPDATE group_queue SET position = -(position + 2) WHERE group_id = ?1 AND position >= ?2",
         params![group_id, at],
@@ -205,6 +199,31 @@ fn post_limit_notice(
     Ok(())
 }
 
+pub fn drop_after_stop(
+    connection: &Connection,
+    turn_id: &str,
+    now: i64,
+) -> rusqlite::Result<Vec<Notice>> {
+    let Some(turn) = finished_turn(connection, turn_id)? else {
+        return Ok(Vec::new());
+    };
+    let dropped = connection.execute(
+        "DELETE FROM group_queue
+         WHERE group_id = ?1 AND root_message_id = ?2 AND kind IN ('hand-off', 'continuation')",
+        params![turn.group_id, turn.root],
+    )?;
+    if dropped == 0 {
+        return Ok(Vec::new());
+    }
+    Ok(vec![post_notice(
+        connection,
+        &turn,
+        turn_id,
+        STOPPED_NOTICE,
+        now,
+    )?])
+}
+
 pub fn queue_after(
     connection: &Connection,
     turn_id: &str,
@@ -216,11 +235,10 @@ pub fn queue_after(
     };
     let members = groups::store::members_of(connection, &turn.group_id)?;
     let reply = final_reply(connection, turn_id)?.unwrap_or_default();
-    let mut limit_reached = false;
+    let mut created = 0;
     for hand_off in mentions::hand_offs(&reply, &members, &turn.agent_id) {
         if turns_of_root(connection, &turn.group_id, &turn.root)? >= MAX_TURNS {
             post_limit_notice(connection, &turn, turn_id, now, &mut notices)?;
-            limit_reached = true;
             break;
         }
         let history = hand_off_history(connection, &turn.group_id, &turn.root)?;
@@ -238,8 +256,12 @@ pub fn queue_after(
             from_agent_id: Some(turn.agent_id.clone()),
             root: Some(turn.root.clone()),
             hop: turn.hop + 1,
+            return_to: Some(turn.agent_id.clone()),
+            parent_turn_id: Some(turn_id.to_owned()),
+            access: turn.access,
+            truncated: false,
         };
-        let position = insert_position(connection, &turn.group_id, &turn.root)?;
+        let position = place_at_head(connection, &turn.group_id, created)?;
         enqueue_at(
             connection,
             &turn.group_id,
@@ -249,42 +271,67 @@ pub fn queue_after(
             position,
             now,
         )?;
+        created += 1;
     }
-    let handed_by = turn
-        .from_agent_id
-        .as_deref()
-        .filter(|_| turn.kind == EntryKind::HandOff && !limit_reached);
-    if let Some(from) = handed_by {
-        queue_continuation(connection, &turn, from, now, &mut notices, turn_id)?;
+    if created > 0 {
+        connection.execute("UPDATE turns SET deferred = 1 WHERE id = ?1", [turn_id])?;
+    } else if let Some(owed) = turn.return_to.as_deref() {
+        queue_continuation(connection, &turn, turn_id, owed, now, &mut notices)?;
     }
     Ok(notices)
+}
+
+fn owed_elsewhere(connection: &Connection, turn: &Finished, owed: &str) -> rusqlite::Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM group_queue
+                       WHERE group_id = ?1 AND root_message_id = ?2 AND return_to = ?3)
+             OR EXISTS(SELECT 1 FROM turns
+                       WHERE group_id = ?1 AND root_message_id = ?2 AND return_to = ?3
+                         AND (status = 'running' OR deferred = 1))",
+        params![turn.group_id, turn.root, owed],
+        |row| row.get(0),
+    )
 }
 
 fn queue_continuation(
     connection: &Connection,
     turn: &Finished,
-    from: &str,
+    turn_id: &str,
+    owed: &str,
     now: i64,
     notices: &mut Vec<Notice>,
-    turn_id: &str,
 ) -> rusqlite::Result<()> {
     let still_member: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM group_members WHERE group_id = ?1 AND agent_id = ?2)",
-        params![turn.group_id, from],
+        params![turn.group_id, owed],
         |row| row.get(0),
     )?;
-    let already_waiting: bool = connection.query_row(
+    let waiting: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM group_queue
-                       WHERE group_id = ?1 AND root_message_id = ?2 AND addressed_agent_id = ?3)",
-        params![turn.group_id, turn.root, from],
+                       WHERE group_id = ?1 AND root_message_id = ?2 AND addressed_agent_id = ?3
+                         AND kind = 'continuation')",
+        params![turn.group_id, turn.root, owed],
         |row| row.get(0),
     )?;
-    if !still_member || already_waiting {
+    if !still_member || waiting || owed_elsewhere(connection, turn, owed)? {
         return Ok(());
     }
+    let debt: Option<(String, Option<String>)> = connection
+        .query_row(
+            "SELECT id, return_to FROM turns
+             WHERE group_id = ?1 AND root_message_id = ?2 AND agent_id = ?3 AND deferred = 1
+             ORDER BY rowid DESC LIMIT 1",
+            params![turn.group_id, turn.root, owed],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((debt_id, carried)) = debt else {
+        return Ok(());
+    };
     if turns_of_root(connection, &turn.group_id, &turn.root)? >= MAX_TURNS {
         return post_limit_notice(connection, turn, turn_id, now, notices);
     }
+    connection.execute("UPDATE turns SET deferred = 0 WHERE id = ?1", [debt_id])?;
     let text = format!(
         "Continue with {}'s answer.",
         name_of(connection, &turn.agent_id)?
@@ -294,12 +341,16 @@ fn queue_continuation(
         from_agent_id: Some(turn.agent_id.clone()),
         root: Some(turn.root.clone()),
         hop: turn.hop + 1,
+        return_to: carried,
+        parent_turn_id: Some(turn_id.to_owned()),
+        access: turn.access,
+        truncated: false,
     };
-    let position = insert_position(connection, &turn.group_id, &turn.root)?;
+    let position = place_at_head(connection, &turn.group_id, 0)?;
     enqueue_at(
         connection,
         &turn.group_id,
-        from,
+        owed,
         &text,
         &origin,
         position,

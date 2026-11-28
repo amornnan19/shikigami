@@ -65,20 +65,34 @@ fn line_ranges(chars: &[char]) -> Vec<(usize, usize)> {
     }
 }
 
+fn fence_of(line: &str) -> Option<(char, usize, &str)> {
+    let trimmed = line.trim_start();
+    let marker = trimmed.chars().next().filter(|c| *c == '`' || *c == '~')?;
+    let length = trimmed.chars().take_while(|c| *c == marker).count();
+    (length >= 3).then(|| (marker, length, &trimmed[length..]))
+}
+
 impl Scan {
     fn new(text: &str) -> Self {
         let chars: Vec<char> = text.chars().collect();
         let mut ignored = vec![false; chars.len()];
-        let mut in_fence = false;
+        let mut open: Option<(char, usize)> = None;
         for (start, end) in line_ranges(&chars) {
             let line: String = chars[start..end].iter().collect();
-            if line.trim_start().starts_with("```") {
-                ignored[start..end].fill(true);
-                in_fence = !in_fence;
-            } else if in_fence {
-                ignored[start..end].fill(true);
-            } else {
-                mark_inline_code(&chars, start, end, &mut ignored);
+            let fence = fence_of(&line);
+            match (open, fence) {
+                (Some((marker, length)), Some((found, run, rest)))
+                    if found == marker && run >= length && rest.trim().is_empty() =>
+                {
+                    ignored[start..end].fill(true);
+                    open = None;
+                }
+                (Some(_), _) => ignored[start..end].fill(true),
+                (None, Some((marker, run, _))) => {
+                    ignored[start..end].fill(true);
+                    open = Some((marker, run));
+                }
+                (None, None) => mark_inline_code(&chars, start, end, &mut ignored),
             }
         }
         Self { chars, ignored }
@@ -249,6 +263,17 @@ mod tests {
     }
 
     #[test]
+    fn a_fence_closes_only_on_the_same_character_and_at_least_the_opening_length() {
+        assert!(ids("~~~\n@Bo hidden\n~~~").is_empty());
+        assert!(ids("~~~\n```\n@Bo hidden\n```\n~~~").is_empty());
+        assert!(ids("```\n~~~\n@Bo hidden\n```").is_empty());
+        assert!(ids("````\n```\n@Bo hidden\n```\n````").is_empty());
+        assert!(ids("```\n@Bo hidden\n```x\n@Bo still hidden").is_empty());
+        assert_eq!(ids("~~~\n@Bo hidden\n~~~\n@Ada shown"), ["a"]);
+        assert_eq!(ids("````\n@Bo hidden\n````\n@Ada shown"), ["a"]);
+    }
+
+    #[test]
     fn a_name_that_is_not_a_member_is_plain_text() {
         assert!(ids("@Zed do this").is_empty());
         assert!(ids("@ Bo").is_empty());
@@ -327,5 +352,28 @@ mod tests {
             offs("@Bo\nthe task is here", "a"),
             [("b".to_owned(), "the task is here".to_owned())]
         );
+    }
+
+    #[test]
+    fn the_shared_vectors_give_the_same_mentions_as_the_ui_mirror() {
+        let vectors: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("../../tests/fixtures/mention-vectors.json"))
+                .unwrap();
+        for vector in vectors {
+            let text = vector["text"].as_str().unwrap();
+            let names = |key: &str| -> Vec<String> {
+                vector[key]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|name| name.as_str().unwrap().to_owned())
+                    .collect()
+            };
+            let members: Vec<Member> = names("members")
+                .iter()
+                .map(|name| member(name, name))
+                .collect();
+            assert_eq!(addressed(text, &members), names("mentions"), "{text:?}");
+        }
     }
 }

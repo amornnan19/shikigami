@@ -52,6 +52,13 @@ pub enum ItemView {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct HandOffView {
+    pub agent_id: String,
+    pub task: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TurnView {
     pub id: String,
     pub agent_id: Option<String>,
@@ -61,6 +68,7 @@ pub struct TurnView {
     pub ended_at: Option<i64>,
     pub kind: String,
     pub from_agent_id: Option<String>,
+    pub hand_offs: Vec<HandOffView>,
     pub user_message: String,
     pub items: Vec<ItemView>,
 }
@@ -544,6 +552,33 @@ fn load_items(connection: &Connection, turn_id: &str) -> rusqlite::Result<(Strin
     ))
 }
 
+fn load_hand_offs(connection: &Connection, turn_id: &str) -> rusqlite::Result<Vec<HandOffView>> {
+    let mut found = Vec::new();
+    for sql in [
+        "SELECT t.agent_id,
+                COALESCE((SELECT m.content FROM messages m
+                          WHERE m.turn_id = t.id AND m.role = 'user' LIMIT 1), '')
+         FROM turns t
+         WHERE t.parent_turn_id = ?1 AND t.kind = 'hand-off' AND t.agent_id IS NOT NULL
+         ORDER BY t.rowid",
+        "SELECT addressed_agent_id, content FROM group_queue
+         WHERE parent_turn_id = ?1 AND kind = 'hand-off'
+         ORDER BY position",
+    ] {
+        let mut statement = connection.prepare(sql)?;
+        let rows = statement.query_map([turn_id], |row| {
+            Ok(HandOffView {
+                agent_id: row.get(0)?,
+                task: row.get(1)?,
+            })
+        })?;
+        for row in rows {
+            found.push(row?);
+        }
+    }
+    Ok(found)
+}
+
 const AGENT_CHAT: &str = "agent_id = ?1 AND group_id IS NULL";
 const GROUP_CHAT: &str = "group_id = ?1";
 
@@ -583,6 +618,7 @@ fn page(
         .into_iter()
         .map(|row| {
             let (user_message, items) = load_items(connection, &row.id)?;
+            let hand_offs = load_hand_offs(connection, &row.id)?;
             Ok(TurnView {
                 id: row.id,
                 agent_id: row.agent_id,
@@ -592,6 +628,7 @@ fn page(
                 ended_at: row.ended_at,
                 kind: row.kind,
                 from_agent_id: row.from_agent_id,
+                hand_offs,
                 user_message,
                 items,
             })
