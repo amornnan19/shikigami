@@ -1,9 +1,12 @@
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Check, Copy } from "lucide-react";
-import { isValidElement, type ReactNode, useState } from "react";
+import { Children, Fragment, isValidElement, type ReactNode, useMemo, useState } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Button } from "@/components/ui/button";
+import { chipClass } from "@/features/agents/colors";
+import type { GroupMember } from "@/features/groups/api";
+import { findMentions } from "@/features/groups/mentions";
 
 function textOf(node: ReactNode): string {
   if (typeof node === "string" || typeof node === "number") return String(node);
@@ -69,6 +72,56 @@ function ImageAsLink({ src, alt }: { src?: string | Blob; alt?: string }) {
   );
 }
 
+export function MentionChip({ member }: { member: GroupMember }) {
+  return (
+    <span
+      data-mention={member.agentId}
+      className={`rounded px-1 py-0.5 text-[0.9em] font-medium ${chipClass(member.color)}`}
+    >
+      @{member.name}
+    </span>
+  );
+}
+
+export function withMentions(text: string, members: GroupMember[]): ReactNode {
+  const found = findMentions(text, members);
+  if (found.length === 0) return text;
+  const parts: ReactNode[] = [];
+  let at = 0;
+  for (const mention of found) {
+    if (mention.start > at) {
+      parts.push(<Fragment key={`text-${at}`}>{text.slice(at, mention.start)}</Fragment>);
+    }
+    parts.push(<MentionChip key={mention.start} member={mention.member} />);
+    at = mention.end;
+  }
+  if (at < text.length) parts.push(<Fragment key={`text-${at}`}>{text.slice(at)}</Fragment>);
+  return parts;
+}
+
+function chipped(children: ReactNode, members: GroupMember[]): ReactNode {
+  return Children.map(children, (child) =>
+    typeof child === "string" ? withMentions(child, members) : child,
+  );
+}
+
+function componentsFor(members: GroupMember[]): Components {
+  if (members.length === 0) return components;
+  return {
+    ...components,
+    p: ({ children }) => <p className="my-2 leading-relaxed">{chipped(children, members)}</p>,
+    li: ({ children }) => <li>{chipped(children, members)}</li>,
+    td: ({ children }) => (
+      <td className="border border-border px-2 py-1">{chipped(children, members)}</td>
+    ),
+    th: ({ children }) => (
+      <th className="border border-border bg-muted px-2 py-1 text-left">
+        {chipped(children, members)}
+      </th>
+    ),
+  };
+}
+
 const components: Components = {
   a: ExternalLink,
   img: ImageAsLink,
@@ -102,10 +155,11 @@ const components: Components = {
   td: ({ children }) => <td className="border border-border px-2 py-1">{children}</td>,
 };
 
-export function Markdown({ text }: { text: string }) {
+export function Markdown({ text, members }: { text: string; members?: GroupMember[] }) {
+  const mapped = useMemo(() => componentsFor(members ?? []), [members]);
   return (
     <div className="min-w-0 break-words">
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
+      <ReactMarkdown remarkPlugins={[remarkGfm]} components={mapped}>
         {text}
       </ReactMarkdown>
     </div>

@@ -98,6 +98,7 @@ export function GroupView({
         running={running}
         runningTurnId={runningTurnId}
         blockedReason={blockedReason}
+        members={group.members}
       />
       <GroupSettingsDialog
         group={group}

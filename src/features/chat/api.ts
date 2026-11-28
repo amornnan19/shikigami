@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 export const MESSAGE_MAX_CHARS = 100_000;
 
 export type TurnStatus = "running" | "completed" | "stopped" | "failed" | "interrupted";
+export type TurnKind = "user" | "hand-off" | "continuation";
 export type StepStatus = "running" | "done" | "stopped" | "failed";
 
 export interface Step {
@@ -30,6 +31,8 @@ export interface Turn {
   error: string | null;
   startedAt: number;
   endedAt: number | null;
+  kind: TurnKind;
+  fromAgentId: string | null;
   userMessage: string;
   items: Item[];
 }

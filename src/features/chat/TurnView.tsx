@@ -1,10 +1,19 @@
-import { Check, ChevronDown, ChevronRight, LoaderCircle, Square, X } from "lucide-react";
+import {
+  ArrowRight,
+  Check,
+  ChevronDown,
+  ChevronRight,
+  LoaderCircle,
+  Square,
+  X,
+} from "lucide-react";
 import { useState } from "react";
 import { AgentAvatar } from "@/features/agents/AgentAvatar";
 import type { GroupMember } from "@/features/groups/api";
+import { splitReply } from "@/features/groups/mentions";
 import { cn } from "@/lib/utils";
 import type { Step, StepStatus, TextItem, Turn } from "./api";
-import { Markdown } from "./Markdown";
+import { Markdown, MentionChip, withMentions } from "./Markdown";
 
 const STATUS_LABEL: Record<StepStatus, string> = {
   running: "Running",
@@ -66,6 +75,29 @@ const FORMER_MEMBER: Pick<GroupMember, "name" | "color"> = {
   color: "slate",
 };
 
+function Reply({ text, turn, members }: { text: string; turn: Turn; members?: GroupMember[] }) {
+  if (!members) return <Markdown text={text} />;
+  return (
+    <>
+      {splitReply(text, members, turn.agentId).map((segment, index) =>
+        segment.type === "text" ? (
+          // biome-ignore lint/suspicious/noArrayIndexKey: segments have no identity of their own
+          <Markdown key={index} text={segment.text} members={members} />
+        ) : (
+          // biome-ignore lint/suspicious/noArrayIndexKey: segments have no identity of their own
+          <div key={index} data-hand-off={segment.member.agentId}>
+            <p className="my-1 flex items-center gap-1.5 text-xs text-muted-foreground">
+              <ArrowRight className="size-3.5" />
+              Handed to <MentionChip member={segment.member} />
+            </p>
+            <Markdown text={segment.text} members={members} />
+          </div>
+        ),
+      )}
+    </>
+  );
+}
+
 export function TurnView({ turn, members }: { turn: Turn; members?: GroupMember[] }) {
   const notices = turn.items.filter((item): item is TextItem => item.type === "notice");
   const steps = turn.items.filter((item): item is Step => item.type === "step");
@@ -77,7 +109,7 @@ export function TurnView({ turn, members }: { turn: Turn; members?: GroupMember[
     <>
       {steps.length > 0 && <Steps steps={steps} />}
       {texts.map((item) => (
-        <Markdown key={item.id} text={item.text} />
+        <Reply key={item.id} text={item.text} turn={turn} members={members} />
       ))}
       {turn.status === "running" && texts.length === 0 && steps.length === 0 && (
         <p role="status" className="animate-pulse text-sm text-muted-foreground">
@@ -91,11 +123,23 @@ export function TurnView({ turn, members }: { turn: Turn; members?: GroupMember[
       )}
     </>
   );
+  const sender = members?.find((member) => member.agentId === turn.fromAgentId);
   return (
     <article className="flex flex-col gap-2">
-      <div className="ml-auto max-w-[80%] rounded-2xl bg-primary px-4 py-2 whitespace-pre-wrap break-words text-primary-foreground">
-        {turn.userMessage}
-      </div>
+      {turn.kind === "continuation" ? (
+        <p className="my-1 text-center text-xs text-muted-foreground">{turn.userMessage}</p>
+      ) : turn.kind === "hand-off" ? (
+        <div className="max-w-[80%] rounded-2xl border border-border bg-muted px-4 py-2 text-sm whitespace-pre-wrap break-words">
+          <span className="block text-xs text-muted-foreground">
+            Task from {sender?.name ?? FORMER_MEMBER.name}
+          </span>
+          {members ? withMentions(turn.userMessage, members) : turn.userMessage}
+        </div>
+      ) : (
+        <div className="ml-auto max-w-[80%] rounded-2xl bg-primary px-4 py-2 whitespace-pre-wrap break-words text-primary-foreground">
+          {members ? withMentions(turn.userMessage, members) : turn.userMessage}
+        </div>
+      )}
       {notices.map((item) => (
         <p key={item.id} className="my-1 text-center text-xs text-muted-foreground">
           {item.text}

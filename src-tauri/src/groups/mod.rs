@@ -1,4 +1,5 @@
 mod folder;
+pub(crate) mod mentions;
 pub(crate) mod store;
 
 use std::ffi::OsString;

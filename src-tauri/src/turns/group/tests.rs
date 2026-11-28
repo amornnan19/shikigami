@@ -174,7 +174,8 @@ impl Fixture {
                         restore_seen: None,
                         now: 50,
                     },
-                ),
+                )
+                .map(|_| ()),
                 None => store::finish_turn(c, &launch.turn_id, &launch.agent_id, status, None, 50),
             })
             .unwrap();
@@ -1393,7 +1394,7 @@ fn an_addressed_agent_that_left_the_group_is_refused_or_re_addressed_to_the_lead
     });
     let refused = fx
         .db
-        .with_connection(|c| begin_in(c, "g", "c", "hi", 5))
+        .with_connection(|c| begin_in(c, "g", "c", "hi", &Origin::user("r"), 5))
         .err()
         .unwrap();
     assert!(matches!(
@@ -1588,3 +1589,5 @@ fn the_hold_is_checked_against_the_agent_the_entry_is_re_addressed_to() {
     fx.registry.release("a");
     assert_eq!(fx.after("b", Some("g"), RunEnd::Finished).len(), 1);
 }
+
+mod flow;

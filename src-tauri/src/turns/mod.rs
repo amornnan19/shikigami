@@ -365,6 +365,7 @@ pub struct GroupRun {
     pub context_changed: bool,
     pub input: String,
     pub folder_notice: Option<String>,
+    pub access: group::AccessLevel,
 }
 
 impl GroupRun {
@@ -527,6 +528,7 @@ fn launch_of_group(
         context_changed: context_stale && begun.stored_context_hash.is_some(),
         input: begun.input,
         folder_notice,
+        access: begun.access,
     };
     let text = run.stdin(&begun.begun.session);
     Some(Launch {
@@ -697,15 +699,17 @@ fn prepare_group(
         return Err(TurnError::shutting_down());
     }
     validate(text)?;
-    let lead = db
-        .with_connection(|connection| group::lead_of(connection, group_id))
+    let addressed = db
+        .with_connection(|connection| group::addressed_agents(connection, group_id, text))
         .map_err(group_begin_error)?;
-    let executable = executable_of(db, dirs, &lead)?;
+    let executable = executable_of(db, dirs, &addressed[0])?;
     let started_at = now_millis();
     let sent = db
         .with_connection(|connection| group::begin_or_queue(connection, group_id, text, started_at))
         .map_err(group_begin_error)?;
-    registry.release(&lead);
+    for agent_id in &addressed {
+        registry.release(agent_id);
+    }
     match sent {
         group::GroupSent::Started(begun) => {
             launch_of_group(registry, dirs, executable, begun, started_at)
@@ -1187,6 +1191,7 @@ pub async fn send_group_message(
     match prepared {
         Prepared::Started(launch) => {
             let turn_id = launch.turn_id.clone();
+            emit_group_queue_changed(&app, &queue_group);
             tauri::async_runtime::spawn(drive(app, launch, Chain::default()));
             Ok(SendResult::Started { turn_id })
         }

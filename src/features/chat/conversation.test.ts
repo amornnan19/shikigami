@@ -10,6 +10,8 @@ function turn(id: string): Conversation["turns"][number] {
     error: null,
     startedAt: 1,
     endedAt: null,
+    kind: "user",
+    fromAgentId: null,
     userMessage: id,
     items: [],
   };

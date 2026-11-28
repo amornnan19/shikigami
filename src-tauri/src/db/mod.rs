@@ -121,7 +121,7 @@ mod tests {
     fn fresh_database_migrates_to_the_latest_version_with_all_tables() {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(dir.path()).unwrap();
-        assert_eq!(schema_version(&db), 7);
+        assert_eq!(schema_version(&db), 8);
         for table in [
             "agents",
             "turns",
@@ -159,7 +159,7 @@ mod tests {
             .unwrap();
         drop(connection);
         let db = Database::open(dir.path()).unwrap();
-        assert_eq!(schema_version(&db), 7);
+        assert_eq!(schema_version(&db), 8);
         assert_eq!(count(&db, "agents"), 1);
         assert_eq!(count(&db, "turns"), 1);
         assert_eq!(count(&db, "settings"), 0);
@@ -170,8 +170,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         drop(Database::open(dir.path()).unwrap());
         let db = Database::open(dir.path()).unwrap();
-        assert_eq!(schema_version(&db), 7);
-        assert_eq!(count(&db, "refinery_schema_history"), 7);
+        assert_eq!(schema_version(&db), 8);
+        assert_eq!(count(&db, "refinery_schema_history"), 8);
     }
 
     #[test]
@@ -279,7 +279,12 @@ mod tests {
             )
             .unwrap(),
             refinery::Migration::unapplied(
-                "V8__broken",
+                "V8__group_hand_offs",
+                include_str!("../../migrations/V8__group_hand_offs.sql"),
+            )
+            .unwrap(),
+            refinery::Migration::unapplied(
+                "V9__broken",
                 "CREATE TABLE probe (x INTEGER); INSERT INTO missing_table VALUES (1);",
             )
             .unwrap(),
@@ -293,7 +298,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         let probe_tables: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE name = 'probe'",
@@ -373,7 +378,12 @@ mod tests {
             )
             .unwrap(),
             refinery::Migration::unapplied(
-                "V8__rebuild_agents",
+                "V8__group_hand_offs",
+                include_str!("../../migrations/V8__group_hand_offs.sql"),
+            )
+            .unwrap(),
+            refinery::Migration::unapplied(
+                "V9__rebuild_agents",
                 "CREATE TABLE agents_new (
                    id TEXT PRIMARY KEY,
                    name TEXT NOT NULL COLLATE NOCASE UNIQUE,
@@ -396,7 +406,7 @@ mod tests {
         let db = Database {
             connection: Mutex::new(connection),
         };
-        assert_eq!(schema_version(&db), 8);
+        assert_eq!(schema_version(&db), 9);
         for table in [
             "agents",
             "turns",
@@ -463,7 +473,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             version_two_database(dir.path(), old);
             let db = Database::open(dir.path()).unwrap();
-            assert_eq!(schema_version(&db), 7);
+            assert_eq!(schema_version(&db), 8);
             assert_eq!(
                 setting(&db, "claude.auth-mode").as_deref(),
                 expected,
@@ -523,7 +533,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         version_three_database(dir.path());
         let db = Database::open(dir.path()).unwrap();
-        assert_eq!(schema_version(&db), 7);
+        assert_eq!(schema_version(&db), 8);
         for table in ["agents", "turns", "messages", "queued_messages", "settings"] {
             assert_eq!(count(&db, table), 1, "{table}");
         }
@@ -585,7 +595,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         version_four_database(dir.path());
         let db = Database::open(dir.path()).unwrap();
-        assert_eq!(schema_version(&db), 7);
+        assert_eq!(schema_version(&db), 8);
         for table in [
             "turns",
             "messages",
@@ -725,7 +735,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         version_five_database(dir.path());
         let db = Database::open(dir.path()).unwrap();
-        assert_eq!(schema_version(&db), 7);
+        assert_eq!(schema_version(&db), 8);
         for (table, rows) in [
             ("agents", 2),
             ("turns", 3),
