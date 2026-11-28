@@ -266,6 +266,7 @@ struct Runner<'a> {
 struct ConfigFiles<'a> {
     settings: &'a Path,
     mcp: &'a Path,
+    config_dir: &'a Path,
 }
 
 struct TempFile(Option<PathBuf>);
@@ -757,6 +758,7 @@ impl Runner<'_> {
                     .filter(|(name, _)| is_allowed_variable(name))
                     .cloned(),
             )
+            .envs(providers::claude_child_environment(files.config_dir))
             .env("PATH", search_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -872,6 +874,10 @@ impl Runner<'_> {
             attempt.failure = Some("Could not start Claude Code.".to_owned());
             return attempt;
         };
+        let Ok(config_dir) = providers::ensure_claude_config_dir(&launch.sandbox.data_dir) else {
+            attempt.failure = Some("Could not start Claude Code.".to_owned());
+            return attempt;
+        };
         let Some(mut command) = self.command(
             launch,
             session,
@@ -881,6 +887,7 @@ impl Runner<'_> {
             ConfigFiles {
                 settings: settings_path,
                 mcp: mcp_path,
+                config_dir: &config_dir,
             },
         ) else {
             attempt.failure = Some("Could not start Claude Code.".to_owned());
@@ -1552,7 +1559,7 @@ mod tests {
         let dropped = [
             "CLAUDE_CODE_USE_BEDROCK",
             "CLAUDECODE",
-            "CLAUDE_CONFIG_DIR",
+            "CLAUDE_CODE_SHELL",
             "GITHUB_TOKEN",
             "AWS_SECRET_ACCESS_KEY",
             "ANTHROPIC_MODEL",
@@ -1574,9 +1581,39 @@ mod tests {
             .collect();
         names.sort_unstable();
         let mut expected: Vec<&str> = allowed.to_vec();
-        expected.push("PATH");
+        expected.extend(["PATH", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_SHELL"]);
         expected.sort_unstable();
         assert_eq!(names, expected);
+    }
+
+    #[tokio::test]
+    async fn the_child_gets_shikigamis_config_dir_and_a_shell_that_reads_no_user_rc() {
+        use std::os::unix::fs::PermissionsExt;
+        let world = World::new();
+        let fixture = world.fixture("basic.jsonl", BASIC);
+        world.install(&recording(
+            &world,
+            &format!(
+                "env > \"{}/env.txt\"\ncat \"{}\"",
+                world.records().display(),
+                fixture.display()
+            ),
+        ));
+        world.set_environment("SHELL", "/bin/zsh");
+        world.set_environment("CLAUDE_CODE_SHELL", "/bin/zsh");
+        world.set_environment("CLAUDE_CONFIG_DIR", "/Users/someone/.claude");
+        world.send("hi", ApiKey::Subscription).await;
+        let text = read(&world, "env.txt");
+        let config_dir = world.data.path().join("claude");
+        for expected in [
+            format!("CLAUDE_CONFIG_DIR={}", config_dir.display()),
+            "SHELL=/bin/bash".to_owned(),
+            "CLAUDE_CODE_SHELL=/bin/bash".to_owned(),
+        ] {
+            assert!(text.lines().any(|line| line == expected), "{expected}");
+        }
+        let mode = fs::metadata(&config_dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
     }
 
     #[tokio::test]

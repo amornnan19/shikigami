@@ -4,8 +4,13 @@ mod search;
 
 pub use probe::is_allowed_variable;
 use probe::ProbeOutput;
+use probe::CONFIG_DIR_VARIABLE;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::ffi::OsString;
+use std::fs;
+use std::io;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -13,6 +18,8 @@ use std::time::Duration;
 pub const CLAUDE_CODE_ID: &str = claude_code::SPEC.id;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const CONFIG_DIR_NAME: &str = "claude";
+const AGENT_SHELL: &str = "/bin/bash";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -47,7 +54,12 @@ pub struct ProviderSpec {
     pub interpret_sign_in: fn(&ProbeOutput) -> SignedIn,
 }
 
-async fn detect(spec: &ProviderSpec, dirs: &[PathBuf], limit: Duration) -> ProviderStatus {
+async fn detect(
+    spec: &ProviderSpec,
+    dirs: &[PathBuf],
+    limit: Duration,
+    config_dir: &Path,
+) -> ProviderStatus {
     let mut status = ProviderStatus {
         id: spec.id,
         name: spec.name,
@@ -72,10 +84,11 @@ async fn detect(spec: &ProviderSpec, dirs: &[PathBuf], limit: Duration) -> Provi
         .and_then(|line| parse_version(line, spec.version_prefix))
         .is_some_and(|version| version >= spec.sign_in_floor);
     if supports_sign_in {
-        status.signed_in = probe::run(&path, spec.sign_in_args, dirs, limit)
-            .await
-            .map(|output| (spec.interpret_sign_in)(&output))
-            .unwrap_or(SignedIn::Unknown);
+        status.signed_in =
+            probe::run_in_config_dir(&path, spec.sign_in_args, dirs, limit, config_dir)
+                .await
+                .map(|output| (spec.interpret_sign_in)(&output))
+                .unwrap_or(SignedIn::Unknown);
     }
     status
 }
@@ -156,8 +169,41 @@ async fn cli_version_within(
     Some(version)
 }
 
-pub async fn claude_status(dirs: &[PathBuf]) -> ProviderStatus {
-    detect(&claude_code::SPEC, dirs, PROBE_TIMEOUT).await
+pub async fn claude_status(dirs: &[PathBuf], config_dir: &Path) -> ProviderStatus {
+    detect(&claude_code::SPEC, dirs, PROBE_TIMEOUT, config_dir).await
+}
+
+pub fn claude_config_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join(CONFIG_DIR_NAME)
+}
+
+pub fn ensure_claude_config_dir(data_dir: &Path) -> io::Result<PathBuf> {
+    let dir = claude_config_dir(data_dir);
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)?;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    Ok(dir)
+}
+
+pub fn claude_child_environment(config_dir: &Path) -> [(&'static str, OsString); 3] {
+    [
+        (
+            probe::CONFIG_DIR_VARIABLE,
+            config_dir.as_os_str().to_owned(),
+        ),
+        ("SHELL", OsString::from(AGENT_SHELL)),
+        ("CLAUDE_CODE_SHELL", OsString::from(AGENT_SHELL)),
+    ]
+}
+
+pub fn claude_sign_in_command(config_dir: &Path) -> String {
+    format!(
+        "{CONFIG_DIR_VARIABLE}='{}' {}",
+        config_dir.to_string_lossy().replace('\'', "'\\''"),
+        claude_code::SPEC.sign_in_hint
+    )
 }
 
 pub fn is_known(id: &str) -> bool {
@@ -216,9 +262,61 @@ mod tests {
 esac"#;
 
     #[tokio::test]
+    async fn the_sign_in_probe_runs_in_the_given_config_dir_with_an_allowlisted_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("env.txt");
+        fake(
+            dir.path(),
+            "claude",
+            &format!(
+                r#"case "$1" in
+  --version) echo "2.1.332 (Claude Code)" ;;
+  auth) /usr/bin/env > {record}; echo '{{"loggedIn": false}}' ;;
+esac"#,
+                record = record.display()
+            ),
+        );
+        std::env::set_var("SHIKIGAMI_PROBE_LEAK", "x");
+        let config_dir = dir.path().join("claude");
+        let status = detect(&claude_code::SPEC, &dirs(&dir), LIMIT, &config_dir).await;
+        assert_eq!(status.signed_in, SignedIn::No);
+        let text = fs::read_to_string(record).unwrap();
+        assert!(text
+            .lines()
+            .any(|line| line == format!("CLAUDE_CONFIG_DIR={}", config_dir.display())));
+        assert!(!text.contains("SHIKIGAMI_PROBE_LEAK"));
+    }
+
+    #[test]
+    fn the_sign_in_command_names_the_config_dir_and_quotes_it() {
+        assert_eq!(
+            claude_sign_in_command(Path::new("/data/it's/claude")),
+            "CLAUDE_CONFIG_DIR='/data/it'\\''s/claude' claude auth login"
+        );
+    }
+
+    #[test]
+    fn the_config_dir_is_created_private_inside_the_data_dir() {
+        let data = tempfile::tempdir().unwrap();
+        let dir = ensure_claude_config_dir(data.path()).unwrap();
+        assert_eq!(dir, data.path().join("claude"));
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(ensure_claude_config_dir(data.path()).is_ok());
+    }
+
+    #[tokio::test]
     async fn missing_executable_is_not_installed() {
         let dir = tempfile::tempdir().unwrap();
-        let status = detect(&claude_code::SPEC, &dirs(&dir), LIMIT).await;
+        let status = detect(
+            &claude_code::SPEC,
+            &dirs(&dir),
+            LIMIT,
+            Path::new("/nonexistent"),
+        )
+        .await;
         assert!(!status.installed);
         assert_eq!(status.path, None);
         assert_eq!(status.version, None);
@@ -230,7 +328,13 @@ esac"#;
     async fn signed_in_claude_is_ready_with_version() {
         let dir = tempfile::tempdir().unwrap();
         fake(dir.path(), "claude", CLAUDE_SIGNED_IN);
-        let status = detect(&claude_code::SPEC, &dirs(&dir), LIMIT).await;
+        let status = detect(
+            &claude_code::SPEC,
+            &dirs(&dir),
+            LIMIT,
+            Path::new("/nonexistent"),
+        )
+        .await;
         assert!(status.installed);
         assert_eq!(status.version.as_deref(), Some("2.1.332 (Claude Code)"));
         assert_eq!(status.signed_in, SignedIn::Yes);
@@ -251,7 +355,13 @@ esac"#;
   auth) echo '{"loggedIn": false}'; exit 1 ;;
 esac"#,
         );
-        let status = detect(&claude_code::SPEC, &dirs(&dir), LIMIT).await;
+        let status = detect(
+            &claude_code::SPEC,
+            &dirs(&dir),
+            LIMIT,
+            Path::new("/nonexistent"),
+        )
+        .await;
         assert!(status.installed);
         assert_eq!(status.signed_in, SignedIn::No);
     }
@@ -261,7 +371,13 @@ esac"#,
         let dir = tempfile::tempdir().unwrap();
         fake(dir.path(), "claude", "exec /bin/sleep 5");
         let started = Instant::now();
-        let status = detect(&claude_code::SPEC, &dirs(&dir), Duration::from_millis(200)).await;
+        let status = detect(
+            &claude_code::SPEC,
+            &dirs(&dir),
+            Duration::from_millis(200),
+            Path::new("/nonexistent"),
+        )
+        .await;
         assert!(started.elapsed() < Duration::from_secs(3));
         assert!(status.installed);
         assert_eq!(status.version, None);
@@ -310,7 +426,13 @@ esac"#,
             ),
         );
         let started = Instant::now();
-        let status = detect(&claude_code::SPEC, &dirs(&dir), KILL_PROBE_LIMIT).await;
+        let status = detect(
+            &claude_code::SPEC,
+            &dirs(&dir),
+            KILL_PROBE_LIMIT,
+            Path::new("/nonexistent"),
+        )
+        .await;
         assert!(started.elapsed() + TIMER_SKEW >= KILL_PROBE_LIMIT);
         assert!(started.elapsed() < KILL_PROBE_LIMIT + LOAD_SLACK);
         assert_eq!(status.version, None);
@@ -444,7 +566,13 @@ esac"#,
             "exec /usr/bin/yes xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
         );
         let started = Instant::now();
-        let status = detect(&claude_code::SPEC, &dirs(&dir), LIMIT).await;
+        let status = detect(
+            &claude_code::SPEC,
+            &dirs(&dir),
+            LIMIT,
+            Path::new("/nonexistent"),
+        )
+        .await;
         assert!(started.elapsed() < Duration::from_secs(4));
         assert_eq!(status.signed_in, SignedIn::Unknown);
     }
@@ -461,7 +589,13 @@ esac"#,
         );
         assert!(std::env::split_paths(&std::env::var_os("PATH").unwrap())
             .all(|entry| !entry.join("fakeinterp").exists()));
-        let status = detect(&claude_code::SPEC, &dirs(&dir), LIMIT).await;
+        let status = detect(
+            &claude_code::SPEC,
+            &dirs(&dir),
+            LIMIT,
+            Path::new("/nonexistent"),
+        )
+        .await;
         assert_eq!(status.version.as_deref(), Some("2.1.332 (Claude Code)"));
         assert_eq!(status.signed_in, SignedIn::Yes);
     }
@@ -480,7 +614,7 @@ esac"#,
                     marker = marker.display()
                 ),
             );
-            let status = detect(spec, &dirs(&dir), LIMIT).await;
+            let status = detect(spec, &dirs(&dir), LIMIT, Path::new("/nonexistent")).await;
             assert!(status.installed);
             assert_eq!(status.version.as_deref(), Some(version));
             assert_eq!(status.signed_in, SignedIn::Unknown, "{name} {version}");
@@ -506,13 +640,25 @@ esac"#,
     async fn garbage_output_gives_unknown() {
         let dir = tempfile::tempdir().unwrap();
         fake(dir.path(), "claude", "echo 'not json at all'");
-        let status = detect(&claude_code::SPEC, &dirs(&dir), LIMIT).await;
+        let status = detect(
+            &claude_code::SPEC,
+            &dirs(&dir),
+            LIMIT,
+            Path::new("/nonexistent"),
+        )
+        .await;
         assert!(status.installed);
         assert_eq!(status.signed_in, SignedIn::Unknown);
 
         let empty = tempfile::tempdir().unwrap();
         fake(empty.path(), "claude", "exit 0");
-        let status = detect(&claude_code::SPEC, &dirs(&empty), LIMIT).await;
+        let status = detect(
+            &claude_code::SPEC,
+            &dirs(&empty),
+            LIMIT,
+            Path::new("/nonexistent"),
+        )
+        .await;
         assert_eq!(status.version, None);
         assert_eq!(status.signed_in, SignedIn::Unknown);
     }
@@ -521,7 +667,13 @@ esac"#,
     async fn status_serialises_in_camel_case() {
         let dir = tempfile::tempdir().unwrap();
         fake(dir.path(), "claude", CLAUDE_SIGNED_IN);
-        let status = detect(&claude_code::SPEC, &dirs(&dir), LIMIT).await;
+        let status = detect(
+            &claude_code::SPEC,
+            &dirs(&dir),
+            LIMIT,
+            Path::new("/nonexistent"),
+        )
+        .await;
         let value = serde_json::to_value(&status).unwrap();
         assert_eq!(value["signedIn"], "yes");
         assert_eq!(value["installHint"], claude_code::SPEC.install_hint);

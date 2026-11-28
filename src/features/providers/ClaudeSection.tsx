@@ -38,8 +38,10 @@ function SignInCommand({ command }: { command: string }) {
   }
 
   return (
-    <div className="flex items-center gap-2">
-      <code className="rounded-md bg-muted px-2 py-1 font-mono text-sm">{command}</code>
+    <div className="flex flex-wrap items-center gap-2">
+      <code className="min-w-0 break-all rounded-md bg-muted px-2 py-1 font-mono text-sm">
+        {command}
+      </code>
       <Button variant="ghost" size="sm" aria-label={`Copy ${command}`} onClick={copy}>
         <Copy />
         {copyState === "copied" && "Copied"}
@@ -100,12 +102,23 @@ function CliStatus({ subscription }: { subscription: ClaudeAuth["subscription"] 
 }
 
 function SubscriptionDetail({ subscription }: { subscription: ClaudeAuth["subscription"] }) {
+  const queryClient = useQueryClient();
   if (subscription.signedIn === "yes") return <span>Signed in</span>;
   if (subscription.signedIn === "no") {
     return (
       <div className="flex flex-col gap-2">
-        <span>Not signed in. Run this command in a terminal:</span>
+        <span>Agents use their own Claude Code sign-in. Run this in Terminal, then come back:</span>
         <SignInCommand command={subscription.signInHint} />
+        <div>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => queryClient.invalidateQueries({ queryKey: CLAUDE_AUTH_KEY })}
+          >
+            <RefreshCw />
+            Check again
+          </Button>
+        </div>
       </div>
     );
   }

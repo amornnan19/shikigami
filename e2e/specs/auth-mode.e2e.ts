@@ -1,5 +1,8 @@
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { $, browser, expect } from "@wdio/globals";
+import { fakeClaudeEnv, fakeClaudeSignedOut } from "../fake-providers";
+import { dataRoot } from "../wdio.shared";
 
 const artifacts = join(import.meta.dirname, "..", "artifacts");
 const claudeCard = 'section[aria-label="Claude"]';
@@ -83,5 +86,45 @@ describe("sign-in choice", () => {
       ),
     );
     await browser.saveScreenshot(join(artifacts, "auth-mode-no-key.png"));
+  });
+
+  it("runs agents with Shikigami's own config dir and a shell that reads no user rc", async () => {
+    await showClaudeSection();
+    await $("#auth-mode-subscription").click();
+    await selectAgent("Follower");
+    await $('textarea[aria-label="Message"]').setValue("env check");
+    await browser.keys("Enter");
+    await expect($('section[aria-label="Agent"]')).toHaveText(expect.stringContaining("pong"), {
+      wait: 20000,
+    });
+    const configDir = join(dataRoot, "auth-mode", "claude");
+    const lines = readFileSync(fakeClaudeEnv, "utf8").trim().split("\n");
+    expect(lines.at(-1)).toBe(
+      `CLAUDE_CONFIG_DIR=${configDir} SHELL=/bin/bash CLAUDE_CODE_SHELL=/bin/bash`,
+    );
+  });
+
+  it("shows the sign-in command for Shikigami's config dir when it is signed out", async () => {
+    writeFileSync(fakeClaudeSignedOut, "");
+    try {
+      await showClaudeSection();
+      const configDir = join(dataRoot, "auth-mode", "claude");
+      await expect($(claudeCard)).toHaveText(
+        expect.stringContaining(
+          "Agents use their own Claude Code sign-in. Run this in Terminal, then come back:",
+        ),
+      );
+      await expect($(claudeCard).$("code")).toHaveText(
+        `CLAUDE_CONFIG_DIR='${configDir}' claude auth login`,
+      );
+      await expect($(`${claudeCard} button[aria-label^="Copy "]`)).toBeDisplayed();
+      await expect($(claudeCard).$("button=Check again")).toBeDisplayed();
+      await browser.saveScreenshot(join(artifacts, "auth-mode-config-dir-sign-in.png"));
+    } finally {
+      rmSync(fakeClaudeSignedOut, { force: true });
+    }
+    await $(claudeCard).$("button=Check again").click();
+    await expect($(claudeCard)).toHaveText(expect.stringContaining("Signed in"));
+    await browser.saveScreenshot(join(artifacts, "auth-mode-config-dir-signed-in.png"));
   });
 });
