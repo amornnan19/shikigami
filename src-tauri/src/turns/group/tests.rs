@@ -8,8 +8,8 @@ use rusqlite::params;
 use super::super::claude_code::{assert_isolated, Session};
 use super::super::runner::{self, ApiKey, RunEnd};
 use super::super::{
-    prepare, prepare_group, resume_group, start_after, start_next_group, Chain, EventSink,
-    Finished, Launch, Prepared, TurnEnvelope, TurnError, TurnRegistry,
+    note_end, prepare, prepare_group, resume, resume_group, start_after, start_next_group, Chain,
+    EventSink, Finished, Launch, Prepared, TurnEnvelope, TurnError, TurnRegistry,
 };
 use super::*;
 use crate::db::Database;
@@ -1163,9 +1163,8 @@ fn a_failure_that_belongs_to_the_agent_starts_nothing_addressed_to_it_in_any_cha
     for group in [None, Some("g")] {
         let fx = Fixture::new();
         fill_queues(&fx);
-        let mut chain = Chain::default();
-        chain.record("a", group, RunEnd::AgentFailed);
-        let launches = fx.after_in("a", group, RunEnd::AgentFailed, &chain);
+        fx.registry.hold("a");
+        let launches = fx.after("a", group, RunEnd::AgentFailed);
         assert!(launches.is_empty(), "{group:?}");
         assert_eq!(started_count(&fx), 0);
         assert_eq!(fx.queue_texts("g"), ["group one", "group two"]);
@@ -1188,14 +1187,12 @@ fn an_agent_failure_in_a_group_still_advances_the_group_when_its_head_is_another
         )
         .unwrap()
     });
-    let mut chain = Chain::default();
-    chain.record("a", Some("g"), RunEnd::AgentFailed);
-    let launches = fx.after_in("a", Some("g"), RunEnd::AgentFailed, &chain);
+    fx.registry.hold("a");
+    let launches = fx.after("a", Some("g"), RunEnd::AgentFailed);
     assert_eq!(launches.len(), 1);
     assert_eq!(launches[0].agent_id, "b");
-    chain.record("b", Some("g"), RunEnd::Finished);
     fx.end(&launches[0], "completed");
-    let next = fx.after_in("b", Some("g"), RunEnd::Finished, &chain);
+    let next = fx.after("b", Some("g"), RunEnd::Finished);
     assert!(next.is_empty(), "the failed agent's entry must not start");
     assert_eq!(fx.queue_texts("g"), ["for ada"]);
 }
@@ -1453,4 +1450,141 @@ fn the_lead_is_resolved_inside_the_begin_transaction() {
         panic!("expected a started turn");
     };
     assert_eq!(begun.agent_id, "b");
+}
+
+#[test]
+fn a_failed_one_to_one_chat_of_another_agent_does_not_skip_this_agents_own_queue() {
+    let fx = Fixture::new();
+    fx.db.with_connection(|c| {
+        c.execute_batch(
+            "INSERT INTO group_queue (id, group_id, addressed_agent_id, content, position, created_at)
+             VALUES ('q1', 'g', 'b', 'for bo', 0, 1), ('q2', 'g', 'a', 'for ada', 1, 1);",
+        )
+        .unwrap()
+    });
+    let mut chain = Chain::default();
+    chain.record("b", None, RunEnd::ChatFailed);
+    let bo_turn = start_next_group(&fx.db, &fx.registry, &fx.dirs(), "g").unwrap();
+    assert_eq!(bo_turn.agent_id, "b");
+    fx.end(&bo_turn, "completed");
+    let hop = fx.after_in("b", Some("g"), RunEnd::Finished, &chain);
+    assert_eq!(hop.len(), 1);
+    assert_eq!(hop[0].agent_id, "a");
+    fx.db.with_connection(|c| {
+        c.execute(
+            "INSERT INTO queued_messages (id, agent_id, content, position, created_at)
+             VALUES ('p', 'a', 'private', 0, 1)",
+            [],
+        )
+        .unwrap()
+    });
+    fx.end(&hop[0], "completed");
+    let after_group = fx.after_in("a", Some("g"), RunEnd::Finished, &chain);
+    assert_eq!(after_group.len(), 1);
+    assert_eq!(after_group[0].agent_id, "a");
+    assert!(after_group[0].group.is_none());
+    assert_eq!(after_group[0].text, "private");
+}
+
+#[test]
+fn resume_releases_the_hold_so_an_old_chain_can_start_the_agents_entry() {
+    let fx = Fixture::new();
+    fx.db
+        .with_connection(|c| c.execute("UPDATE groups SET lead_agent_id = 'b' WHERE id = 'g2'", []))
+        .unwrap();
+    let bo_turn = fx.started("g2", "bo works");
+    fx.db.with_connection(|c| {
+        c.execute(
+            "INSERT INTO group_queue (id, group_id, addressed_agent_id, content, position, created_at)
+             VALUES ('q', 'g2', 'a', 'for ada', 0, 1)",
+            [],
+        )
+        .unwrap()
+    });
+    fx.registry.hold("a");
+    fx.end(&bo_turn, "completed");
+    assert!(fx.after("b", Some("g2"), RunEnd::Finished).is_empty());
+    assert!(resume(&fx.db, &fx.registry, &fx.dirs(), "a")
+        .unwrap()
+        .is_none());
+    assert!(!fx.registry.is_held("a"));
+    let launches = fx.after("b", Some("g2"), RunEnd::Finished);
+    assert_eq!(launches.len(), 1);
+    assert_eq!(launches[0].agent_id, "a");
+    assert_eq!(input(&launches[0]), "User: bo works\n\nfor ada");
+}
+
+#[test]
+fn a_held_agent_is_not_started_by_any_drive() {
+    let fx = Fixture::new();
+    fill_queues(&fx);
+    fx.registry.hold("a");
+    for end in [RunEnd::Finished, RunEnd::ChatFailed, RunEnd::AgentFailed] {
+        for (agent, group) in [
+            ("a", None),
+            ("a", Some("g")),
+            ("b", None),
+            ("b", Some("g")),
+            ("b", Some("g2")),
+        ] {
+            let launches = fx.after(agent, group, end);
+            assert!(
+                launches.iter().all(|launch| launch.agent_id != "a"),
+                "{agent} {group:?} {end:?}"
+            );
+        }
+    }
+    assert_eq!(started_count(&fx), 0);
+}
+
+#[test]
+fn the_hold_follows_the_end_of_a_turn_and_the_users_own_actions() {
+    let fx = Fixture::new();
+    fx.registry.hold("a");
+    note_end(&fx.registry, "a", RunEnd::ChatFailed);
+    assert!(fx.registry.is_held("a"));
+    note_end(&fx.registry, "a", RunEnd::Finished);
+    assert!(!fx.registry.is_held("a"));
+    note_end(&fx.registry, "a", RunEnd::AgentFailed);
+    assert!(fx.registry.is_held("a"));
+    fx.send("g", "from the user").unwrap();
+    assert!(!fx.registry.is_held("a"));
+    fx.registry.hold("a");
+    fx.queued("g", "queued by the user");
+    assert!(!fx.registry.is_held("a"));
+    let fx = Fixture::new();
+    fx.registry.hold("a");
+    fx.chat("a", "private");
+    assert!(!fx.registry.is_held("a"));
+    let fx = Fixture::new();
+    fx.db.with_connection(|c| {
+        c.execute(
+            "INSERT INTO group_queue (id, group_id, addressed_agent_id, content, position, created_at)
+             VALUES ('q', 'g', 'a', 'waiting', 0, 1)",
+            [],
+        )
+        .unwrap()
+    });
+    fx.registry.hold("a");
+    resume_group(&fx.db, &fx.registry, &fx.dirs(), "g").unwrap();
+    assert!(!fx.registry.is_held("a"));
+}
+
+#[test]
+fn the_hold_is_checked_against_the_agent_the_entry_is_re_addressed_to() {
+    let fx = Fixture::new();
+    fx.db.with_connection(|c| {
+        c.execute_batch(
+            "INSERT INTO agents (id, name, color, provider, model, workspace_path, created_at, last_activity_at)
+             VALUES ('c', 'Cy', 'red', 'claude-code', 'haiku', '/c', 1, 1);
+             INSERT INTO group_queue (id, group_id, addressed_agent_id, content, position, created_at)
+             VALUES ('q', 'g', 'c', 'for the one who left', 0, 1);",
+        )
+        .unwrap()
+    });
+    fx.registry.hold("a");
+    assert!(fx.after("b", Some("g"), RunEnd::Finished).is_empty());
+    assert_eq!(fx.queue_texts("g"), ["for the one who left"]);
+    fx.registry.release("a");
+    assert_eq!(fx.after("b", Some("g"), RunEnd::Finished).len(), 1);
 }

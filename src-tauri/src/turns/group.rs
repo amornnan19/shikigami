@@ -293,6 +293,23 @@ pub fn head_agent(connection: &Connection, group_id: &str) -> rusqlite::Result<O
         .optional()
 }
 
+pub fn effective_head(connection: &Connection, group_id: &str) -> rusqlite::Result<Option<String>> {
+    let Some(head) = head_agent(connection, group_id)? else {
+        return Ok(None);
+    };
+    let member: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM group_members WHERE group_id = ?1 AND agent_id = ?2)",
+        params![group_id, head],
+        |row| row.get(0),
+    )?;
+    if member {
+        return Ok(Some(head));
+    }
+    Ok(groups::store::find_row(connection, group_id)?
+        .and_then(|row| row.lead_agent_id)
+        .filter(|lead| *lead != head))
+}
+
 fn advance_in(
     transaction: &Connection,
     group_id: &str,
