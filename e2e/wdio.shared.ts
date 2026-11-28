@@ -6,6 +6,9 @@ import { browser } from "@wdio/globals";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 export const workspacesRoot = join(root, "e2e", "artifacts", "workspaces");
 export const trashDir = join(root, "e2e", "artifacts", "trash");
+export const groupsRoot = join(root, "e2e", "artifacts", "groups");
+export const pickedParent = join(root, "e2e", "artifacts", "group-projects");
+export const pickedFolder = join(pickedParent, "repo");
 export const revealLog = join(root, "e2e", "artifacts", "reveal.log");
 const appBinaryPath = join(root, "src-tauri", "target", "debug", "shikigami");
 

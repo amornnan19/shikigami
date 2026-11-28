@@ -3,6 +3,7 @@ pub mod api_key;
 mod auth;
 mod commands;
 pub mod db;
+mod groups;
 mod providers;
 pub mod secrets;
 mod settings;
@@ -68,6 +69,7 @@ pub fn run() {
     let builder = builder.plugin(tauri_plugin_wdio_webdriver::init());
     builder
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             #[cfg(all(feature = "e2e", target_os = "macos"))]
             if std::env::var_os(E2E_BACKGROUND_ENV).is_some_and(|value| value == "1") {
@@ -93,6 +95,13 @@ pub fn run() {
                 app.path().home_dir().ok(),
                 std::env::var_os(agents::WORKSPACES_DIR_ENV),
             )));
+            app.manage(groups::GroupsConfig {
+                root: groups::resolve_groups_root(
+                    app.path().home_dir().ok().as_deref(),
+                    std::env::var_os(groups::GROUPS_DIR_ENV),
+                ),
+                home: app.path().home_dir().ok(),
+            });
             app.manage(DataDir(data_dir));
             Ok(())
         })
@@ -112,6 +121,12 @@ pub fn run() {
             agents::write_instructions,
             agents::reveal_workspace,
             agents::delete_agent,
+            groups::list_groups,
+            groups::create_group,
+            groups::update_group,
+            groups::delete_group,
+            groups::pick_group_folder,
+            groups::suggest_group_folder,
             turns::send_message,
             turns::get_conversation,
             turns::stop_turn,

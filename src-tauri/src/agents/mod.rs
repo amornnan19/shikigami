@@ -1,8 +1,8 @@
 mod instructions;
-mod remove;
+pub(crate) mod remove;
 mod store;
-mod validate;
-mod workspace;
+pub(crate) mod validate;
+pub(crate) mod workspace;
 
 use std::ffi::OsString;
 use std::fs;
