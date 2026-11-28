@@ -8,8 +8,8 @@ use rusqlite::params;
 use super::super::claude_code::{assert_isolated, Session};
 use super::super::runner::{self, ApiKey};
 use super::super::{
-    prepare, prepare_group, resume_group, start_after, start_next_group, EventSink, Launch,
-    Prepared, TurnEnvelope, TurnError, TurnRegistry,
+    prepare, prepare_group, resume_group, start_after, start_next_group, EventSink, Finished,
+    Launch, Prepared, TurnEnvelope, TurnError, TurnRegistry,
 };
 use super::*;
 use crate::db::Database;
@@ -41,6 +41,7 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let data = tempfile::tempdir().unwrap();
+        let data_path = data.path().to_path_buf();
         let workspaces = tempfile::tempdir().unwrap();
         let folder = tempfile::tempdir().unwrap();
         let other_folder = tempfile::tempdir().unwrap();
@@ -91,7 +92,7 @@ impl Fixture {
             other_folder,
             workspaces,
             db,
-            registry: TurnRegistry::default(),
+            registry: TurnRegistry::with_temp_dir(data_path.join("tmp")),
             sink: Recorder::default(),
         }
     }
@@ -118,6 +119,25 @@ impl Fixture {
         }
     }
 
+    fn after(&self, agent: &str, group: Option<&str>, advance_same_chat: bool) -> Vec<Launch> {
+        start_after(
+            &self.db,
+            &self.registry,
+            &self.dirs(),
+            &Finished {
+                agent_id: agent,
+                group_id: group,
+                advance_same_chat,
+            },
+        )
+    }
+
+    fn after_one(&self, agent: &str, group: Option<&str>) -> Option<Launch> {
+        let mut launches = self.after(agent, group, true);
+        assert!(launches.len() <= 1);
+        launches.pop()
+    }
+
     fn chat(&self, agent: &str, text: &str) -> Prepared {
         prepare(&self.db, &self.registry, &self.dirs(), agent, text).unwrap()
     }
@@ -128,12 +148,15 @@ impl Fixture {
             .with_connection(|c| match &launch.group {
                 Some(group) => super::finish_turn(
                     c,
-                    &launch.turn_id,
-                    &launch.agent_id,
-                    &group.group_id,
-                    status,
-                    None,
-                    50,
+                    &super::Finish {
+                        turn_id: &launch.turn_id,
+                        agent_id: &launch.agent_id,
+                        group_id: &group.group_id,
+                        status,
+                        error: None,
+                        restore_seen: None,
+                        now: 50,
+                    },
                 ),
                 None => store::finish_turn(c, &launch.turn_id, &launch.agent_id, status, None, 50),
             })
@@ -193,7 +216,7 @@ impl Fixture {
         let fixture = self.records.path().join("basic.jsonl");
         fs::write(&fixture, BASIC).unwrap();
         let script = format!(
-            "#!/bin/sh\nn=$(ls \"{records}\" | grep -c '^args' || true)\nfor a in \"$@\"; do printf '%s\\0' \"$a\"; done > \"{records}/args.$n\"\ncat > \"{records}/stdin.$n\"\npwd > \"{records}/pwd.$n\"\n{body}\ncat \"{}\"\n",
+            "#!/bin/sh\ncase \"$1\" in --help) echo '  --system-prompt-snapshot <on|off>'; exit 0;; esac\nn=$(ls \"{records}\" | grep -c '^args' || true)\nfor a in \"$@\"; do printf '%s\\0' \"$a\"; done > \"{records}/args.$n\"\nprev=\"\"; for a in \"$@\"; do if [ \"$prev\" = --append-system-prompt-file ]; then cp \"$a\" \"{records}/prompt.$n\"; stat -f %Lp \"$a\" > \"{records}/mode.$n\"; echo \"$a\" > \"{records}/promptpath.$n\"; fi; prev=\"$a\"; done\ncat > \"{records}/stdin.$n\"\npwd > \"{records}/pwd.$n\"\n{body}\ncat \"{}\"\n",
             fixture.display()
         );
         let claude = self.bin.path().join("claude");
@@ -221,12 +244,22 @@ impl Fixture {
     }
 
     fn args(&self, n: usize) -> Vec<String> {
-        self.record(&format!("args.{n}"))
+        let record = self.record(&format!("args.{n}"));
+        record
+            .strip_suffix('\0')
+            .unwrap_or(&record)
             .split('\0')
-            .filter(|arg| !arg.is_empty())
             .map(str::to_owned)
             .collect()
     }
+}
+
+fn input(launch: &Launch) -> &str {
+    launch
+        .text
+        .split_once(super::MESSAGES_HEADER)
+        .expect("a group turn input has a messages part")
+        .1
 }
 
 fn path_of(text: &str) -> PathBuf {
@@ -239,7 +272,7 @@ fn a_user_message_goes_to_the_lead_and_runs_in_the_group_folder_with_the_group_s
     let launch = fx.started("g", "hello");
     assert_eq!(launch.agent_id, "a");
     assert_eq!(launch.workspace, fx.folder.path());
-    assert_eq!(launch.text, "hello");
+    assert_eq!(input(&launch), "hello");
     assert_eq!(launch.group.as_ref().unwrap().group_id, "g");
     assert!(matches!(launch.session, Session::New(_)));
     assert_eq!(
@@ -300,11 +333,11 @@ fn only_one_turn_runs_per_group_and_the_queue_advances_one_message_at_a_time() {
     assert_eq!(fx.queue_texts("g"), ["two", "three"]);
     assert!(start_next_group(&fx.db, &fx.registry, &fx.dirs(), "g").is_none());
     fx.end(&first, "completed");
-    let second = start_after(&fx.db, &fx.registry, &fx.dirs(), "a", Some("g")).unwrap();
-    assert_eq!(second.text, "two");
+    let second = fx.after_one("a", Some("g")).unwrap();
+    assert_eq!(input(&second), "two");
     assert_eq!(fx.queue_texts("g"), ["three"]);
     assert_eq!(fx.value::<i64>("SELECT COUNT(*) FROM turns", &[]), 2);
-    assert!(start_after(&fx.db, &fx.registry, &fx.dirs(), "a", Some("g")).is_none());
+    assert!(fx.after_one("a", Some("g")).is_none());
     assert_eq!(fx.queue_texts("g"), ["three"]);
 }
 
@@ -317,11 +350,11 @@ fn an_agent_busy_in_its_own_chat_delays_its_group_turn_until_that_turn_ends() {
     assert!(fx.queued("g", "hello group").is_none());
     assert_eq!(fx.queue_texts("g"), ["hello group"]);
     assert_eq!(fx.value::<i64>("SELECT COUNT(*) FROM turns", &[]), 1);
-    assert!(start_after(&fx.db, &fx.registry, &fx.dirs(), "a", None).is_none());
+    assert!(fx.after_one("a", None).is_none());
     fx.end(&own, "completed");
-    let launch = start_after(&fx.db, &fx.registry, &fx.dirs(), "a", None).unwrap();
+    let launch = fx.after_one("a", None).unwrap();
     assert_eq!(launch.group.as_ref().unwrap().group_id, "g");
-    assert_eq!(launch.text, "hello group");
+    assert_eq!(input(&launch), "hello group");
     assert_eq!(launch.workspace, fx.folder.path());
     assert!(fx.queue_texts("g").is_empty());
 }
@@ -334,7 +367,7 @@ fn an_agent_busy_in_another_group_delays_its_turn_in_this_group() {
     assert_eq!(fx.queue_texts("g"), ["hello team"]);
     assert_eq!(fx.queue_texts("g2"), Vec::<String>::new());
     fx.end(&elsewhere, "completed");
-    let launch = start_after(&fx.db, &fx.registry, &fx.dirs(), "a", Some("g2")).unwrap();
+    let launch = fx.after_one("a", Some("g2")).unwrap();
     assert_eq!(launch.group.as_ref().unwrap().group_id, "g");
 }
 
@@ -347,7 +380,7 @@ fn a_one_to_one_message_waits_while_the_agent_works_in_a_group_and_starts_after_
     };
     assert!(launch.is_none());
     fx.end(&group_turn, "completed");
-    let next = start_after(&fx.db, &fx.registry, &fx.dirs(), "a", Some("g")).unwrap();
+    let next = fx.after_one("a", Some("g")).unwrap();
     assert!(next.group.is_none());
     assert_eq!(next.text, "private");
     assert_eq!(
@@ -360,7 +393,7 @@ fn a_one_to_one_message_waits_while_the_agent_works_in_a_group_and_starts_after_
 fn the_input_holds_exactly_the_unseen_messages_in_order_then_the_addressed_message() {
     let fx = Fixture::new();
     let first = fx.started("g", "hello");
-    assert_eq!(first.text, "hello");
+    assert_eq!(input(&first), "hello");
     fx.say(
         "a",
         "g",
@@ -381,10 +414,10 @@ fn the_input_holds_exactly_the_unseen_messages_in_order_then_the_addressed_messa
     fx.bo_turn("tb", "ask Bo", "Bo answers");
     fx.say("b", "g", "tb", "assistant", Some("b"), "");
     let second = fx.started("g", "what now");
-    assert_eq!(second.text, "User: ask Bo\nBo: Bo answers\n\nwhat now");
+    assert_eq!(input(&second), "User: ask Bo\nBo: Bo answers\n\nwhat now");
     fx.end(&second, "completed");
     let third = fx.started("g", "again");
-    assert_eq!(third.text, "again");
+    assert_eq!(input(&third), "again");
 }
 
 #[test]
@@ -406,25 +439,24 @@ fn messages_of_another_group_never_reach_the_input() {
         "secret of the other group",
     );
     let launch = fx.started("g", "hello");
-    assert_eq!(launch.text, "hello");
+    assert_eq!(input(&launch), "hello");
 }
 
 #[test]
-fn last_seen_moves_to_the_addressed_message_at_the_start_and_to_the_agents_own_last_message_at_the_end(
-) {
+fn last_seen_moves_to_the_addressed_message_when_the_turn_starts() {
     let fx = Fixture::new();
     let launch = fx.started("g", "hello");
-    let user_rowid: i64 = fx.value(
-        "SELECT rowid FROM messages WHERE turn_id = ?1 AND role = 'user'",
+    let user_seq: i64 = fx.value(
+        "SELECT seq FROM messages WHERE turn_id = ?1 AND role = 'user'",
         &[&launch.turn_id],
     );
     let seen = || {
         fx.value::<i64>(
-            "SELECT last_seen_rowid FROM agent_group_sessions WHERE agent_id = 'a' AND group_id = 'g'",
+            "SELECT last_seen_seq FROM agent_group_sessions WHERE agent_id = 'a' AND group_id = 'g'",
             &[],
         )
     };
-    assert_eq!(seen(), user_rowid);
+    assert_eq!(seen(), user_seq);
     assert_eq!(
         fx.value::<i64>(
             "SELECT COUNT(*) FROM agent_group_sessions WHERE agent_id = 'b'",
@@ -440,11 +472,11 @@ fn last_seen_at_the_end_reaches_the_agents_own_last_message() {
     let launch = fx.started("g", "hello");
     fx.say("a", "g", &launch.turn_id, "assistant", Some("a"), "one");
     fx.say("a", "g", &launch.turn_id, "assistant", Some("a"), "two");
-    let last: i64 = fx.value("SELECT MAX(rowid) FROM messages", &[]);
+    let last: i64 = fx.value("SELECT MAX(seq) FROM messages", &[]);
     fx.end(&launch, "completed");
     assert_eq!(
         fx.value::<i64>(
-            "SELECT last_seen_rowid FROM agent_group_sessions WHERE agent_id = 'a' AND group_id = 'g'",
+            "SELECT last_seen_seq FROM agent_group_sessions WHERE agent_id = 'a' AND group_id = 'g'",
             &[]
         ),
         last
@@ -489,15 +521,26 @@ fn a_group_session_is_separate_from_the_one_to_one_session_and_from_other_groups
     assert_ne!(other_id, private_id);
 }
 
+const HAND_OFF: &str = "The user and other members write in this chat. To hand a task to another member, start a line with @Name followed by the task.";
+
 #[test]
-fn the_briefing_names_the_group_the_members_with_their_roles_and_the_hand_off_rule() {
+fn the_turn_input_opens_with_the_briefing_and_the_folder_instructions_before_the_messages() {
     let fx = Fixture::new();
+    fs::write(
+        fx.folder.path().join("CLAUDE.md"),
+        "Use tabs.\nPROBE-LINE: zebra\n",
+    )
+    .unwrap();
     let launch = fx.started("g", "hello");
-    let prompt = launch.group.as_ref().unwrap().system_prompt.clone();
     assert_eq!(
-        prompt,
-        "Ada rules\n\nYou are Ada, a member of the group chat \"Team\". Members: Ada (you, lead), Bo. The user and other members write in this chat. To hand a task to another member, start a line with @Name followed by the task."
+        launch.text,
+        format!(
+            "You are Ada, a member of the group chat \"Team\". Members: Ada (you, lead), Bo. {HAND_OFF}\n\nInstructions from the group folder's CLAUDE.md:\nUse tabs.\nPROBE-LINE: zebra{}hello",
+            super::MESSAGES_HEADER
+        )
     );
+    let group = launch.group.as_ref().unwrap();
+    assert_eq!(group.instructions, "Ada rules\n");
     fx.end(&launch, "completed");
     fx.db
         .with_connection(|c| c.execute("UPDATE groups SET lead_agent_id = 'b' WHERE id = 'g'", []))
@@ -511,24 +554,33 @@ fn the_briefing_names_the_group_the_members_with_their_roles_and_the_hand_off_ru
         .unwrap()
     });
     let bo = start_next_group(&fx.db, &fx.registry, &fx.dirs(), "g").unwrap();
-    assert_eq!(
-        bo.group.unwrap().system_prompt,
-        "You are Bo, a member of the group chat \"Team\". Members: Ada, Bo (you, lead). The user and other members write in this chat. To hand a task to another member, start a line with @Name followed by the task."
-    );
+    assert!(bo.text.starts_with(&format!(
+        "You are Bo, a member of the group chat \"Team\". Members: Ada, Bo (you, lead). {HAND_OFF}\n\nInstructions from the group folder's CLAUDE.md:"
+    )));
+    assert_eq!(bo.group.unwrap().instructions, "");
 }
 
 #[test]
-fn an_unreadable_instruction_file_leaves_the_briefing_alone() {
-    assert_eq!(system_prompt("  \n", "brief"), "brief");
-    assert_eq!(system_prompt("rules\n\n", "brief"), "rules\n\nbrief");
+fn a_missing_oversized_or_linked_folder_instructions_file_is_left_out() {
     let fx = Fixture::new();
-    fs::remove_file(fx.workspaces.path().join("Ada").join("CLAUDE.md")).unwrap();
     let launch = fx.started("g", "hello");
-    assert!(launch
-        .group
-        .unwrap()
-        .system_prompt
-        .starts_with("You are Ada,"));
+    assert!(!launch.text.contains("Instructions from the group folder"));
+    fx.end(&launch, "completed");
+    fs::write(
+        fx.folder.path().join("CLAUDE.md"),
+        "x".repeat(super::FOLDER_INSTRUCTIONS_MAX_BYTES as usize + 1),
+    )
+    .unwrap();
+    let big = fx.started("g", "again");
+    assert!(!big.text.contains("Instructions from the group folder"));
+    fx.end(&big, "completed");
+    let secret = fx.workspaces.path().join("secret.txt");
+    fs::write(&secret, "do not leak").unwrap();
+    fs::remove_file(fx.folder.path().join("CLAUDE.md")).unwrap();
+    std::os::unix::fs::symlink(&secret, fx.folder.path().join("CLAUDE.md")).unwrap();
+    let linked = fx.started("g", "third");
+    assert!(!linked.text.contains("do not leak"));
+    assert!(!linked.text.contains("Instructions from the group folder"));
 }
 
 #[tokio::test]
@@ -543,28 +595,41 @@ async fn a_group_turn_runs_in_the_group_folder_isolated_with_the_prompt_and_the_
     let folder = fs::canonicalize(fx.folder.path()).unwrap();
     assert_eq!(path_of(&fx.record("pwd.0")), folder);
     assert_eq!(path_of(&fx.record("pwd.1")), folder);
-    assert_eq!(fx.record("stdin.0"), "hello");
-    assert_eq!(
-        fx.record("stdin.1"),
-        "User: ask Bo\nBo: Bo answers\n\nwhat now"
-    );
+    let stdin = |n: usize| {
+        fx.record(&format!("stdin.{n}"))
+            .split_once(super::MESSAGES_HEADER)
+            .unwrap()
+            .1
+            .to_owned()
+    };
+    assert_eq!(stdin(0), "hello");
+    assert_eq!(stdin(1), "User: ask Bo\nBo: Bo answers\n\nwhat now");
+    assert!(fx
+        .record("stdin.0")
+        .starts_with("You are Ada, a member of the group chat \"Team\"."));
     let args = fx.args(0);
     assert_isolated(&args);
-    assert_eq!(
-        args[args
-            .iter()
-            .position(|arg| arg == "--setting-sources")
-            .unwrap()
-            + 1],
-        "project"
-    );
-    let at = args
+    let sources = args
         .iter()
-        .position(|arg| arg == "--append-system-prompt")
+        .position(|arg| arg == "--setting-sources")
         .unwrap();
-    assert!(args[at + 1].starts_with("Ada rules"));
-    assert!(args[at + 1].contains("You are Ada, a member of the group chat \"Team\"."));
-    assert_eq!(args.len(), at + 2);
+    assert_eq!(args[sources + 1], "");
+    let file = args
+        .iter()
+        .position(|arg| arg == "--append-system-prompt-file")
+        .unwrap();
+    assert_eq!(fx.record("prompt.0"), "Ada rules\n");
+    assert_eq!(fx.record("mode.0").trim(), "600");
+    let path = PathBuf::from(fx.record("promptpath.0").trim());
+    assert_eq!(args[file + 1], path.to_string_lossy());
+    assert!(path.starts_with(fx._data.path().join("tmp")));
+    assert!(!path.exists());
+    assert_eq!(
+        fs::read_dir(fx._data.path().join("tmp")).unwrap().count(),
+        0
+    );
+    assert!(!args.iter().any(|arg| arg == "--append-system-prompt"));
+    assert_eq!(args[args.len() - 2..], ["--system-prompt-snapshot", "off"]);
     assert!(args.contains(&"--session-id".to_owned()));
     let second_args = fx.args(1);
     assert_isolated(&second_args);
@@ -616,17 +681,17 @@ async fn a_group_turn_stores_its_session_and_messages_in_the_group_and_leaves_th
         .with_connection(|c| store::group_conversation(c, "g", None))
         .unwrap();
     assert_eq!(page.turns.len(), 1);
-    assert_eq!(page.turns[0].agent_id, "a");
+    assert_eq!(page.turns[0].agent_id.as_deref(), Some("a"));
     assert_eq!(page.turns[0].user_message, "hello");
     let own = fx
         .db
         .with_connection(|c| store::conversation(c, "a", None))
         .unwrap();
     assert!(own.turns.is_empty());
-    let last_message: i64 = fx.value("SELECT MAX(rowid) FROM messages", &[]);
+    let last_message: i64 = fx.value("SELECT MAX(seq) FROM messages", &[]);
     assert_eq!(
         fx.value::<i64>(
-            "SELECT last_seen_rowid FROM agent_group_sessions WHERE agent_id = 'a'",
+            "SELECT last_seen_seq FROM agent_group_sessions WHERE agent_id = 'a'",
             &[]
         ),
         last_message
@@ -693,7 +758,7 @@ fn an_interrupted_group_turn_leaves_the_queue_waiting_for_resume_and_resume_star
     let launch = resume_group(&fx.db, &fx.registry, &fx.dirs(), "g")
         .unwrap()
         .unwrap();
-    assert_eq!(launch.text, "two");
+    assert_eq!(input(&launch), "two");
     assert_eq!(fx.queue_texts("g"), ["three"]);
     assert!(resume_group(&fx.db, &fx.registry, &fx.dirs(), "g")
         .unwrap()
@@ -756,7 +821,7 @@ fn the_agents_own_partial_messages_of_an_interrupted_turn_are_not_replayed_to_it
     fx.registry.clear(&launch.agent_id, &launch.turn_id);
     assert_eq!(super::super::sweep_interrupted(&fx.db).unwrap(), 1);
     let next = fx.started("g", "again");
-    assert_eq!(next.text, "again");
+    assert_eq!(input(&next), "again");
 }
 
 #[test]
@@ -774,4 +839,272 @@ fn a_member_queued_behind_a_running_turn_of_the_group_does_not_start_beside_it()
     assert!(start_next_group(&fx.db, &fx.registry, &fx.dirs(), "g").is_none());
     assert_eq!(fx.queue_texts("g"), ["for bo"]);
     assert_eq!(fx.value::<i64>("SELECT COUNT(*) FROM turns", &[]), 1);
+}
+
+#[tokio::test]
+async fn a_group_folder_with_project_settings_loads_none_of_them_and_its_instructions_reach_the_turn(
+) {
+    let fx = Fixture::new();
+    fx.install("");
+    fs::create_dir(fx.folder.path().join(".claude")).unwrap();
+    fs::write(
+        fx.folder.path().join(".claude").join("settings.json"),
+        r#"{"hooks":{"PreToolUse":[{"matcher":"","hooks":[{"type":"command","command":"touch hooked"}]}]},"apiKeyHelper":"echo key"}"#,
+    )
+    .unwrap();
+    fs::write(
+        fx.folder.path().join("CLAUDE.md"),
+        "PROBE-LINE: zebra-quartz-4471\n",
+    )
+    .unwrap();
+    let launch = fx.started("g", "hello");
+    fx.run(launch).await;
+    let args = fx.args(0);
+    assert_isolated(&args);
+    let at = args
+        .iter()
+        .position(|arg| arg == "--setting-sources")
+        .unwrap();
+    assert_eq!(args[at + 1], "");
+    assert!(!args.iter().any(|arg| arg == "project"));
+    let stdin = fx.record("stdin.0");
+    assert!(stdin.contains("PROBE-LINE: zebra-quartz-4471"));
+    assert!(stdin.ends_with("hello"));
+}
+
+#[tokio::test]
+async fn a_turn_that_fails_before_the_cli_read_its_input_restores_the_watermark() {
+    for failure in ["folder", "spawn", "key"] {
+        let fx = Fixture::new();
+        fx.install("");
+        let first = fx.started("g", "hello");
+        fx.run(first).await;
+        fx.bo_turn("tb", "ask Bo", "Bo answers");
+        let seen = || {
+            fx.value::<i64>(
+                "SELECT last_seen_seq FROM agent_group_sessions WHERE agent_id = 'a' AND group_id = 'g'",
+                &[],
+            )
+        };
+        let before = seen();
+        let mut launch = fx.started("g", "will fail");
+        assert!(seen() > before);
+        let mut key = ApiKey::Subscription;
+        match failure {
+            "folder" => launch.workspace = fx.folder.path().join("gone"),
+            "spawn" => launch.executable = fx.bin.path().join("missing"),
+            _ => key = ApiKey::Missing,
+        }
+        launch
+            .search_dirs
+            .extend(["/usr/bin".into(), "/bin".into()]);
+        runner::run(&fx.db, &fx.sink, &fx.registry, launch, key).await;
+        assert_eq!(
+            fx.value::<String>("SELECT status FROM turns ORDER BY rowid DESC LIMIT 1", &[]),
+            "failed",
+            "{failure}"
+        );
+        assert_eq!(seen(), before, "{failure}");
+        let retry = fx.started("g", "again");
+        assert_eq!(
+            input(&retry),
+            "User: ask Bo\nBo: Bo answers\nUser: will fail\n\nagain",
+            "{failure}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_turn_that_got_as_far_as_the_session_start_keeps_the_watermark_when_it_fails_later() {
+    let fx = Fixture::new();
+    fx.install(&format!(
+        "head -n 1 \"{}/basic.jsonl\"; exit 3",
+        fx.records.path().display()
+    ));
+    let launch = fx.started("g", "hello");
+    let turn_id = launch.turn_id.clone();
+    fx.run(launch).await;
+    assert_eq!(
+        fx.value::<String>("SELECT status FROM turns WHERE id = ?1", &[&turn_id]),
+        "failed"
+    );
+    let retry = fx.started("g", "again");
+    assert_eq!(input(&retry), "again");
+}
+
+#[test]
+fn when_a_turn_ends_the_group_and_the_freed_agent_each_start_what_can_start() {
+    let fx = Fixture::new();
+    let running = fx.started("g", "lead works");
+    fx.db.with_connection(|c| {
+        c.execute(
+            "INSERT INTO group_queue (id, group_id, addressed_agent_id, content, position, created_at)
+             VALUES ('q', 'g', 'b', 'for bo', 0, 1)",
+            [],
+        )
+        .unwrap()
+    });
+    let Prepared::Queued { launch: None, .. } = fx.chat("a", "own work") else {
+        panic!("the busy lead queues its own work");
+    };
+    fx.end(&running, "completed");
+    let launches = fx.after("a", Some("g"), true);
+    let mut started: Vec<(String, bool)> = launches
+        .iter()
+        .map(|launch| (launch.agent_id.clone(), launch.group.is_some()))
+        .collect();
+    started.sort();
+    assert_eq!(started, [("a".to_owned(), false), ("b".to_owned(), true)]);
+    assert!(fx.queue_texts("g").is_empty());
+}
+
+#[test]
+fn a_group_entry_blocked_on_another_agent_does_not_hold_back_the_freed_agents_own_work() {
+    let fx = Fixture::new();
+    let Prepared::Started(_ada_busy) = fx.chat("a", "ada busy") else {
+        panic!("expected a started turn");
+    };
+    fx.db
+        .with_connection(|c| c.execute("UPDATE groups SET lead_agent_id = 'b' WHERE id = 'g2'", []))
+        .unwrap();
+    let bo_turn = fx.started("g2", "bo works");
+    let Prepared::Queued { launch: None, .. } = fx.chat("b", "bo own") else {
+        panic!("a busy agent queues");
+    };
+    fx.db.with_connection(|c| {
+        c.execute(
+            "INSERT INTO group_queue (id, group_id, addressed_agent_id, content, position, created_at)
+             VALUES ('q', 'g', 'a', 'for ada', 0, 1)",
+            [],
+        )
+        .unwrap()
+    });
+    fx.end(&bo_turn, "completed");
+    let launches = fx.after("b", Some("g2"), true);
+    assert_eq!(launches.len(), 1);
+    assert_eq!(launches[0].agent_id, "b");
+    assert!(launches[0].group.is_none());
+    assert_eq!(fx.queue_texts("g"), ["for ada"]);
+}
+
+#[test]
+fn a_failure_before_the_spawn_does_not_freeze_the_other_chats_waiting_on_the_agent() {
+    let fx = Fixture::new();
+    let failing = fx.started("g", "will fail");
+    let Prepared::Queued { launch: None, .. } = fx.chat("a", "own work") else {
+        panic!("a busy agent queues");
+    };
+    fx.queued("g", "next in g");
+    fx.end(&failing, "failed");
+    let launches = fx.after("a", Some("g"), false);
+    assert_eq!(launches.len(), 1);
+    assert!(launches[0].group.is_none());
+    assert_eq!(input_or_text(&launches[0]), "own work");
+    assert_eq!(fx.queue_texts("g"), ["next in g"]);
+}
+
+#[test]
+fn a_failed_own_chat_still_lets_a_waiting_group_message_start() {
+    let fx = Fixture::new();
+    let Prepared::Started(own) = fx.chat("a", "private") else {
+        panic!("expected a started turn");
+    };
+    fx.queued("g", "waiting in g");
+    fx.chat("a", "next private");
+    fx.end(&own, "failed");
+    let launches = fx.after("a", None, false);
+    assert_eq!(launches.len(), 1);
+    assert_eq!(launches[0].group.as_ref().unwrap().group_id, "g");
+    let queued: i64 = fx.value("SELECT COUNT(*) FROM queued_messages", &[]);
+    assert_eq!(queued, 1);
+}
+
+fn input_or_text(launch: &Launch) -> &str {
+    if launch.group.is_some() {
+        input(launch)
+    } else {
+        &launch.text
+    }
+}
+
+#[tokio::test]
+async fn deleting_an_agent_keeps_its_group_history_and_removes_its_private_chat() {
+    let fx = Fixture::new();
+    fx.install("");
+    let Prepared::Started(private) = fx.chat("a", "private") else {
+        panic!("expected a started turn");
+    };
+    fx.run(private).await;
+    let launch = fx.started("g", "hello");
+    fx.run(launch).await;
+    fx.db.with_connection(|c| {
+        c.execute(
+            "INSERT INTO queued_messages (id, agent_id, content, position, created_at)
+             VALUES ('qp', 'a', 'queued private', 0, 1)",
+            [],
+        )
+        .unwrap()
+    });
+    fx.db.with_connection(|c| {
+        c.execute_batch(
+            "INSERT INTO group_queue (id, group_id, addressed_agent_id, content, position, created_at)
+             VALUES ('qa', 'g', 'a', 'for ada', 0, 1), ('qb', 'g', 'b', 'for bo', 1, 1);",
+        )
+        .unwrap()
+    });
+    crate::agents::remove::delete(&fx.db, &Err(String::new()), "a", false, &|_| Ok(())).unwrap();
+    assert_eq!(
+        fx.value::<i64>("SELECT COUNT(*) FROM turns WHERE group_id IS NULL", &[]),
+        0
+    );
+    assert_eq!(
+        fx.value::<i64>("SELECT COUNT(*) FROM queued_messages", &[]),
+        0
+    );
+    assert_eq!(
+        fx.value::<i64>("SELECT COUNT(*) FROM messages WHERE group_id IS NULL", &[]),
+        0
+    );
+    assert_eq!(
+        fx.value::<i64>(
+            "SELECT COUNT(*) FROM turns WHERE group_id = 'g' AND agent_id IS NULL",
+            &[]
+        ),
+        1
+    );
+    assert_eq!(
+        fx.value::<i64>(
+            "SELECT COUNT(*) FROM messages WHERE group_id = 'g' AND agent_id IS NULL AND author_agent_id IS NULL",
+            &[]
+        ),
+        fx.value::<i64>("SELECT COUNT(*) FROM messages WHERE group_id = 'g'", &[])
+    );
+    assert_eq!(
+        fx.value::<String>(
+            "SELECT content FROM messages WHERE role = 'assistant' AND group_id = 'g'",
+            &[]
+        ),
+        "pong"
+    );
+    let page = fx
+        .db
+        .with_connection(|c| store::group_conversation(c, "g", None))
+        .unwrap();
+    assert_eq!(page.turns.len(), 1);
+    assert_eq!(page.turns[0].agent_id, None);
+    assert_eq!(page.turns[0].user_message, "hello");
+    assert_eq!(
+        fx.value::<String>(
+            "SELECT addressed_agent_id FROM group_queue WHERE id = 'qa'",
+            &[]
+        ),
+        "b"
+    );
+    assert_eq!(fx.queue_texts("g"), ["for ada", "for bo"]);
+    crate::agents::remove::delete(&fx.db, &Err(String::new()), "b", false, &|_| Ok(())).unwrap();
+    assert!(fx.queue_texts("g").is_empty());
+    assert_eq!(
+        fx.value::<i64>("SELECT COUNT(*) FROM turns WHERE group_id = 'g'", &[]),
+        1
+    );
 }

@@ -4,7 +4,9 @@ mod search;
 
 use probe::ProbeOutput;
 use serde::Serialize;
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 pub const CLAUDE_CODE_ID: &str = claude_code::SPEC.id;
@@ -86,6 +88,29 @@ fn parse_version(line: &str, prefix: &str) -> Option<[u32; 3]> {
         digits.parse().ok()
     };
     Some([next()?, next()?, next()?])
+}
+
+static FLAG_SUPPORT: OnceLock<Mutex<HashMap<(PathBuf, String), bool>>> = OnceLock::new();
+
+pub async fn help_lists_flag(executable: &Path, dirs: &[PathBuf], flag: &str) -> bool {
+    let cache = FLAG_SUPPORT.get_or_init(Mutex::default);
+    let key = (executable.to_path_buf(), flag.to_owned());
+    let known = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&key)
+        .copied();
+    if let Some(listed) = known {
+        return listed;
+    }
+    let listed = probe::run(executable, &["--help"], dirs, PROBE_TIMEOUT)
+        .await
+        .is_some_and(|output| output.stdout.contains(flag));
+    cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key, listed);
+    listed
 }
 
 pub async fn claude_status(dirs: &[PathBuf]) -> ProviderStatus {
@@ -206,6 +231,7 @@ esac"#,
 
     const KILL_PROBE_LIMIT: Duration = Duration::from_secs(4);
     const LOAD_SLACK: Duration = Duration::from_secs(10);
+    const TIMER_SKEW: Duration = Duration::from_millis(50);
 
     fn read_pid(path: &Path) -> Option<i32> {
         fs::read_to_string(path).ok()?.trim().parse().ok()
@@ -242,7 +268,7 @@ esac"#,
         );
         let started = Instant::now();
         let status = detect(&claude_code::SPEC, &dirs(&dir), KILL_PROBE_LIMIT).await;
-        assert!(started.elapsed() >= KILL_PROBE_LIMIT);
+        assert!(started.elapsed() + TIMER_SKEW >= KILL_PROBE_LIMIT);
         assert!(started.elapsed() < KILL_PROBE_LIMIT + LOAD_SLACK);
         assert_eq!(status.version, None);
         let pids = [
@@ -256,6 +282,25 @@ esac"#,
         for pid in pids {
             assert!(!process_exists(pid), "process {pid} is still running");
         }
+    }
+
+    #[tokio::test]
+    async fn a_flag_is_listed_when_the_help_names_it_and_the_answer_is_read_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = dir.path().join("calls");
+        fake(
+            dir.path(),
+            "claude",
+            &format!(
+                "echo x >> {}\necho '  --system-prompt-snapshot <on|off>'",
+                counter.display()
+            ),
+        );
+        let path = dir.path().join("claude");
+        assert!(help_lists_flag(&path, &dirs(&dir), "--system-prompt-snapshot").await);
+        assert!(help_lists_flag(&path, &dirs(&dir), "--system-prompt-snapshot").await);
+        assert!(!help_lists_flag(&path, &dirs(&dir), "--other-flag").await);
+        assert_eq!(fs::read_to_string(counter).unwrap().lines().count(), 2);
     }
 
     #[tokio::test]

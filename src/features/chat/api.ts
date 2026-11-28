@@ -25,7 +25,7 @@ export type Item = Step | TextItem;
 
 export interface Turn {
   id: string;
-  agentId: string;
+  agentId: string | null;
   status: TurnStatus;
   error: string | null;
   startedAt: number;

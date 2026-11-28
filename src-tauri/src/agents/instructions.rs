@@ -76,20 +76,24 @@ fn open_regular(path: &Path) -> Result<Option<(File, fs::Metadata)>, AgentError>
 }
 
 pub fn read(folder: &Path) -> Result<Instructions, AgentError> {
+    read_up_to(folder, MAX_BYTES)
+}
+
+pub fn read_up_to(folder: &Path, limit: u64) -> Result<Instructions, AgentError> {
     let Some((file, metadata)) = open_regular(&path_in(folder))? else {
         return Ok(Instructions {
             text: String::new(),
             modified_at: None,
         });
     };
-    if metadata.len() > MAX_BYTES {
+    if metadata.len() > limit {
         return Err(too_large());
     }
     let mut bytes = Vec::new();
-    file.take(MAX_BYTES + 1)
+    file.take(limit + 1)
         .read_to_end(&mut bytes)
         .map_err(io_failed)?;
-    if bytes.len() as u64 > MAX_BYTES {
+    if bytes.len() as u64 > limit {
         return Err(too_large());
     }
     let text = String::from_utf8(bytes).map_err(|_| {

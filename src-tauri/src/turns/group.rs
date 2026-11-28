@@ -15,6 +15,7 @@ pub struct GroupBegun {
     pub members: Vec<Member>,
     pub lead_agent_id: Option<String>,
     pub input: String,
+    pub previous_seen: i64,
 }
 
 pub enum GroupSent {
@@ -80,7 +81,7 @@ fn session_of(
         params![agent_id, group_id],
     )?;
     let (stored, last_seen): (Option<String>, i64) = connection.query_row(
-        "SELECT provider_session_id, last_seen_rowid FROM agent_group_sessions
+        "SELECT provider_session_id, last_seen_seq FROM agent_group_sessions
          WHERE agent_id = ?1 AND group_id = ?2",
         params![agent_id, group_id],
         |row| Ok((row.get(0)?, row.get(1)?)),
@@ -109,10 +110,10 @@ fn unseen_lines(
     let mut statement = connection.prepare(
         "SELECT m.role, m.content, a.name FROM messages m
          LEFT JOIN agents a ON a.id = m.author_agent_id
-         WHERE m.group_id = ?1 AND m.rowid > ?3 AND m.role IN ('user', 'assistant')
+         WHERE m.group_id = ?1 AND m.seq > ?3 AND m.role IN ('user', 'assistant')
            AND m.author_agent_id IS NOT ?2
            AND m.content <> ''
-         ORDER BY m.rowid",
+         ORDER BY m.seq",
     )?;
     let rows = statement.query_map(params![group_id, agent_id, after_rowid], |row| {
         let role: String = row.get(0)?;
@@ -168,11 +169,15 @@ fn begin_in(
             now
         ],
     )?;
-    let message_rowid = transaction.last_insert_rowid();
+    let message_seq: i64 = transaction.query_row(
+        "SELECT seq FROM messages WHERE rowid = last_insert_rowid()",
+        [],
+        |row| row.get(0),
+    )?;
     transaction.execute(
-        "UPDATE agent_group_sessions SET last_seen_rowid = MAX(last_seen_rowid, ?3)
+        "UPDATE agent_group_sessions SET last_seen_seq = MAX(last_seen_seq, ?3)
          WHERE agent_id = ?1 AND group_id = ?2",
-        params![addressed, group_id, message_rowid],
+        params![addressed, group_id, message_seq],
     )?;
     transaction.execute(
         "UPDATE agents SET last_activity_at = ?2 WHERE id = ?1",
@@ -195,6 +200,7 @@ fn begin_in(
         members: facts.members,
         lead_agent_id: facts.lead_agent_id,
         input: compose_input(&unseen, text),
+        previous_seen: last_seen,
     })
 }
 
@@ -376,24 +382,42 @@ pub fn set_session(
     Ok(())
 }
 
-pub fn finish_turn(
-    connection: &Connection,
-    turn_id: &str,
-    agent_id: &str,
-    group_id: &str,
-    status: &str,
-    error: Option<&str>,
-    now: i64,
-) -> rusqlite::Result<()> {
+pub struct Finish<'a> {
+    pub turn_id: &'a str,
+    pub agent_id: &'a str,
+    pub group_id: &'a str,
+    pub status: &'a str,
+    pub error: Option<&'a str>,
+    pub restore_seen: Option<i64>,
+    pub now: i64,
+}
+
+pub fn finish_turn(connection: &Connection, finish: &Finish) -> rusqlite::Result<()> {
+    let Finish {
+        turn_id,
+        agent_id,
+        group_id,
+        status,
+        error,
+        restore_seen,
+        now,
+    } = *finish;
     let transaction = connection.unchecked_transaction()?;
     store::finish_turn_rows(&transaction, turn_id, agent_id, status, error, now)?;
-    transaction.execute(
-        "UPDATE agent_group_sessions
-         SET last_seen_rowid = MAX(last_seen_rowid, COALESCE(
-               (SELECT MAX(rowid) FROM messages WHERE turn_id = ?3 AND author_agent_id = ?1), 0))
-         WHERE agent_id = ?1 AND group_id = ?2",
-        params![agent_id, group_id, turn_id],
-    )?;
+    match restore_seen {
+        Some(previous) => transaction.execute(
+            "UPDATE agent_group_sessions SET last_seen_seq = ?3
+             WHERE agent_id = ?1 AND group_id = ?2",
+            params![agent_id, group_id, previous],
+        )?,
+        None => transaction.execute(
+            "UPDATE agent_group_sessions
+             SET last_seen_seq = MAX(last_seen_seq, COALESCE(
+                   (SELECT MAX(seq) FROM messages WHERE turn_id = ?3 AND author_agent_id = ?1), 0))
+             WHERE agent_id = ?1 AND group_id = ?2",
+            params![agent_id, group_id, turn_id],
+        )?,
+    };
     transaction.execute(
         "UPDATE groups SET last_activity_at = ?2 WHERE id = ?1",
         params![group_id, now],
@@ -406,14 +430,19 @@ pub fn running_turn_agent(
     group_id: &str,
     turn_id: &str,
 ) -> rusqlite::Result<Option<String>> {
-    connection
+    Ok(connection
         .query_row(
             "SELECT agent_id FROM turns WHERE id = ?1 AND group_id = ?2",
             params![turn_id, group_id],
-            |row| row.get(0),
+            |row| row.get::<_, Option<String>>(0),
         )
-        .optional()
+        .optional()?
+        .flatten())
 }
+
+pub const FOLDER_INSTRUCTIONS_MAX_BYTES: u64 = 64 * 1024;
+
+pub const MESSAGES_HEADER: &str = "\n\nMessages:\n";
 
 pub fn briefing(begun: &GroupBegun) -> String {
     let agent_id = begun.agent_id.as_str();
@@ -443,12 +472,14 @@ pub fn briefing(begun: &GroupBegun) -> String {
     )
 }
 
-pub fn system_prompt(instructions: &str, briefing: &str) -> String {
-    if instructions.trim().is_empty() {
-        briefing.to_owned()
-    } else {
-        format!("{}\n\n{briefing}", instructions.trim_end())
+pub fn turn_input(begun: &GroupBegun, folder_instructions: &str) -> String {
+    let mut context = briefing(begun);
+    let folder_text = folder_instructions.trim();
+    if !folder_text.is_empty() {
+        context.push_str("\n\nInstructions from the group folder's CLAUDE.md:\n");
+        context.push_str(folder_text);
     }
+    format!("{context}{MESSAGES_HEADER}{}", begun.input)
 }
 
 #[cfg(test)]

@@ -39,6 +39,7 @@ export function prepareFakeProviders() {
 PATH="$PATH:/usr/bin:/bin"
 dir="\${0%/*}"
 case "$1" in
+  --help) echo "  --system-prompt-snapshot <on|off>" ;;
   --version) read -r version < "$dir/claude-version"; echo "$version" ;;
   auth) echo '{"loggedIn": true}' ;;
   -p)
@@ -46,13 +47,14 @@ case "$1" in
     prompt=""
     take=0
     for arg in "$@"; do
-      if [ "$take" = 1 ]; then prompt="$arg"; take=0; continue; fi
-      if [ "$arg" = "--append-system-prompt" ]; then take=1; continue; fi
+      if [ "$take" = 1 ]; then prompt=$(cat "$arg"); take=0; continue; fi
+      if [ "$arg" = "--append-system-prompt-file" ]; then take=1; safe="$safe $arg"; continue; fi
       safe="$safe $arg"
     done
     echo "$safe" >> "$dir/invocations.log"
     case "$safe " in
       *" --setting-sources project --strict-mcp-config --permission-mode manual --permission-prompts none "*) ;;
+      *" --setting-sources  --strict-mcp-config --permission-mode manual --permission-prompts none "*) ;;
       *) echo "Claude Code was not started isolated." >&2; exit 2 ;;
     esac
     case "$safe" in

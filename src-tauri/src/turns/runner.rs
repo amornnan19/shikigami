@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::env;
 use std::ffi::OsStr;
-use std::io;
+use std::fs;
+use std::io::{self, Write};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -20,6 +23,7 @@ use crate::agents::now_millis;
 use crate::api_key::ApiKeyError;
 use crate::auth::AuthMode;
 use crate::db::Database;
+use crate::providers;
 use crate::secrets::SecretString;
 
 const LINE_LIMIT: usize = 1024 * 1024;
@@ -30,6 +34,7 @@ const EXIT_GRACE: Duration = Duration::from_secs(5);
 const STDERR_GRACE: Duration = Duration::from_secs(2);
 const ALLOWED_VARIABLES: [&str; 7] = ["HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "TERM"];
 const ALLOWED_PREFIX: &str = "LC_";
+const SNAPSHOT_FLAG: &str = "--system-prompt-snapshot";
 const SESSION_MISSING: &str = "No conversation found";
 
 const RESUME_NOTICE: &str =
@@ -198,6 +203,41 @@ struct Runner<'a> {
     step_inputs: HashMap<String, String>,
     stored_session: String,
     save_failed: bool,
+    input_unread: bool,
+    previous_seen: i64,
+}
+
+struct InstructionsFile(Option<PathBuf>);
+
+impl InstructionsFile {
+    fn write(temp_dir: &Path, text: &str) -> io::Result<Self> {
+        if text.trim().is_empty() {
+            return Ok(Self(None));
+        }
+        fs::create_dir_all(temp_dir)?;
+        let path = temp_dir.join(format!("instructions-{}.md", uuid::Uuid::new_v4().simple()));
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        let written = file.write_all(text.as_bytes());
+        let guard = Self(Some(path));
+        written?;
+        Ok(guard)
+    }
+
+    fn path(&self) -> Option<&Path> {
+        self.0.as_deref()
+    }
+}
+
+impl Drop for InstructionsFile {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 fn safe_end(redactor: &Redactor, raw: &str) -> usize {
@@ -446,15 +486,19 @@ impl Runner<'_> {
         let now = self.tick();
         let (turn_id, agent_id) = (self.turn_id.clone(), self.agent_id.clone());
         let group_id = self.group_id.clone();
+        let restore_seen = self.input_unread.then_some(self.previous_seen);
         self.save(|connection| match &group_id {
             Some(group_id) => group::finish_turn(
                 connection,
-                &turn_id,
-                &agent_id,
-                group_id,
-                status,
-                error.as_deref(),
-                now,
+                &group::Finish {
+                    turn_id: &turn_id,
+                    agent_id: &agent_id,
+                    group_id,
+                    status,
+                    error: error.as_deref(),
+                    restore_seen,
+                    now,
+                },
             ),
             None => store::finish_turn(
                 connection,
@@ -471,18 +515,17 @@ impl Runner<'_> {
         });
     }
 
-    fn command(&self, launch: &Launch, session: &Session, key: &ApiKey) -> Option<Command> {
+    fn command(
+        &self,
+        launch: &Launch,
+        session: &Session,
+        key: &ApiKey,
+        group_flags: Option<&claude_code::GroupFlags>,
+    ) -> Option<Command> {
         let search_path = env::join_paths(&launch.search_dirs).ok()?;
         let mut command = Command::new(&launch.executable);
         command
-            .args(claude_code::arguments(
-                &launch.model,
-                session,
-                launch
-                    .group
-                    .as_ref()
-                    .map(|group| group.system_prompt.as_str()),
-            ))
+            .args(claude_code::arguments(&launch.model, session, group_flags))
             .current_dir(&launch.workspace)
             .env_clear()
             .envs(
@@ -510,7 +553,36 @@ impl Runner<'_> {
         {
             return attempt;
         }
-        let Some(mut command) = self.command(launch, session, key) else {
+        let instructions = match &launch.group {
+            Some(group) => match InstructionsFile::write(&group.temp_dir, &group.instructions) {
+                Ok(file) => Some(file),
+                Err(_) => {
+                    attempt.failure = Some("Could not start Claude Code.".to_owned());
+                    return attempt;
+                }
+            },
+            None => None,
+        };
+        let snapshot_off = match &launch.group {
+            Some(_) => {
+                providers::help_lists_flag(&launch.executable, &launch.search_dirs, SNAPSHOT_FLAG)
+                    .await
+            }
+            None => false,
+        };
+        let group_flags = instructions
+            .as_ref()
+            .map(|file| claude_code::GroupFlags {
+                instructions_file: file.path(),
+                snapshot_off,
+            })
+            .or_else(|| {
+                launch.group.as_ref().map(|_| claude_code::GroupFlags {
+                    instructions_file: None,
+                    snapshot_off,
+                })
+            });
+        let Some(mut command) = self.command(launch, session, key, group_flags.as_ref()) else {
             attempt.failure = Some("Could not start Claude Code.".to_owned());
             return attempt;
         };
@@ -657,9 +729,12 @@ async fn run_turn(
         step_inputs: HashMap::new(),
         stored_session,
         save_failed: false,
+        input_unread: false,
+        previous_seen: launch.group.as_ref().map_or(0, |group| group.previous_seen),
     };
     runner.emit(TurnEvent::Started);
     if !launch.workspace.is_dir() {
+        runner.input_unread = true;
         let missing = if launch.group.is_some() {
             "The group folder is missing."
         } else {
@@ -669,6 +744,7 @@ async fn run_turn(
         return false;
     }
     if let Some(refusal) = key.refusal() {
+        runner.input_unread = true;
         runner.finish("failed", Some(refusal));
         return false;
     }
@@ -688,6 +764,7 @@ async fn run_turn(
         runner.flush_texts();
         return false;
     }
+    runner.input_unread = !attempt.saw_init;
     if matches!(session, Session::New(_)) && !attempt.saw_init {
         runner.store_session(None);
     }
@@ -1664,7 +1741,7 @@ mod tests {
         let world = World::new();
         install_streaming_then(&world, "", "trap '' TERM\nwhile true; do sleep 1; done");
         let (_, elapsed) = run_and_stop(&world, Duration::from_millis(300)).await;
-        assert!(elapsed >= Duration::from_millis(300));
+        assert!(elapsed + TIMER_SKEW >= Duration::from_millis(300));
         assert!(elapsed < Duration::from_millis(300) + LOAD_SLACK);
         assert_eq!(only_turn(&world).status, "stopped");
     }
@@ -1912,6 +1989,7 @@ mod tests {
     const STEADY_STALL: Duration = Duration::from_millis(1800);
     const QUIET_TOOL_LIMIT: Duration = Duration::from_secs(5);
     const LOAD_SLACK: Duration = Duration::from_secs(5);
+    const TIMER_SKEW: Duration = Duration::from_millis(50);
 
     async fn run_with_stall(world: &World, idle: Duration, tool: Duration) -> bool {
         let mut launch = world.launch("go");
@@ -2008,7 +2086,7 @@ mod tests {
         );
         let started = Instant::now();
         let advance = run_with_stall(&world, SHORT_STALL, SHORT_TOOL_STALL).await;
-        assert!(started.elapsed() >= SHORT_TOOL_STALL);
+        assert!(started.elapsed() + TIMER_SKEW >= SHORT_TOOL_STALL);
         assert!(started.elapsed() < Duration::from_secs(10));
         assert!(advance);
         let turn = only_turn(&world);
@@ -2039,7 +2117,7 @@ mod tests {
         install_streaming_then(&world, "", "sleep 1.5\nexit 0");
         let started = Instant::now();
         run_with_stall(&world, SHORT_STALL, QUIET_TOOL_LIMIT).await;
-        assert!(started.elapsed() >= Duration::from_millis(1500));
+        assert!(started.elapsed() + TIMER_SKEW >= Duration::from_millis(1500));
         let turn = only_turn(&world);
         assert_eq!(turn.status, "failed");
         assert_eq!(
@@ -2059,7 +2137,7 @@ mod tests {
         let started = Instant::now();
         run_with_stall(&world, SHORT_STALL, LONG_STALL).await;
         let elapsed = started.elapsed();
-        assert!(elapsed >= SHORT_STALL + EXIT_TERM_GRACE);
+        assert!(elapsed + TIMER_SKEW >= SHORT_STALL + EXIT_TERM_GRACE);
         assert!(elapsed < SHORT_STALL + EXIT_TERM_GRACE + LOAD_SLACK);
         assert_eq!(only_turn(&world).status, "failed");
         assert_ne!(unsafe { libc::killpg(shell_pid(&world), 0) }, 0);

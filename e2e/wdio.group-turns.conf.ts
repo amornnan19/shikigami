@@ -15,6 +15,7 @@ config.onPrepare = () => {
   rmSync(pickedParent, { recursive: true, force: true });
   mkdirSync(pickedFolder, { recursive: true });
   writeFileSync(join(pickedFolder, "notes.txt"), "group notes\n");
+  writeFileSync(join(pickedFolder, "CLAUDE.md"), "PROBE-LINE: zebra-quartz-4471\n");
   prepareFakeProviders();
 };
 

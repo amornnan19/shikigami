@@ -54,7 +54,7 @@ pub enum ItemView {
 #[serde(rename_all = "camelCase")]
 pub struct TurnView {
     pub id: String,
-    pub agent_id: String,
+    pub agent_id: Option<String>,
     pub status: String,
     pub error: Option<String>,
     pub started_at: i64,
@@ -485,7 +485,7 @@ pub fn sweep_interrupted(connection: &Connection, now: i64) -> rusqlite::Result<
 
 struct TurnRow {
     id: String,
-    agent_id: String,
+    agent_id: Option<String>,
     status: String,
     error: Option<String>,
     started_at: i64,
