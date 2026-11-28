@@ -25,6 +25,7 @@ export type Item = Step | TextItem;
 
 export interface Turn {
   id: string;
+  agentId: string;
   status: TurnStatus;
   error: string | null;
   startedAt: number;
@@ -38,7 +39,7 @@ export interface Conversation {
   hasMore: boolean;
 }
 
-export type TurnEvent = { agentId: string; turnId: string } & (
+export type TurnEvent = { agentId: string; groupId: string | null; turnId: string } & (
   | { kind: "started" }
   | { kind: "text-delta"; itemId: string; text: string }
   | { kind: "text-set"; itemId: string; text: string }
@@ -91,4 +92,38 @@ export function onQueueChanged(handler: (agentId: string) => void) {
 
 export function onTurnEvent(handler: (event: TurnEvent) => void) {
   return listen<TurnEvent>("turn-event", (event) => handler(event.payload));
+}
+
+export function getGroupConversation(groupId: string, beforeTurnId?: string) {
+  return invoke<Conversation>("get_group_conversation", { groupId, beforeTurnId });
+}
+
+export function sendGroupMessage(groupId: string, text: string) {
+  return invoke<SendResult>("send_group_message", { groupId, text });
+}
+
+export function stopGroupTurn(groupId: string, turnId: string) {
+  return invoke<void>("stop_group_turn", { groupId, turnId });
+}
+
+export function resumeGroupQueue(groupId: string) {
+  return invoke<void>("resume_group_queue", { groupId });
+}
+
+export function listGroupQueue(groupId: string) {
+  return invoke<QueuedMessage[]>("list_group_queue", { groupId });
+}
+
+export function editGroupQueued(queuedId: string, text: string) {
+  return invoke<QueuedMessage>("edit_group_queued", { queuedId, text });
+}
+
+export function removeGroupQueued(queuedId: string) {
+  return invoke<void>("remove_group_queued", { queuedId });
+}
+
+export function onGroupQueueChanged(handler: (groupId: string) => void) {
+  return listen<{ groupId: string }>("group-queue-changed", (event) =>
+    handler(event.payload.groupId),
+  );
 }

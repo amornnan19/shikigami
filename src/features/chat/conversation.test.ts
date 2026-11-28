@@ -5,6 +5,7 @@ import { applyEvent, mergeNewest, prependOlder } from "./conversation";
 function turn(id: string): Conversation["turns"][number] {
   return {
     id,
+    agentId: "a",
     status: "running",
     error: null,
     startedAt: 1,
@@ -17,7 +18,7 @@ function turn(id: string): Conversation["turns"][number] {
 const base: Conversation = { turns: [turn("t1")], hasMore: false };
 
 function apply(data: Conversation, event: object) {
-  return applyEvent(data, { agentId: "a", turnId: "t1", ...event } as TurnEvent);
+  return applyEvent(data, { agentId: "a", groupId: null, turnId: "t1", ...event } as TurnEvent);
 }
 
 describe("applyEvent", () => {
@@ -46,6 +47,7 @@ describe("applyEvent", () => {
   it("ignores events for turns it does not have", () => {
     const other = applyEvent(base, {
       agentId: "a",
+      groupId: null,
       turnId: "zzz",
       kind: "text-delta",
       itemId: "i",

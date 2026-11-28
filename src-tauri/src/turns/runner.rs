@@ -10,8 +10,9 @@ use tokio::process::Command;
 use tokio::time::timeout;
 
 use super::claude_code::{self, Parsed, Session, StepStart, StreamParser};
+use super::group;
 use super::redact::Redactor;
-use super::store::{self, StepView};
+use super::store::{self, NewMessage, StepView};
 use super::{
     kill_group_after, EventSink, Launch, TurnEnvelope, TurnEvent, TurnRegistry, EXIT_TERM_GRACE,
 };
@@ -189,6 +190,7 @@ struct Runner<'a> {
     registry: &'a TurnRegistry,
     redactor: Redactor,
     agent_id: String,
+    group_id: Option<String>,
     turn_id: String,
     clock: i64,
     next_position: i64,
@@ -220,6 +222,7 @@ impl Runner<'_> {
     fn emit(&self, event: TurnEvent) {
         self.sink.emit(&TurnEnvelope {
             agent_id: self.agent_id.clone(),
+            group_id: self.group_id.clone(),
             turn_id: self.turn_id.clone(),
             event,
         });
@@ -235,10 +238,23 @@ impl Runner<'_> {
         let text = self.redactor.redact(text);
         let id = uuid::Uuid::now_v7().to_string();
         let created_at = self.tick();
-        let (agent_id, turn_id) = (self.agent_id.clone(), self.turn_id.clone());
+        let (agent_id, turn_id, group_id) = (
+            self.agent_id.clone(),
+            self.turn_id.clone(),
+            self.group_id.clone(),
+        );
         self.save(|connection| {
-            store::insert_message(
-                connection, &id, &agent_id, &turn_id, "notice", &text, created_at,
+            store::insert_message_in(
+                connection,
+                &NewMessage {
+                    id: &id,
+                    agent_id: &agent_id,
+                    turn_id: &turn_id,
+                    group_id: group_id.as_deref(),
+                    role: "notice",
+                    content: &text,
+                    created_at,
+                },
             )
         });
         self.emit(TurnEvent::Notice { item_id: id, text });
@@ -259,16 +275,23 @@ impl Runner<'_> {
             return;
         }
         let created_at = self.tick();
-        let (agent_id, turn_id) = (self.agent_id.clone(), self.turn_id.clone());
+        let (agent_id, turn_id, group_id) = (
+            self.agent_id.clone(),
+            self.turn_id.clone(),
+            self.group_id.clone(),
+        );
         self.save(|connection| {
-            store::insert_message(
+            store::insert_message_in(
                 connection,
-                item_id,
-                &agent_id,
-                &turn_id,
-                "assistant",
-                "",
-                created_at,
+                &NewMessage {
+                    id: item_id,
+                    agent_id: &agent_id,
+                    turn_id: &turn_id,
+                    group_id: group_id.as_deref(),
+                    role: "assistant",
+                    content: "",
+                    created_at,
+                },
             )
         });
         self.texts.insert(
@@ -386,8 +409,7 @@ impl Runner<'_> {
             Parsed::Session(id) => {
                 attempt.saw_init = true;
                 if id != self.stored_session {
-                    let agent_id = self.agent_id.clone();
-                    self.save(|connection| store::set_session(connection, &agent_id, Some(&id)));
+                    self.store_session(Some(&id));
                     self.stored_session = id;
                 }
             }
@@ -403,6 +425,16 @@ impl Runner<'_> {
         }
     }
 
+    fn store_session(&mut self, session_id: Option<&str>) {
+        let agent_id = self.agent_id.clone();
+        match self.group_id.clone() {
+            Some(group_id) => self.save(|connection| {
+                group::set_session(connection, &agent_id, &group_id, session_id)
+            }),
+            None => self.save(|connection| store::set_session(connection, &agent_id, session_id)),
+        }
+    }
+
     fn finish(&mut self, status: &str, error: Option<String>) {
         self.flush_texts();
         let error = error.map(|message| self.redactor.redact(&message));
@@ -413,15 +445,25 @@ impl Runner<'_> {
         };
         let now = self.tick();
         let (turn_id, agent_id) = (self.turn_id.clone(), self.agent_id.clone());
-        self.save(|connection| {
-            store::finish_turn(
+        let group_id = self.group_id.clone();
+        self.save(|connection| match &group_id {
+            Some(group_id) => group::finish_turn(
+                connection,
+                &turn_id,
+                &agent_id,
+                group_id,
+                status,
+                error.as_deref(),
+                now,
+            ),
+            None => store::finish_turn(
                 connection,
                 &turn_id,
                 &agent_id,
                 status,
                 error.as_deref(),
                 now,
-            )
+            ),
         });
         self.emit(TurnEvent::Ended {
             status: status.to_owned(),
@@ -433,7 +475,14 @@ impl Runner<'_> {
         let search_path = env::join_paths(&launch.search_dirs).ok()?;
         let mut command = Command::new(&launch.executable);
         command
-            .args(claude_code::arguments(&launch.model, session))
+            .args(claude_code::arguments(
+                &launch.model,
+                session,
+                launch
+                    .group
+                    .as_ref()
+                    .map(|group| group.system_prompt.as_str()),
+            ))
             .current_dir(&launch.workspace)
             .env_clear()
             .envs(
@@ -600,6 +649,7 @@ async fn run_turn(
         registry,
         redactor: key.redactor(),
         agent_id: launch.agent_id.clone(),
+        group_id: launch.group.as_ref().map(|group| group.group_id.clone()),
         turn_id: launch.turn_id.clone(),
         clock: launch.started_at,
         next_position: 0,
@@ -610,10 +660,12 @@ async fn run_turn(
     };
     runner.emit(TurnEvent::Started);
     if !launch.workspace.is_dir() {
-        runner.finish(
-            "failed",
-            Some("The workspace folder is missing.".to_owned()),
-        );
+        let missing = if launch.group.is_some() {
+            "The group folder is missing."
+        } else {
+            "The workspace folder is missing."
+        };
+        runner.finish("failed", Some(missing.to_owned()));
         return false;
     }
     if let Some(refusal) = key.refusal() {
@@ -637,8 +689,7 @@ async fn run_turn(
         return false;
     }
     if matches!(session, Session::New(_)) && !attempt.saw_init {
-        let agent_id = runner.agent_id.clone();
-        runner.save(|connection| store::set_session(connection, &agent_id, None));
+        runner.store_session(None);
     }
     if attempt.succeeded() {
         runner.finish("completed", None);
@@ -777,6 +828,7 @@ mod tests {
                 environment: self.environment.lock().unwrap().clone(),
                 stall_timeout: STALL_TIMEOUT,
                 tool_stall_timeout: TOOL_STALL_TIMEOUT,
+                group: None,
             }
         }
 

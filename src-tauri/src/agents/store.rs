@@ -128,9 +128,9 @@ pub fn list(connection: &Connection) -> rusqlite::Result<Vec<AgentRow>> {
     let mut statement = connection.prepare(
         "SELECT a.id, a.name, a.color, a.provider, a.model, a.workspace_path, a.created_at, a.last_activity_at,
                 EXISTS(SELECT 1 FROM turns t WHERE t.agent_id = a.id AND t.status = 'running'),
-                (SELECT t.status FROM turns t WHERE t.agent_id = a.id
+                (SELECT t.status FROM turns t WHERE t.agent_id = a.id AND t.group_id IS NULL
                    ORDER BY t.started_at DESC, t.rowid DESC LIMIT 1),
-                (SELECT t.error FROM turns t WHERE t.agent_id = a.id
+                (SELECT t.error FROM turns t WHERE t.agent_id = a.id AND t.group_id IS NULL
                    ORDER BY t.started_at DESC, t.rowid DESC LIMIT 1),
                 a.auth_mode
          FROM agents a

@@ -1,9 +1,10 @@
 import { Settings } from "lucide-react";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Composer } from "@/features/chat/Composer";
 import { QueueList } from "@/features/chat/QueueList";
 import { ResumeBar } from "@/features/chat/ResumeBar";
+import { agentScope } from "@/features/chat/scope";
 import { Transcript } from "@/features/chat/Transcript";
 import { useConversation, useQueue } from "@/features/chat/useConversation";
 import { AUTH_MODE_LABELS } from "@/features/providers/api";
@@ -20,8 +21,9 @@ export function AgentView({
   onDeleted: (outcome: Deleted, askedForTrash: boolean) => void;
 }) {
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const { query, loadOlder, loadingOlder } = useConversation(agent.id);
-  const queue = useQueue(agent.id);
+  const scope = useMemo(() => agentScope(agent.id), [agent.id]);
+  const { query, loadOlder, loadingOlder } = useConversation(scope);
+  const queue = useQueue(scope);
   const turns = query.data?.turns ?? [];
   const last = turns.at(-1);
   const runningTurnId = last?.status === "running" ? last.id : null;
@@ -62,16 +64,16 @@ export function AgentView({
         loaded={query.isSuccess}
         onLoadOlder={loadOlder}
       />
-      <QueueList agentId={agent.id} messages={queue.data ?? []} />
+      <QueueList scope={scope} messages={queue.data ?? []} />
       {waiting > 0 && !running && blockedReason === null && (
         <ResumeBar
-          agentId={agent.id}
+          scope={scope}
           count={waiting}
           interrupted={agent.attention?.code === "last-turn-interrupted"}
         />
       )}
       <Composer
-        agentId={agent.id}
+        scope={scope}
         running={running}
         runningTurnId={runningTurnId}
         blockedReason={blockedReason}

@@ -149,7 +149,7 @@ pub struct UpdateGroupInput {
     pub lead_agent_id: Option<String>,
 }
 
-fn derive_attention(folder_exists: bool, member_count: usize) -> Option<Attention> {
+pub(crate) fn derive_attention(folder_exists: bool, member_count: usize) -> Option<Attention> {
     if !folder_exists {
         return Some(Attention {
             code: "folder-missing",
@@ -417,7 +417,18 @@ fn update(db: &Database, group_id: &str, input: UpdateGroupInput) -> Result<Grou
 }
 
 fn delete(db: &Database, group_id: &str) -> Result<(), GroupError> {
-    let removed = db.with_connection(|connection| store::delete(connection, group_id))?;
+    let removed = db.with_connection(|connection| {
+        let transaction = connection.unchecked_transaction()?;
+        if store::has_running_turn(&transaction, group_id)? {
+            return Err(GroupError::new(
+                "busy",
+                "Stop the group's work before deleting it.",
+            ));
+        }
+        let removed = store::delete(&transaction, group_id)?;
+        transaction.commit()?;
+        Ok::<_, GroupError>(removed)
+    })?;
     if removed == 0 {
         return Err(GroupError::not_found());
     }

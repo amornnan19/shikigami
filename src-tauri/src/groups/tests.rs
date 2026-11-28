@@ -476,6 +476,29 @@ fn deleting_a_group_keeps_its_folder_and_files_and_the_agents() {
 }
 
 #[test]
+fn a_group_with_a_running_turn_cannot_be_deleted_until_the_turn_ends() {
+    let fx = Fixture::new();
+    let folder = fx.project("repo");
+    let (group, a, _) = fx.pair_group("Team", Some(&folder));
+    fx.db.with_connection(|c| {
+        c.execute(
+            "INSERT INTO turns (id, agent_id, group_id, status, started_at)
+             VALUES ('t', ?1, ?2, 'running', 1)",
+            params![a, group.id],
+        )
+        .unwrap()
+    });
+    assert_eq!(code(delete(&fx.db, &group.id)), "busy");
+    assert_eq!(fx.groups().len(), 1);
+    fx.db.with_connection(|c| {
+        c.execute("UPDATE turns SET status = 'stopped'", [])
+            .unwrap()
+    });
+    delete(&fx.db, &group.id).unwrap();
+    assert_eq!(fx.groups().len(), 0);
+}
+
+#[test]
 fn a_group_can_be_renamed_and_re_membered_and_given_a_new_lead() {
     let fx = Fixture::new();
     let folder = fx.project("repo");

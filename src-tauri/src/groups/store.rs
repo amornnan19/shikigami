@@ -161,6 +161,31 @@ pub fn replace_members(
     Ok(())
 }
 
+pub fn has_running_turn(connection: &Connection, group_id: &str) -> rusqlite::Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM turns WHERE group_id = ?1 AND status = 'running')",
+        [group_id],
+        |row| row.get(0),
+    )
+}
+
+pub fn members_of(connection: &Connection, group_id: &str) -> rusqlite::Result<Vec<Member>> {
+    let mut statement = connection.prepare(
+        "SELECT a.id, a.name, a.color
+         FROM group_members gm JOIN agents a ON a.id = gm.agent_id
+         WHERE gm.group_id = ?1
+         ORDER BY gm.position, gm.joined_at",
+    )?;
+    let rows = statement.query_map([group_id], |row| {
+        Ok(Member {
+            agent_id: row.get(0)?,
+            name: row.get(1)?,
+            color: row.get(2)?,
+        })
+    })?;
+    rows.collect()
+}
+
 pub fn delete(connection: &Connection, group_id: &str) -> rusqlite::Result<usize> {
     connection.execute("DELETE FROM groups WHERE id = ?1", [group_id])
 }

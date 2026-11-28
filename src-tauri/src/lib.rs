@@ -133,7 +133,14 @@ pub fn run() {
             turns::list_queue,
             turns::edit_queued,
             turns::remove_queued,
-            turns::resume_queue
+            turns::resume_queue,
+            turns::send_group_message,
+            turns::get_group_conversation,
+            turns::stop_group_turn,
+            turns::list_group_queue,
+            turns::edit_group_queued,
+            turns::remove_group_queued,
+            turns::resume_group_queue
         ])
         .build(app_context())
         .expect("error while building tauri application")

@@ -1,4 +1,4 @@
-mod instructions;
+pub(crate) mod instructions;
 pub(crate) mod remove;
 mod store;
 pub(crate) mod validate;
