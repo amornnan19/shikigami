@@ -5,6 +5,7 @@ mod commands;
 pub mod db;
 mod groups;
 mod providers;
+mod sandbox;
 pub mod secrets;
 mod settings;
 mod turns;
@@ -81,7 +82,7 @@ pub fn run() {
                 .and_then(|dir| open_database(&dir))
                 .and_then(|database| turns::sweep_interrupted(&database).map(|_| database));
             if !data_dir.as_os_str().is_empty() {
-                turns::sweep_instruction_files(&data_dir.join("tmp"));
+                turns::sweep_temp_files(&data_dir.join("tmp"));
             }
             match opened {
                 Ok(database) => {
