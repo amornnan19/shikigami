@@ -18,7 +18,12 @@ type TurnSettings = {
     network: { allowedDomains: string[]; strictAllowlist: boolean };
     filesystem: { allowWrite: string[]; denyRead: string[]; denyWrite: string[] };
   };
-  permissions: { allow: string[]; deny: string[] };
+  permissions: {
+    allow: string[];
+    deny: string[];
+    ask: string[];
+    blockReadsOutsideWorkingDirectories: boolean;
+  };
 };
 
 function recordedSettings(): TurnSettings[] {
@@ -59,6 +64,9 @@ describe("the sandbox", () => {
       expect(sandbox?.filesystem.denyWrite).toContain(join(home, place));
     }
     expect(sandbox?.filesystem.denyRead).not.toContain(folder);
+    expect(settings?.permissions.blockReadsOutsideWorkingDirectories).toBe(true);
+    expect(settings?.permissions.ask).toEqual(["WebFetch", "WebSearch"]);
+    expect(sandbox?.filesystem.denyRead).toContain("/Volumes");
     expect(settings?.permissions.allow).toEqual([`Read(/${folder}/**)`, `Edit(/${folder}/**)`]);
     expect(settings?.permissions.deny).toContain(`Read(/${join(home, ".ssh")}/**)`);
     expect(settings?.permissions.deny).toContain(`Edit(/${join(home, ".ssh")}/**)`);

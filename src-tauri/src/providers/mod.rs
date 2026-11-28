@@ -124,6 +124,48 @@ async fn help_lists_flag_within(
     listed
 }
 
+static VERSIONS: OnceLock<Mutex<HashMap<PathBuf, [u32; 3]>>> = OnceLock::new();
+
+pub async fn version_at_least(executable: &Path, dirs: &[PathBuf], minimum: [u32; 3]) -> bool {
+    version_at_least_within(executable, dirs, minimum, PROBE_TIMEOUT).await
+}
+
+async fn version_at_least_within(
+    executable: &Path,
+    dirs: &[PathBuf],
+    minimum: [u32; 3],
+    limit: Duration,
+) -> bool {
+    let cache = VERSIONS.get_or_init(Mutex::default);
+    let known = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(executable)
+        .copied();
+    let version = match known {
+        Some(version) => version,
+        None => {
+            let Some(output) =
+                probe::run_allowlisted(executable, &["--version"], dirs, limit).await
+            else {
+                return false;
+            };
+            let Some(version) = output
+                .first_line()
+                .and_then(|line| parse_version(&line, claude_code::SPEC.version_prefix))
+            else {
+                return false;
+            };
+            cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(executable.to_path_buf(), version);
+            version
+        }
+    };
+    version >= minimum
+}
+
 pub async fn claude_status(dirs: &[PathBuf]) -> ProviderStatus {
     detect(&claude_code::SPEC, dirs, PROBE_TIMEOUT).await
 }

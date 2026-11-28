@@ -58,9 +58,12 @@ Finder-launched app only has /usr/bin:/bin:/usr/sbin:/sbin, and npm-installed CL
 PATH. Start each CLI in its own process group and kill the group on timeout or stop. Bound how much
 output is read. Start each agent CLI isolated from the user's own configuration of that CLI: no
 user-level settings, hooks, plugins, output styles or MCP servers. For Claude Code:
-`--setting-sources project --strict-mcp-config --permission-mode manual --permission-prompts none`.
-A CLI started in a folder the user picked (a group folder) loads no setting sources
-(`--setting-sources ""`); Shikigami passes that folder's CLAUDE.md text itself.
+`--setting-sources "" --strict-mcp-config --permission-mode manual --permission-prompts none`.
+Every agent CLI loads no setting sources; Shikigami passes the folder's CLAUDE.md text itself.
+Claude Code's sandbox covers shell commands only, and its read-only commands run without a prompt on
+any path. Every turn's `--settings` keeps outside reads blocked
+(`permissions.blockReadsOutsideWorkingDirectories`), and failure detection matches text the real CLI
+prints, captured by a probe.
 A turn that fails before spawn for a reason that belongs to the agent (sign-in, missing CLI) starts no
 other queued work addressed to that agent; only a chat-level failure (a missing folder) lets the
 agent's other chats proceed.

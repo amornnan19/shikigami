@@ -3,13 +3,20 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 
 pub const UNAVAILABLE_MESSAGE: &str = "The sandbox could not start, so this agent did not run.";
+pub const UNSAFE_FOLDER_MESSAGE: &str =
+    "This folder's name contains characters the sandbox cannot use safely.";
+pub const PROTECTED_FOLDER_MESSAGE: &str = "It is inside a protected location.";
 
-const UNAVAILABLE_MARKERS: [&str; 2] = [
+const UNAVAILABLE_MARKERS: [&str; 6] = [
     "sandbox required but unavailable",
     "refusing to start without a working sandbox",
+    "sandbox is required but failed to initialize",
+    "sandbox is required (sandbox.failifunavailable)",
+    "did not load, so nothing in them is in effect",
+    "these settings entries were skipped",
 ];
 
-const PROTECTED_IN_HOME: [&str; 34] = [
+const PROTECTED_IN_HOME: [&str; 68] = [
     ".ssh",
     ".gnupg",
     ".aws",
@@ -28,7 +35,7 @@ const PROTECTED_IN_HOME: [&str; 34] = [
     "Library/Mail",
     "Library/Messages",
     "Library/Safari",
-    "Library/Application Support/Google/Chrome",
+    "Library/Application Support/Google",
     "Library/Application Support/Firefox",
     "Library/Application Support/BraveSoftware",
     "Library/Application Support/Microsoft Edge",
@@ -44,7 +51,43 @@ const PROTECTED_IN_HOME: [&str; 34] = [
     ".bashrc",
     ".bash_profile",
     ".profile",
+    ".cargo/credentials",
+    ".cargo/credentials.toml",
+    ".gem/credentials",
+    ".m2/settings.xml",
+    ".gradle/gradle.properties",
+    ".yarnrc.yml",
+    ".config/pip",
+    ".composer/auth.json",
+    ".oci",
+    ".config/doctl",
+    ".terraform.d",
+    ".vault-token",
+    ".s3cfg",
+    ".boto",
+    ".pgpass",
+    ".my.cnf",
+    ".config/git/credentials",
+    ".codex",
+    ".config/github-copilot",
+    "Library/Containers/com.apple.Safari",
+    "Library/Application Support/Chromium",
+    "Library/Application Support/Vivaldi",
+    "Library/Application Support/com.operasoftware.Opera",
+    "Library/Group Containers",
+    ".bash_login",
+    ".bash_aliases",
+    ".zlogout",
+    ".local/share/fish",
+    ".config/fish",
+    ".python_history",
+    ".psql_history",
+    ".node_repl_history",
+    ".lesshst",
+    ".viminfo",
 ];
+
+const PROTECTED_ABSOLUTE: [&str; 1] = ["/Volumes"];
 
 #[derive(Debug, Clone)]
 pub struct Scope {
@@ -76,6 +119,21 @@ pub fn is_unavailable(text: &str) -> bool {
         .any(|marker| lowered.contains(marker))
 }
 
+pub fn fixed_protected(home: Option<&Path>) -> Vec<PathBuf> {
+    let in_home = home
+        .into_iter()
+        .flat_map(|home| PROTECTED_IN_HOME.iter().map(|relative| home.join(relative)));
+    in_home
+        .chain(PROTECTED_ABSOLUTE.iter().map(PathBuf::from))
+        .collect()
+}
+
+pub fn has_unsafe_characters(path: &Path) -> bool {
+    path.to_string_lossy()
+        .chars()
+        .any(|character| matches!(character, '*' | '?' | '[' | ']'))
+}
+
 pub fn protected_paths(
     folder: &Path,
     home: &Path,
@@ -83,9 +141,8 @@ pub fn protected_paths(
     other_workspaces: &[PathBuf],
 ) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = Vec::new();
-    let candidates = PROTECTED_IN_HOME
-        .iter()
-        .map(|relative| home.join(relative))
+    let candidates = fixed_protected(Some(home))
+        .into_iter()
         .chain(std::iter::once(data_dir.to_path_buf()))
         .chain(other_workspaces.iter().cloned());
     for path in candidates {
@@ -148,6 +205,8 @@ pub fn turn_settings(
             }
         },
         "permissions": {
+            "blockReadsOutsideWorkingDirectories": true,
+            "ask": ["WebFetch", "WebSearch"],
             "allow": [format!("Read({own}/**)"), format!("Edit({own}/**)")],
             "deny": deny
         }
@@ -198,6 +257,14 @@ mod tests {
             })
         );
         assert_eq!(
+            value["permissions"]["blockReadsOutsideWorkingDirectories"],
+            true
+        );
+        assert_eq!(
+            value["permissions"]["ask"],
+            json!(["WebFetch", "WebSearch"])
+        );
+        assert_eq!(
             value["permissions"]["allow"],
             json!([
                 "Read(//Users/me/Agents/ada/**)",
@@ -212,7 +279,10 @@ mod tests {
             "Read(//Users/me/.zshrc)",
             "Edit(//Users/me/.npmrc)",
             "Read(//Users/me/Library/Keychains/**)",
-            "Read(//Users/me/Library/Application Support/Google/Chrome/**)",
+            "Read(//Users/me/Library/Application Support/Google/**)",
+            "Read(//Volumes/**)",
+            "Edit(//Users/me/.cargo/credentials.toml)",
+            "Read(//Users/me/Library/Group Containers/**)",
             "Read(//Users/me/Agents/bo/**)",
             "Edit(//Users/me/Agents/bo/**)",
             "Read(//Users/me/Library/Application Support/Shikigami/**)",
@@ -231,7 +301,10 @@ mod tests {
         let read = strings(&value["sandbox"]["filesystem"]["denyRead"]);
         let write = strings(&value["sandbox"]["filesystem"]["denyWrite"]);
         assert_eq!(read, write);
-        assert_eq!(read.len(), PROTECTED_IN_HOME.len() + 2);
+        assert_eq!(
+            read.len(),
+            PROTECTED_IN_HOME.len() + PROTECTED_ABSOLUTE.len() + 2
+        );
         assert_eq!(strings(&value["permissions"]["deny"]).len(), read.len() * 4);
         for path in [
             "/Users/me/.ssh",
@@ -242,6 +315,9 @@ mod tests {
             "/Users/me/Library/Keychains",
             "/Users/me/Library/Messages",
             "/Users/me/.zsh_history",
+            "/Users/me/.viminfo",
+            "/Users/me/.codex",
+            "/Volumes",
             "/Users/me/Library/Application Support/Shikigami",
             "/Users/me/Agents/bo",
         ] {
@@ -313,7 +389,10 @@ mod tests {
             Path::new(""),
             &others,
         );
-        assert_eq!(paths.len(), PROTECTED_IN_HOME.len() + 1);
+        assert_eq!(
+            paths.len(),
+            PROTECTED_IN_HOME.len() + PROTECTED_ABSOLUTE.len() + 1
+        );
         assert!(paths.contains(&PathBuf::from("/Users/me/Agents/bo")));
         assert!(!paths.contains(&PathBuf::from("relative/dir")));
         assert_eq!(
@@ -323,6 +402,22 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn folders_with_pattern_characters_are_unsafe_and_ordinary_ones_are_not() {
+        for name in ["/a/b*c", "/a/b?c", "/a/x[", "/a/x]"] {
+            assert!(has_unsafe_characters(Path::new(name)), "{name}");
+        }
+        assert!(!has_unsafe_characters(Path::new("/a/My Docs (1)/x-y_z")));
+    }
+
+    #[test]
+    fn the_fixed_protected_list_covers_home_entries_and_absolute_volumes() {
+        let list = fixed_protected(Some(Path::new("/Users/me")));
+        assert!(list.contains(&PathBuf::from("/Users/me/.ssh")));
+        assert!(list.contains(&PathBuf::from("/Volumes")));
+        assert_eq!(fixed_protected(None), [PathBuf::from("/Volumes")]);
     }
 
     #[test]
@@ -340,6 +435,18 @@ mod tests {
         ));
         assert!(is_unavailable(
             "  Refusing to start without a working sandbox (see sandbox.failIfUnavailable)."
+        ));
+        assert!(is_unavailable(
+            "Sandbox is required but failed to initialize: no seatbelt"
+        ));
+        assert!(is_unavailable(
+            "Sandbox is required (sandbox.failIfUnavailable) and stopped being available in this session: x"
+        ));
+        assert!(is_unavailable(
+            "These settings did not load, so nothing in them is in effect, including hooks"
+        ));
+        assert!(is_unavailable(
+            "These settings entries were skipped; the rest"
         ));
         assert!(!is_unavailable("The sandbox blocked the write."));
         assert!(!is_unavailable(""));

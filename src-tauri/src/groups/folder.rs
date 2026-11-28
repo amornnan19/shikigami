@@ -127,6 +127,19 @@ pub fn check(raw: &str, guard: &Guard) -> Result<PathBuf, GroupError> {
     {
         return Err(refused("It is your home folder."));
     }
+    if crate::sandbox::has_unsafe_characters(&folder) {
+        return Err(refused(
+            "Its name contains characters the sandbox cannot use safely.",
+        ));
+    }
+    for location in crate::sandbox::fixed_protected(guard.home) {
+        if matches!(
+            relation(&folder, &location),
+            Some(Relation::Equal | Relation::Inside)
+        ) {
+            return Err(refused(crate::sandbox::PROTECTED_FOLDER_MESSAGE));
+        }
+    }
     match relation(&folder, guard.data_dir) {
         Some(Relation::Equal) => return Err(refused("It is Shikigami's data folder.")),
         Some(Relation::Inside) => return Err(refused("It is inside Shikigami's data folder.")),

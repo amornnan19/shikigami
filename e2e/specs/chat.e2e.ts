@@ -81,7 +81,7 @@ describe("chat", () => {
     expect(second).not.toContain("--session-id");
     for (const line of lines) {
       expect(line).toContain(
-        "--setting-sources project --strict-mcp-config --permission-mode manual --permission-prompts none",
+        "--setting-sources  --strict-mcp-config --permission-mode manual --permission-prompts none",
       );
       expect(line).not.toMatch(/bypassPermissions|acceptEdits|dontAsk|dangerously|allowedTools/i);
       expect(line.split(" ")).not.toContain("auto");

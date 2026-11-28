@@ -294,6 +294,55 @@ fn a_relative_or_missing_or_file_folder_is_invalid() {
 }
 
 #[test]
+fn a_folder_that_is_or_sits_inside_a_protected_location_is_refused() {
+    let fx = Fixture::new();
+    let try_folder = |path: &Path| {
+        let a = fx.agent(&format!("a{}", path.display().to_string().len()));
+        let b = fx.agent(&format!("b{}", path.display().to_string().len()));
+        fx.create(fx.input("Team", &[&a, &b], &a, Some(path)))
+    };
+    let ssh = fx.home.path().join(".ssh");
+    fs::create_dir_all(ssh.join("keys")).unwrap();
+    let keychains = fx.home.path().join("Library").join("Keychains");
+    fs::create_dir_all(&keychains).unwrap();
+    for path in [
+        ssh.clone(),
+        ssh.join("keys"),
+        keychains,
+        PathBuf::from("/Volumes"),
+    ] {
+        assert_eq!(
+            refusal_message(try_folder(&path)),
+            "This folder cannot be used. It is inside a protected location.",
+            "{}",
+            path.display()
+        );
+    }
+    let through_link = fx.projects.path().join("ssh-link");
+    symlink(&ssh, &through_link).unwrap();
+    assert!(refusal_message(try_folder(&through_link)).contains("protected location"));
+    let near = fx.home.path().join(".ssh-notes");
+    fs::create_dir_all(&near).unwrap();
+    assert!(try_folder(&near).is_ok());
+}
+
+#[test]
+fn a_folder_whose_name_has_pattern_characters_is_refused() {
+    let fx = Fixture::new();
+    let a = fx.agent("Ada");
+    let b = fx.agent("Bo");
+    for name in ["a*b", "a?b", "a[b", "a]b"] {
+        let folder = fx.project(name);
+        assert_eq!(
+            refusal_message(fx.create(fx.input("Team", &[&a, &b], &a, Some(&folder)))),
+            "This folder cannot be used. Its name contains characters the sandbox cannot use safely.",
+            "{name}"
+        );
+    }
+    assert_eq!(fx.groups().len(), 0);
+}
+
+#[test]
 fn the_disk_root_and_the_home_folder_are_refused() {
     let fx = Fixture::new();
     let a = fx.agent("Ada");

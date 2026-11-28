@@ -35,6 +35,9 @@ const TEXT_WRITE_INTERVAL: Duration = Duration::from_millis(500);
 const EXIT_GRACE: Duration = Duration::from_secs(5);
 const STDERR_GRACE: Duration = Duration::from_secs(2);
 const SNAPSHOT_FLAG: &str = "--system-prompt-snapshot";
+const MINIMUM_VERSION: [u32; 3] = [2, 1, 285];
+const TOO_OLD_MESSAGE: &str =
+    "This Claude Code version is too old to run safely. Update it, then press Resume.";
 const SESSION_MISSING: &str = "No conversation found";
 
 const RESUME_NOTICE: &str =
@@ -664,12 +667,18 @@ impl Runner<'_> {
         session: &Session,
         key: &ApiKey,
         group_flags: Option<&claude_code::GroupFlags>,
+        instructions_file: Option<&Path>,
         settings_file: &Path,
     ) -> Option<Command> {
         let search_path = env::join_paths(&launch.search_dirs).ok()?;
         let mut command = Command::new(&launch.executable);
         command
-            .args(claude_code::arguments(&launch.model, session, group_flags))
+            .args(claude_code::arguments(
+                &launch.model,
+                session,
+                group_flags,
+                instructions_file,
+            ))
             .arg("--settings")
             .arg(settings_file)
             .current_dir(&launch.workspace)
@@ -717,6 +726,12 @@ impl Runner<'_> {
         {
             return attempt;
         }
+        if !providers::version_at_least(&launch.executable, &launch.search_dirs, MINIMUM_VERSION)
+            .await
+        {
+            attempt.failure = Some(TOO_OLD_MESSAGE.to_owned());
+            return attempt;
+        }
         let Some(settings) = self.settings_file(launch) else {
             attempt.failure = Some(sandbox::UNAVAILABLE_MESSAGE.to_owned());
             return attempt;
@@ -725,15 +740,13 @@ impl Runner<'_> {
             attempt.failure = Some(sandbox::UNAVAILABLE_MESSAGE.to_owned());
             return attempt;
         };
-        let instructions = match &launch.group {
-            Some(group) => match TempFile::write(&group.temp_dir, &group.instructions) {
-                Ok(file) => Some(file),
-                Err(_) => {
-                    attempt.failure = Some("Could not start Claude Code.".to_owned());
-                    return attempt;
-                }
-            },
-            None => None,
+        let (temp_dir, text) = match &launch.group {
+            Some(group) => (group.temp_dir.clone(), group.instructions.as_str()),
+            None => (self.registry.temp_dir(), launch.instructions.as_str()),
+        };
+        let Ok(instructions) = TempFile::write(&temp_dir, text) else {
+            attempt.failure = Some("Could not start Claude Code.".to_owned());
+            return attempt;
         };
         let snapshot_off = match &launch.group {
             Some(_) => {
@@ -743,13 +756,17 @@ impl Runner<'_> {
             None => false,
         };
         let group_flags = launch.group.as_ref().map(|group| claude_code::GroupFlags {
-            instructions_file: instructions.as_ref().and_then(TempFile::path),
             snapshot_off,
             access: group.access,
         });
-        let Some(mut command) =
-            self.command(launch, session, key, group_flags.as_ref(), settings_path)
-        else {
+        let Some(mut command) = self.command(
+            launch,
+            session,
+            key,
+            group_flags.as_ref(),
+            instructions.path(),
+            settings_path,
+        ) else {
             attempt.failure = Some("Could not start Claude Code.".to_owned());
             return attempt;
         };
@@ -951,6 +968,15 @@ async fn run_turn(
         runner.finish("failed", Some(missing.to_owned()), false);
         return RunEnd::ChatFailed;
     }
+    if sandbox::has_unsafe_characters(&launch.workspace) {
+        runner.input_unread = true;
+        runner.finish(
+            "failed",
+            Some(sandbox::UNSAFE_FOLDER_MESSAGE.to_owned()),
+            false,
+        );
+        return RunEnd::ChatFailed;
+    }
     if let Some(refusal) = key.refusal() {
         runner.input_unread = true;
         runner.finish("failed", Some(refusal), false);
@@ -1089,7 +1115,11 @@ mod tests {
 
         fn install(&self, body: &str) {
             let path = self.bin.path().join("claude");
-            fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            fs::write(
+                &path,
+                format!("#!/bin/sh\ncase \"$1\" in --version) echo '2.1.332 (Claude Code)'; exit 0;; esac\n{body}\n"),
+            )
+            .unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         }
 
@@ -1128,6 +1158,7 @@ mod tests {
                 model: begun.agent.model,
                 session: begun.session,
                 text: text.to_owned(),
+                instructions: String::new(),
                 started_at: now_millis(),
                 environment: self.environment.lock().unwrap().clone(),
                 stall_timeout: STALL_TIMEOUT,
@@ -1166,7 +1197,7 @@ mod tests {
     fn recording(world: &World, rest: &str) -> String {
         let records = world.records().display();
         format!(
-            "n=$(ls \"{records}\" | grep -c '^args' || true)\nfor a in \"$@\"; do echo \"$a\"; done > \"{records}/args.$n\"\nprev=\"\"; for a in \"$@\"; do if [ \"$prev\" = \"--settings\" ]; then cp \"$a\" \"{records}/settings.$n\"; stat -f %Lp \"$a\" > \"{records}/settings-mode.$n\"; fi; prev=\"$a\"; done\ncat > \"{records}/stdin.$n\"\nprintf '%s' \"$ANTHROPIC_API_KEY\" > \"{records}/key.$n\"\nprintf '%s' \"$ANTHROPIC_AUTH_TOKEN\" > \"{records}/token.$n\"\nprintf '%s' \"$ANTHROPIC_BASE_URL\" > \"{records}/base.$n\"\nprintf '%s' \"$LC_KEPT\" > \"{records}/kept.$n\"\n{rest}"
+            "n=$(ls \"{records}\" | grep -c '^args' || true)\nfor a in \"$@\"; do echo \"$a\"; done > \"{records}/args.$n\"\nprev=\"\"; for a in \"$@\"; do if [ \"$prev\" = \"--settings\" ]; then cp \"$a\" \"{records}/settings.$n\"; stat -f %Lp \"$a\" > \"{records}/settings-mode.$n\"; fi; if [ \"$prev\" = \"--append-system-prompt-file\" ]; then cp \"$a\" \"{records}/prompt.$n\"; echo \"$a\" > \"{records}/promptpath.$n\"; fi; prev=\"$a\"; done\ncat > \"{records}/stdin.$n\"\nprintf '%s' \"$ANTHROPIC_API_KEY\" > \"{records}/key.$n\"\nprintf '%s' \"$ANTHROPIC_AUTH_TOKEN\" > \"{records}/token.$n\"\nprintf '%s' \"$ANTHROPIC_BASE_URL\" > \"{records}/base.$n\"\nprintf '%s' \"$LC_KEPT\" > \"{records}/kept.$n\"\n{rest}"
         )
     }
 
@@ -2584,6 +2615,154 @@ mod tests {
             Some("The sandbox could not start, so this agent did not run.")
         );
         assert!(!has_record(&world, "args.0"));
+    }
+
+    #[tokio::test]
+    async fn a_one_to_one_turn_loads_no_setting_sources_and_gets_the_workspace_instructions_from_a_file(
+    ) {
+        let world = World::new();
+        let fixture = world.fixture("basic.jsonl", BASIC);
+        world.install(&recording(
+            &world,
+            &format!("cat \"{}\"", fixture.display()),
+        ));
+        let mut launch = world.launch("hi");
+        launch.instructions = "Ada rules\n".to_owned();
+        run(
+            &world.db,
+            &world.sink,
+            &world.registry,
+            launch,
+            ApiKey::Subscription,
+        )
+        .await;
+        let args = args(&world, 0);
+        assert_isolated(&args);
+        assert_eq!(arg_after(&args, "--setting-sources"), "");
+        assert_eq!(read(&world, "prompt.0"), "Ada rules\n");
+        let path = PathBuf::from(read(&world, "promptpath.0").trim());
+        assert_eq!(
+            arg_after(&args, "--append-system-prompt-file"),
+            path.to_string_lossy()
+        );
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn a_one_to_one_turn_without_instructions_passes_no_prompt_file() {
+        let world = World::new();
+        let fixture = world.fixture("basic.jsonl", BASIC);
+        world.install(&recording(
+            &world,
+            &format!("cat \"{}\"", fixture.display()),
+        ));
+        world.send("hi", ApiKey::Subscription).await;
+        assert!(!args(&world, 0)
+            .iter()
+            .any(|arg| arg == "--append-system-prompt-file"));
+    }
+
+    #[tokio::test]
+    async fn settings_that_did_not_load_fail_the_turn_closed_and_hold_the_agent() {
+        for text in [
+            "These settings did not load, so nothing in them is in effect, including hooks, permission rules and sandbox settings",
+            "These settings entries were skipped; the rest of each source is in effect:",
+        ] {
+            let world = World::new();
+            world.install(&recording(&world, &format!("echo '{text}' >&2\nexit 1")));
+            let launch = world.launch("hi");
+            let end = run(
+                &world.db,
+                &world.sink,
+                &world.registry,
+                launch,
+                ApiKey::Subscription,
+            )
+            .await;
+            assert_eq!(end, RunEnd::AgentFailed, "{text}");
+            assert_eq!(
+                only_turn(&world).error.as_deref(),
+                Some("The sandbox could not start, so this agent did not run.")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_claude_code_older_than_the_minimum_or_unreadable_fails_closed_and_starts_no_turn() {
+        for version in ["2.1.284 (Claude Code)", "garbage", ""] {
+            let world = World::new();
+            let path = world.bin.path().join("claude");
+            let body = recording(&world, "exit 0");
+            fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\ncase \"$1\" in --version) echo '{version}'; exit 0;; esac\n{body}\n"
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            let launch = world.launch("hi");
+            let end = run(
+                &world.db,
+                &world.sink,
+                &world.registry,
+                launch,
+                ApiKey::Subscription,
+            )
+            .await;
+            assert_eq!(end, RunEnd::AgentFailed, "{version}");
+            assert_eq!(
+                only_turn(&world).error.as_deref(),
+                Some("This Claude Code version is too old to run safely. Update it, then press Resume.")
+            );
+            assert!(!has_record(&world, "args.0"), "{version}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_exact_minimum_version_runs() {
+        let world = World::new();
+        let path = world.bin.path().join("claude");
+        let fixture = world.fixture("basic.jsonl", BASIC);
+        let body = recording(&world, &format!("cat \"{}\"", fixture.display()));
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in --version) echo '2.1.285 (Claude Code)'; exit 0;; esac\n{body}\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        world.send("hi", ApiKey::Subscription).await;
+        assert!(has_record(&world, "args.0"));
+        assert_eq!(only_turn(&world).status, "completed");
+    }
+
+    #[tokio::test]
+    async fn a_folder_name_with_pattern_characters_fails_the_chat_and_starts_no_process() {
+        for name in ["a*b", "a?b", "a[b", "a]b"] {
+            let world = World::new();
+            world.install(&recording(&world, "exit 0"));
+            let parent = tempfile::tempdir().unwrap();
+            let folder = parent.path().join(name);
+            fs::create_dir(&folder).unwrap();
+            let mut launch = world.launch("hi");
+            launch.workspace = folder;
+            let end = run(
+                &world.db,
+                &world.sink,
+                &world.registry,
+                launch,
+                ApiKey::Subscription,
+            )
+            .await;
+            assert_eq!(end, RunEnd::ChatFailed, "{name}");
+            assert_eq!(
+                only_turn(&world).error.as_deref(),
+                Some("This folder's name contains characters the sandbox cannot use safely.")
+            );
+            assert!(!has_record(&world, "args.0"), "{name}");
+        }
     }
 
     #[tokio::test]
