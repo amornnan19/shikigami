@@ -37,6 +37,9 @@ const SESSION_MISSING: &str = "No conversation found";
 const RESUME_NOTICE: &str =
     "Started a new Claude Code session. The agent may have lost earlier context.";
 
+const SIGN_IN_SUBSCRIPTION: &str = "Sign in again, then press Resume.";
+const SIGN_IN_API_KEY: &str = "Check the API key in Settings, then press Resume.";
+
 const NO_KEY_SAVED: &str =
     "No API key is saved. Add one or switch this agent to your Claude subscription.";
 
@@ -64,6 +67,13 @@ impl ApiKey {
             Self::Subscription | Self::Missing | Self::Unreadable(_) | Self::Unresolved => {
                 Redactor::none()
             }
+        }
+    }
+
+    fn sign_in_guidance(&self) -> &'static str {
+        match self {
+            Self::Present(_) => SIGN_IN_API_KEY,
+            _ => SIGN_IN_SUBSCRIPTION,
         }
     }
 
@@ -117,6 +127,7 @@ async fn read_line<R: AsyncBufRead + Unpin>(
 struct StderrSummary {
     last_line: Option<String>,
     session_missing: bool,
+    sign_in: bool,
 }
 
 async fn read_stderr<R: AsyncReadExt + Unpin>(mut stderr: R) -> StderrSummary {
@@ -147,6 +158,7 @@ async fn read_stderr<R: AsyncReadExt + Unpin>(mut stderr: R) -> StderrSummary {
             .rfind(|line| !line.is_empty())
             .map(|line| claude_code::truncate(line, STDERR_LINE_LIMIT)),
         session_missing: text.contains(SESSION_MISSING),
+        sign_in: claude_code::is_sign_in_failure(&text, None),
     }
 }
 
@@ -163,6 +175,8 @@ struct Attempt {
     spawned: bool,
     saw_init: bool,
     result: Option<(bool, String)>,
+    api_error_status: Option<u64>,
+    compacted: bool,
     failure: Option<String>,
     stderr: StderrSummary,
 }
@@ -170,6 +184,13 @@ struct Attempt {
 impl Attempt {
     fn succeeded(&self) -> bool {
         matches!(self.result, Some((false, _))) && self.failure.is_none()
+    }
+
+    fn sign_in_failed(&self) -> bool {
+        match &self.result {
+            Some((_, text)) => claude_code::is_sign_in_failure(text, self.api_error_status),
+            None => self.stderr.sign_in,
+        }
     }
 
     fn session_missing(&self) -> bool {
@@ -456,7 +477,15 @@ impl Runner<'_> {
                 failed,
                 output,
             } => self.end_step(step_id, failed, output),
-            Parsed::Result { is_error, text } => attempt.result = Some((is_error, text)),
+            Parsed::Compacted => attempt.compacted = true,
+            Parsed::Result {
+                is_error,
+                text,
+                api_error_status,
+            } => {
+                attempt.result = Some((is_error, text));
+                attempt.api_error_status = api_error_status;
+            }
         }
     }
 
@@ -491,7 +520,7 @@ impl Runner<'_> {
         }
     }
 
-    fn finish(&mut self, status: &str, error: Option<String>) {
+    fn finish(&mut self, status: &str, error: Option<String>, compacted: bool) {
         self.flush_texts();
         let error = error.map(|message| self.redactor.redact(&message));
         let (status, error) = if status == "completed" && self.save_failed {
@@ -515,6 +544,7 @@ impl Runner<'_> {
                         status,
                         error: error.as_deref(),
                         restore_seen,
+                        clear_context_hash: compacted,
                         now,
                     },
                 )?;
@@ -792,12 +822,12 @@ async fn run_turn(
         } else {
             "The workspace folder is missing."
         };
-        runner.finish("failed", Some(missing.to_owned()));
+        runner.finish("failed", Some(missing.to_owned()), false);
         return RunEnd::ChatFailed;
     }
     if let Some(refusal) = key.refusal() {
         runner.input_unread = true;
-        runner.finish("failed", Some(refusal));
+        runner.finish("failed", Some(refusal), false);
         return RunEnd::AgentFailed;
     }
     let mut session = launch.session.clone();
@@ -824,14 +854,20 @@ async fn run_turn(
         runner.store_session(None);
     }
     if attempt.succeeded() {
-        runner.finish("completed", None);
+        runner.finish("completed", None, attempt.compacted);
         RunEnd::Finished
     } else if registry.stop_requested(&launch.agent_id, &launch.turn_id) {
-        runner.finish("stopped", None);
+        runner.finish("stopped", None, attempt.compacted);
         RunEnd::Finished
     } else {
-        runner.finish("failed", Some(failure_of(&attempt)));
-        if attempt.spawned {
+        let sign_in = attempt.spawned && attempt.failure.is_none() && attempt.sign_in_failed();
+        let message = if sign_in {
+            format!("{} {}", failure_of(&attempt), key.sign_in_guidance())
+        } else {
+            failure_of(&attempt)
+        };
+        runner.finish("failed", Some(message), attempt.compacted);
+        if attempt.spawned && !sign_in {
             RunEnd::Finished
         } else {
             RunEnd::AgentFailed
@@ -2000,6 +2036,77 @@ mod tests {
         assert!(advance.advances());
         let statuses: Vec<_> = world.turns().into_iter().map(|turn| turn.status).collect();
         assert_eq!(statuses, ["completed", "failed"]);
+    }
+
+    const SIGN_IN_FAILURE: &str = "echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\"}'\necho '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,\"api_error_status\":401,\"result\":\"Invalid API key\"}'\nexit 1";
+
+    #[tokio::test]
+    async fn a_sign_in_failure_after_the_process_started_holds_the_agent_and_shows_the_guidance() {
+        for (key, guidance) in [
+            (ApiKey::Subscription, SIGN_IN_SUBSCRIPTION),
+            (
+                ApiKey::Present(SecretString::new(SAVED_KEY)),
+                SIGN_IN_API_KEY,
+            ),
+        ] {
+            let world = World::new();
+            world.install(&recording(&world, SIGN_IN_FAILURE));
+            let launch = world.launch("hi");
+            let end = run(&world.db, &world.sink, &world.registry, launch, key).await;
+            assert_eq!(end, RunEnd::AgentFailed);
+            let turn = only_turn(&world);
+            assert_eq!(turn.status, "failed");
+            assert_eq!(
+                turn.error.as_deref(),
+                Some(format!("Invalid API key {guidance}").as_str())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_failure_that_only_reaches_stderr_also_holds_the_agent() {
+        let world = World::new();
+        world.install(&recording(
+            &world,
+            "echo 'Not logged in · Please run /login' >&2\nexit 1",
+        ));
+        let launch = world.launch("hi");
+        let end = run(
+            &world.db,
+            &world.sink,
+            &world.registry,
+            launch,
+            ApiKey::Subscription,
+        )
+        .await;
+        assert_eq!(end, RunEnd::AgentFailed);
+        assert_eq!(
+            only_turn(&world).error.as_deref(),
+            Some("Not logged in · Please run /login Sign in again, then press Resume.")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_billing_failure_after_the_process_started_still_advances_the_queue() {
+        let world = World::new();
+        world.install(&recording(
+            &world,
+            "echo '{\"type\":\"result\",\"is_error\":true,\"result\":\"Credit balance is too low\"}'\nexit 1",
+        ));
+        let launch = world.launch("hi");
+        let end = run(
+            &world.db,
+            &world.sink,
+            &world.registry,
+            launch,
+            ApiKey::Subscription,
+        )
+        .await;
+        assert_eq!(end, RunEnd::Finished);
+        assert_eq!(
+            only_turn(&world).error.as_deref(),
+            Some("Credit balance is too low")
+        );
     }
 
     struct VanishedItem;

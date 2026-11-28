@@ -172,6 +172,7 @@ impl Fixture {
                         status,
                         error: None,
                         restore_seen: None,
+                        clear_context_hash: false,
                         now: 50,
                     },
                 )
@@ -1287,6 +1288,53 @@ async fn a_member_change_or_a_folder_instructions_edit_sends_the_context_again()
     assert_eq!(fx.started("g", "fifth").text, "Messages:\nfifth");
 }
 
+const COMPACT_BOUNDARY: &str = r#"echo '{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"auto","pre_tokens":9000}}'"#;
+
+#[tokio::test]
+async fn a_compaction_clears_the_context_hash_so_the_next_turn_sends_the_details_again() {
+    let fx = Fixture::new();
+    fx.install(COMPACT_BOUNDARY);
+    let first = fx.started("g", "hello");
+    fx.run(first).await;
+    assert_eq!(hash_of(&fx), None);
+    let second = fx.started("g", "again");
+    assert!(second.text.starts_with("You are Ada"));
+    assert!(!second.text.contains("The group details changed:"));
+    assert!(second.text.ends_with("Messages:\nagain"));
+    fx.run(second).await;
+    assert!(fx.record("stdin.1").starts_with("You are Ada"));
+}
+
+#[tokio::test]
+async fn a_turn_without_a_compaction_keeps_the_context_hash() {
+    let fx = Fixture::new();
+    fx.install("");
+    let first = fx.started("g", "hello");
+    fx.run(first).await;
+    let hash = hash_of(&fx);
+    assert!(hash.is_some());
+    let second = fx.started("g", "again");
+    fx.run(second).await;
+    assert_eq!(hash_of(&fx), hash);
+}
+
+#[tokio::test]
+async fn a_compaction_in_a_group_turn_leaves_other_groups_of_the_agent_alone() {
+    let fx = Fixture::new();
+    fx.install("");
+    let other = fx.started("g2", "crew");
+    fx.run(other).await;
+    fx.install(COMPACT_BOUNDARY);
+    let first = fx.started("g", "hello");
+    fx.run(first).await;
+    assert_eq!(hash_of(&fx), None);
+    let crew: Option<String> = fx.value(
+        "SELECT context_hash FROM agent_group_sessions WHERE agent_id = 'a' AND group_id = 'g2'",
+        &[],
+    );
+    assert!(crew.is_some());
+}
+
 #[tokio::test]
 async fn a_reset_session_gets_the_context_again() {
     let fx = Fixture::new();
@@ -1513,6 +1561,34 @@ fn resume_releases_the_hold_so_an_old_chain_can_start_the_agents_entry() {
     assert_eq!(launches.len(), 1);
     assert_eq!(launches[0].agent_id, "a");
     assert_eq!(input(&launches[0]), "User: bo works\n\nfor ada");
+}
+
+#[tokio::test]
+async fn a_sign_in_failure_after_the_process_started_holds_the_agent_until_resume() {
+    let fx = Fixture::new();
+    fx.install("echo 'Not logged in' >&2\nexit 1");
+    let launch = fx.started("g", "hello");
+    fill_queues(&fx);
+    let mut launch = launch;
+    launch
+        .search_dirs
+        .extend(["/usr/bin".into(), "/bin".into()]);
+    let end = runner::run(&fx.db, &fx.sink, &fx.registry, launch, ApiKey::Subscription).await;
+    assert_eq!(end, RunEnd::AgentFailed);
+    note_end(&fx.registry, "a", end);
+    for group in [None, Some("g"), Some("g2")] {
+        assert!(fx.failed("a", group, end).is_empty(), "{group:?}");
+    }
+    assert_eq!(fx.queue_texts("g"), ["group one", "group two"]);
+    assert_eq!(
+        fx.value::<i64>("SELECT COUNT(*) FROM queued_messages", &[]),
+        2
+    );
+    assert!(fx.registry.is_held("a"));
+    assert!(resume(&fx.db, &fx.registry, &fx.dirs(), "a")
+        .unwrap()
+        .is_some());
+    assert!(!fx.registry.is_held("a"));
 }
 
 #[test]

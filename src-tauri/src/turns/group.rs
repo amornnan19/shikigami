@@ -722,6 +722,7 @@ pub struct Finish<'a> {
     pub status: &'a str,
     pub error: Option<&'a str>,
     pub restore_seen: Option<i64>,
+    pub clear_context_hash: bool,
     pub now: i64,
 }
 
@@ -733,6 +734,7 @@ pub fn finish_turn(connection: &Connection, finish: &Finish) -> rusqlite::Result
         status,
         error,
         restore_seen,
+        clear_context_hash,
         now,
     } = *finish;
     let transaction = connection.unchecked_transaction()?;
@@ -751,6 +753,13 @@ pub fn finish_turn(connection: &Connection, finish: &Finish) -> rusqlite::Result
             params![agent_id, group_id, turn_id],
         )?,
     };
+    if clear_context_hash {
+        transaction.execute(
+            "UPDATE agent_group_sessions SET context_hash = NULL
+             WHERE agent_id = ?1 AND group_id = ?2",
+            params![agent_id, group_id],
+        )?;
+    }
     transaction.execute(
         "UPDATE groups SET last_activity_at = ?2 WHERE id = ?1",
         params![group_id, now],
