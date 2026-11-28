@@ -107,7 +107,10 @@ function Workspace() {
           group={selectedGroup}
           agents={list}
           notice={notice}
-          onDeleted={() => setSelectedGroupId(null)}
+          onDeleted={() => {
+            setSelectedGroupId(null);
+            setNotice(null);
+          }}
         />
       ) : (
         <main className="flex flex-1 flex-col items-center justify-center gap-6 overflow-y-auto p-6">

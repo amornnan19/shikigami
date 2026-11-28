@@ -98,6 +98,7 @@ describe("group chats", () => {
     await $("#group-settings-name").setValue("Crew");
     await $("button=Save name").click();
     await expect($(`${groupView} h2`)).toHaveText("Crew");
+    await expect($("#group-header-lead")).toHaveText("Lead: Bo");
     await expect($(groupList)).toHaveText(expect.stringContaining("Crew"));
     await expect($("button=Save name")).toBeDisabled();
     await browser.keys("Escape");
@@ -134,8 +135,8 @@ describe("group chats", () => {
       "Add another agent to use this group.",
     );
     await browser.saveScreenshot(join(artifacts, "groups-too-few-members.png"));
+    await expect($("#group-header-lead")).toHaveText("Lead: Ada");
     await openSettings();
-    await expect($("#group-settings-lead")).toHaveText("Ada");
     await expect($("button=Save members")).toBeDisabled();
     await browser.saveScreenshot(join(artifacts, "groups-lead-reassigned.png"));
     await browser.keys("Escape");
