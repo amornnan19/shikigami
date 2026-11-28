@@ -22,6 +22,8 @@ export const fakeClaudeSettings = join(fakeProviderDir, "settings.log");
 export const fakeClaudeToolMarker = join(fakeProviderDir, "tool-ran");
 export const fakeClaudeApprovalMarker = join(fakeProviderDir, "approved-ran");
 export const fakeClaudeApprovals = join(fakeProviderDir, "approvals.log");
+export const fakeClaudeEnv = join(fakeProviderDir, "env.log");
+export const fakeClaudeSignedOut = join(fakeProviderDir, "signed-out");
 export const fakeClaudeRecordSeparator = "\n----\n";
 const fixtureDir = join(root, "src-tauri", "tests", "fixtures");
 const fixtureNames = ["claude-stream-basic.jsonl", "claude-stream-denied.jsonl"];
@@ -60,6 +62,7 @@ export function prepareFakeProviders() {
     fakeClaudePrompts,
     fakeClaudeSettings,
     fakeClaudeApprovals,
+    fakeClaudeEnv,
   ]) {
     writeFileSync(log, "");
   }
@@ -70,6 +73,7 @@ export function prepareFakeProviders() {
   for (const name of fixtureNames) {
     copyFileSync(join(fixtureDir, name), join(fakeProviderDir, name));
   }
+  rmSync(fakeClaudeSignedOut, { force: true });
   rmSync(fakeClaudeToolMarker, { force: true });
   rmSync(fakeClaudeApprovalMarker, { force: true });
   for (const name of readdirSync(fakeProviderDir)) {
@@ -84,7 +88,9 @@ dir="\${0%/*}"
 case "$1" in
   --help) echo "  --system-prompt-snapshot <on|off>" ;;
   --version) read -r version < "$dir/claude-version"; echo "$version" ;;
-  auth) echo '{"loggedIn": true}' ;;
+  auth)
+    if [ -f "$dir/signed-out" ]; then echo '{"loggedIn": false}'; exit 1; fi
+    echo '{"loggedIn": true}' ;;
   -p)
     safe=""
     prompt=""
@@ -95,6 +101,7 @@ case "$1" in
       safe="$safe $arg"
     done
     echo "$safe" >> "$dir/invocations.log"
+    printf 'CLAUDE_CONFIG_DIR=%s SHELL=%s CLAUDE_CODE_SHELL=%s\\n' "$CLAUDE_CONFIG_DIR" "$SHELL" "$CLAUDE_CODE_SHELL" >> "$dir/env.log"
     case "$safe " in
       *" --setting-sources  --strict-mcp-config --permission-mode manual --permission-prompts host "*) ;;
       *) echo "Claude Code was not started isolated." >&2; exit 2 ;;

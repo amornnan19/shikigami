@@ -24,6 +24,7 @@ impl ProbeOutput {
 }
 
 const ALLOWED_VARIABLES: [&str; 7] = ["HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "TERM"];
+pub const CONFIG_DIR_VARIABLE: &str = "CLAUDE_CONFIG_DIR";
 const ALLOWED_PREFIX: &str = "LC_";
 
 pub fn is_allowed_variable(name: &OsStr) -> bool {
@@ -37,7 +38,7 @@ pub async fn run(
     search_dirs: &[PathBuf],
     limit: Duration,
 ) -> Option<ProbeOutput> {
-    run_with(path, args, search_dirs, limit, false).await
+    run_with(path, args, search_dirs, limit, false, None).await
 }
 
 pub async fn run_allowlisted(
@@ -46,7 +47,17 @@ pub async fn run_allowlisted(
     search_dirs: &[PathBuf],
     limit: Duration,
 ) -> Option<ProbeOutput> {
-    run_with(path, args, search_dirs, limit, true).await
+    run_with(path, args, search_dirs, limit, true, None).await
+}
+
+pub async fn run_in_config_dir(
+    path: &Path,
+    args: &[&str],
+    search_dirs: &[PathBuf],
+    limit: Duration,
+    config_dir: &Path,
+) -> Option<ProbeOutput> {
+    run_with(path, args, search_dirs, limit, true, Some(config_dir)).await
 }
 
 async fn run_with(
@@ -55,6 +66,7 @@ async fn run_with(
     search_dirs: &[PathBuf],
     limit: Duration,
     allowlisted: bool,
+    config_dir: Option<&Path>,
 ) -> Option<ProbeOutput> {
     let search_path = env::join_paths(search_dirs).ok()?;
     let mut command = Command::new(path);
@@ -62,6 +74,9 @@ async fn run_with(
         command
             .env_clear()
             .envs(std::env::vars_os().filter(|(name, _)| is_allowed_variable(name)));
+    }
+    if let Some(config_dir) = config_dir {
+        command.env(CONFIG_DIR_VARIABLE, config_dir);
     }
     command
         .args(args)

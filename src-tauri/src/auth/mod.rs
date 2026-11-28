@@ -1,5 +1,6 @@
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use tauri::{AppHandle, Manager};
 
 use crate::api_key::{self, ApiKeyError, ApiKeyStatus, StatusCache};
@@ -7,6 +8,7 @@ use crate::db::Database;
 use crate::providers::{self, ProviderStatus, SignedIn, CLAUDE_CODE_ID};
 use crate::secrets::{SecretError, SecretStore, SharedStore};
 use crate::settings;
+use crate::DataDir;
 
 const AUTH_MODE_SETTING: &str = "claude.auth-mode";
 
@@ -170,7 +172,7 @@ pub struct SubscriptionStatus {
     pub installed: bool,
     pub version: Option<String>,
     pub signed_in: SignedIn,
-    pub sign_in_hint: &'static str,
+    pub sign_in_hint: String,
     pub install_hint: &'static str,
 }
 
@@ -187,6 +189,7 @@ fn assemble(
     provider: &ProviderStatus,
     setting: Option<AuthMode>,
     api_key: ApiKeyStatus,
+    config_dir: &Path,
 ) -> ClaudeAuth {
     ClaudeAuth {
         app_mode: effective_mode(None, setting, api_key.saved),
@@ -195,7 +198,7 @@ fn assemble(
             installed: provider.installed,
             version: provider.version.clone(),
             signed_in: provider.signed_in,
-            sign_in_hint: provider.sign_in_hint,
+            sign_in_hint: providers::claude_sign_in_command(config_dir),
             install_hint: provider.install_hint,
         },
         api_key,
@@ -219,9 +222,10 @@ fn claude_auth(
     db: &Database,
     store: &dyn SecretStore,
     cache: &StatusCache,
+    config_dir: &Path,
 ) -> Result<ClaudeAuth, AuthError> {
     let (setting, key) = gather(db, store, cache)?;
-    Ok(assemble(provider, setting, key))
+    Ok(assemble(provider, setting, key, config_dir))
 }
 
 #[tauri::command]
@@ -229,7 +233,11 @@ pub async fn get_claude_auth(app: AppHandle) -> Result<ClaudeAuth, AuthError> {
     let dirs = tauri::async_runtime::spawn_blocking(providers::search_dirs)
         .await
         .map_err(AuthError::database)?;
-    let provider = providers::claude_status(&dirs).await;
+    let config_dir = app
+        .try_state::<DataDir>()
+        .map(|data_dir| providers::claude_config_dir(&data_dir.0))
+        .ok_or_else(AuthError::unavailable)?;
+    let provider = providers::claude_status(&dirs, &config_dir).await;
     tauri::async_runtime::spawn_blocking(move || {
         let db = app
             .try_state::<Database>()
@@ -240,7 +248,7 @@ pub async fn get_claude_auth(app: AppHandle) -> Result<ClaudeAuth, AuthError> {
         let cache = app
             .try_state::<StatusCache>()
             .ok_or_else(AuthError::unavailable)?;
-        claude_auth(&provider, &db, &**store, &cache)
+        claude_auth(&provider, &db, &**store, &cache, &config_dir)
     })
     .await
     .map_err(AuthError::database)?
@@ -454,7 +462,14 @@ mod tests {
         assert_eq!(error.code, AuthError::KEYCHAIN_FAILED);
         let listed = load_app_auth(&fx.db, &Broken).unwrap();
         assert_eq!(listed.effective(None), Subscription);
-        let shown = claude_auth(&provider(), &fx.db, &Broken, &fx.cache).unwrap();
+        let shown = claude_auth(
+            &provider(),
+            &fx.db,
+            &Broken,
+            &fx.cache,
+            Path::new("/data/claude"),
+        )
+        .unwrap();
         assert!(shown.api_key.read_failed);
         assert_eq!(shown.app_mode, Subscription);
     }
@@ -467,7 +482,14 @@ mod tests {
         set_app_mode(&fx.db, Subscription).unwrap();
         assert_eq!(mode_for_agent(&fx.db, &Broken, "a").unwrap(), Subscription);
         assert_eq!(mode_for_agent(&fx.db, &Broken, "pinned").unwrap(), ApiKey);
-        let shown = claude_auth(&provider(), &fx.db, &Broken, &fx.cache).unwrap();
+        let shown = claude_auth(
+            &provider(),
+            &fx.db,
+            &Broken,
+            &fx.cache,
+            Path::new("/data/claude"),
+        )
+        .unwrap();
         assert!(shown.api_key.read_failed);
         assert!(shown.app_mode_explicit);
     }
@@ -476,7 +498,14 @@ mod tests {
     fn claude_auth_reports_the_state_and_never_decrypts() {
         let fx = fixture();
         let store = NeverDecrypts(MemoryStore::default());
-        let cold = claude_auth(&provider(), &fx.db, &store, &fx.cache).unwrap();
+        let cold = claude_auth(
+            &provider(),
+            &fx.db,
+            &store,
+            &fx.cache,
+            Path::new("/data/claude"),
+        )
+        .unwrap();
         assert_eq!(cold.app_mode, Subscription);
         assert!(!cold.app_mode_explicit);
         assert!(!cold.api_key.saved);
@@ -484,18 +513,35 @@ mod tests {
         store
             .set(api_key::ACCOUNT, &SecretString::new(KEY))
             .unwrap();
-        let saved = claude_auth(&provider(), &fx.db, &store, &StatusCache::default()).unwrap();
+        let saved = claude_auth(
+            &provider(),
+            &fx.db,
+            &store,
+            &StatusCache::default(),
+            Path::new("/data/claude"),
+        )
+        .unwrap();
         assert_eq!(saved.app_mode, ApiKey);
         assert!(!saved.app_mode_explicit);
         assert!(saved.api_key.saved);
         set_app_mode(&fx.db, Subscription).unwrap();
-        let chosen = claude_auth(&provider(), &fx.db, &store, &fx.cache).unwrap();
+        let chosen = claude_auth(
+            &provider(),
+            &fx.db,
+            &store,
+            &fx.cache,
+            Path::new("/data/claude"),
+        )
+        .unwrap();
         assert_eq!(chosen.app_mode, Subscription);
         assert!(chosen.app_mode_explicit);
         let json = serde_json::to_value(&chosen).unwrap();
         assert_eq!(json["appMode"], "subscription");
         assert_eq!(json["subscription"]["signedIn"], "no");
-        assert_eq!(json["subscription"]["signInHint"], "claude auth login");
+        assert_eq!(
+            json["subscription"]["signInHint"],
+            "CLAUDE_CONFIG_DIR='/data/claude' claude auth login"
+        );
         assert!(!json.to_string().contains("sk-ant"));
     }
 }
