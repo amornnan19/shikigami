@@ -18,6 +18,7 @@ export const fakeClaudeInvocations = join(fakeProviderDir, "invocations.log");
 export const fakeClaudeCwds = join(fakeProviderDir, "cwd.log");
 export const fakeClaudeStdins = join(fakeProviderDir, "stdin.log");
 export const fakeClaudePrompts = join(fakeProviderDir, "prompt.log");
+export const fakeClaudeSettings = join(fakeProviderDir, "settings.log");
 export const fakeClaudeRecordSeparator = "\n----\n";
 const fixtureDir = join(root, "src-tauri", "tests", "fixtures");
 const fixtureNames = ["claude-stream-basic.jsonl", "claude-stream-denied.jsonl"];
@@ -49,7 +50,13 @@ export function setFakeClaudeVersion(version: string) {
 export function prepareFakeProviders() {
   mkdirSync(fakeProviderDir, { recursive: true });
   setFakeClaudeVersion("9.9.9 (Fake Claude Code)");
-  for (const log of [fakeClaudeInvocations, fakeClaudeCwds, fakeClaudeStdins, fakeClaudePrompts]) {
+  for (const log of [
+    fakeClaudeInvocations,
+    fakeClaudeCwds,
+    fakeClaudeStdins,
+    fakeClaudePrompts,
+    fakeClaudeSettings,
+  ]) {
     writeFileSync(log, "");
   }
   for (const name of fixtureNames) {
@@ -87,6 +94,14 @@ case "$1" in
       *bypassPermissions*|*acceptEdits*|*dontAsk*|*dangerously*|*allowedTools*|*" auto"*)
         echo "Claude Code was started with a widened permission." >&2; exit 2 ;;
     esac
+    prev=""
+    for arg in "$@"; do
+      if [ "$prev" = "--settings" ]; then
+        cat "$arg" >> "$dir/settings.log"
+        printf '\\n----\\n' >> "$dir/settings.log"
+      fi
+      prev="$arg"
+    done
     message=$(cat)
     pwd -P >> "$dir/cwd.log"
     printf '%s\\n----\\n' "$message" >> "$dir/stdin.log"
@@ -102,6 +117,10 @@ case "$1" in
       exit 0
     fi
     case "$message" in
+      *NOSANDBOX*)
+        echo "Error: sandbox required but unavailable: seatbelt is missing" >&2
+        echo "  Refusing to start without a working sandbox (see sandbox.failIfUnavailable)." >&2
+        exit 1 ;;
       *STALL*)
         head -n 4 "$dir/claude-stream-basic.jsonl"
         sleep 60

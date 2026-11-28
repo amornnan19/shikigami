@@ -227,6 +227,11 @@ fn validate(
     })
 }
 
+pub(crate) fn recorded_workspaces(db: &Database) -> rusqlite::Result<Vec<PathBuf>> {
+    db.with_connection(store::workspace_paths)
+        .map(|paths| paths.into_iter().map(PathBuf::from).collect())
+}
+
 fn persist(
     db: &Database,
     root: &Path,

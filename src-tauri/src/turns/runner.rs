@@ -23,6 +23,7 @@ use crate::api_key::ApiKeyError;
 use crate::auth::AuthMode;
 use crate::db::Database;
 use crate::providers::{self, is_allowed_variable};
+use crate::sandbox;
 use crate::secrets::SecretString;
 
 const MAX_STEPS: usize = 500;
@@ -130,6 +131,7 @@ struct StderrSummary {
     last_line: Option<String>,
     session_missing: bool,
     sign_in: bool,
+    sandbox_unavailable: bool,
 }
 
 async fn read_stderr<R: AsyncReadExt + Unpin>(mut stderr: R) -> StderrSummary {
@@ -161,6 +163,7 @@ async fn read_stderr<R: AsyncReadExt + Unpin>(mut stderr: R) -> StderrSummary {
             .map(|line| claude_code::truncate(line, STDERR_LINE_LIMIT)),
         session_missing: text.contains(SESSION_MISSING),
         sign_in: claude_code::is_sign_in_failure(&text, None),
+        sandbox_unavailable: sandbox::is_unavailable(&text),
     }
 }
 
@@ -193,6 +196,15 @@ impl Attempt {
             Some((_, text)) => claude_code::is_sign_in_failure(text, self.api_error_status),
             None => self.stderr.sign_in,
         }
+    }
+
+    fn sandbox_unavailable(&self) -> bool {
+        self.stderr.sandbox_unavailable
+            || (!self.saw_init
+                && self
+                    .result
+                    .as_ref()
+                    .is_some_and(|(_, text)| sandbox::is_unavailable(text)))
     }
 
     fn session_missing(&self) -> bool {
@@ -229,15 +241,22 @@ struct Runner<'a> {
     hash_stored: bool,
 }
 
-struct InstructionsFile(Option<PathBuf>);
+struct TempFile(Option<PathBuf>);
 
-impl InstructionsFile {
+impl TempFile {
     fn write(temp_dir: &Path, text: &str) -> io::Result<Self> {
         if text.trim().is_empty() {
             return Ok(Self(None));
         }
+        Self::create(temp_dir, "instructions", "md", text)
+    }
+
+    fn create(temp_dir: &Path, prefix: &str, extension: &str, text: &str) -> io::Result<Self> {
         fs::create_dir_all(temp_dir)?;
-        let path = temp_dir.join(format!("instructions-{}.md", uuid::Uuid::new_v4().simple()));
+        let path = temp_dir.join(format!(
+            "{prefix}-{}.{extension}",
+            uuid::Uuid::new_v4().simple()
+        ));
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -254,7 +273,7 @@ impl InstructionsFile {
     }
 }
 
-impl Drop for InstructionsFile {
+impl Drop for TempFile {
     fn drop(&mut self) {
         if let Some(path) = &self.0 {
             let _ = fs::remove_file(path);
@@ -645,11 +664,14 @@ impl Runner<'_> {
         session: &Session,
         key: &ApiKey,
         group_flags: Option<&claude_code::GroupFlags>,
+        settings_file: &Path,
     ) -> Option<Command> {
         let search_path = env::join_paths(&launch.search_dirs).ok()?;
         let mut command = Command::new(&launch.executable);
         command
             .args(claude_code::arguments(&launch.model, session, group_flags))
+            .arg("--settings")
+            .arg(settings_file)
             .current_dir(&launch.workspace)
             .env_clear()
             .envs(
@@ -671,14 +693,40 @@ impl Runner<'_> {
         Some(command)
     }
 
+    fn settings_file(&self, launch: &Launch) -> Option<TempFile> {
+        let home = launch.sandbox.home.as_deref()?;
+        let others: Vec<PathBuf> = crate::agents::recorded_workspaces(self.db)
+            .ok()?
+            .iter()
+            .map(|path| sandbox::real_path(path))
+            .collect();
+        let settings = sandbox::turn_settings(
+            &sandbox::real_path(&launch.workspace),
+            &sandbox::real_path(&launch.sandbox.temp),
+            home,
+            &sandbox::real_path(&launch.sandbox.data_dir),
+            &others,
+        );
+        let text = serde_json::to_string(&settings).ok()?;
+        TempFile::create(&self.registry.temp_dir(), "settings", "json", &text).ok()
+    }
+
     async fn attempt(&mut self, launch: &Launch, session: &Session, key: &ApiKey) -> Attempt {
         let mut attempt = Attempt::default();
         if self.registry.is_closing() || self.registry.stop_requested(&self.agent_id, &self.turn_id)
         {
             return attempt;
         }
+        let Some(settings) = self.settings_file(launch) else {
+            attempt.failure = Some(sandbox::UNAVAILABLE_MESSAGE.to_owned());
+            return attempt;
+        };
+        let Some(settings_path) = settings.path() else {
+            attempt.failure = Some(sandbox::UNAVAILABLE_MESSAGE.to_owned());
+            return attempt;
+        };
         let instructions = match &launch.group {
-            Some(group) => match InstructionsFile::write(&group.temp_dir, &group.instructions) {
+            Some(group) => match TempFile::write(&group.temp_dir, &group.instructions) {
                 Ok(file) => Some(file),
                 Err(_) => {
                     attempt.failure = Some("Could not start Claude Code.".to_owned());
@@ -695,11 +743,13 @@ impl Runner<'_> {
             None => false,
         };
         let group_flags = launch.group.as_ref().map(|group| claude_code::GroupFlags {
-            instructions_file: instructions.as_ref().and_then(InstructionsFile::path),
+            instructions_file: instructions.as_ref().and_then(TempFile::path),
             snapshot_off,
             access: group.access,
         });
-        let Some(mut command) = self.command(launch, session, key, group_flags.as_ref()) else {
+        let Some(mut command) =
+            self.command(launch, session, key, group_flags.as_ref(), settings_path)
+        else {
             attempt.failure = Some("Could not start Claude Code.".to_owned());
             return attempt;
         };
@@ -803,6 +853,9 @@ fn stall_message(limit: Duration) -> String {
 fn failure_of(attempt: &Attempt) -> String {
     if let Some(message) = &attempt.failure {
         return message.clone();
+    }
+    if attempt.sandbox_unavailable() {
+        return sandbox::UNAVAILABLE_MESSAGE.to_owned();
     }
     match &attempt.result {
         Some((_, text)) if !text.trim().is_empty() => text.clone(),
@@ -933,14 +986,18 @@ async fn run_turn(
         runner.finish("stopped", None, attempt.compacted);
         RunEnd::Finished
     } else {
-        let sign_in = attempt.spawned && attempt.failure.is_none() && attempt.sign_in_failed();
+        let unavailable = attempt.sandbox_unavailable();
+        let sign_in = attempt.spawned
+            && attempt.failure.is_none()
+            && !unavailable
+            && attempt.sign_in_failed();
         let message = if sign_in {
             format!("{} {}", failure_of(&attempt), key.sign_in_guidance())
         } else {
             failure_of(&attempt)
         };
         runner.finish("failed", Some(message), attempt.compacted);
-        if attempt.spawned && !sign_in {
+        if attempt.spawned && !sign_in && !unavailable {
             RunEnd::Finished
         } else {
             RunEnd::AgentFailed
@@ -963,6 +1020,7 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::sync::Mutex;
 
+    const TEST_HOME: &str = "/Users/test-home";
     const BASIC: &str = include_str!("../../tests/fixtures/claude-stream-basic.jsonl");
     const DENIED: &str = include_str!("../../tests/fixtures/claude-stream-denied.jsonl");
 
@@ -1016,6 +1074,7 @@ mod tests {
                 )
                 .unwrap();
             });
+            let registry = TurnRegistry::with_temp_dir(data.path().join("tmp"));
             Self {
                 data,
                 bin: tempfile::tempdir().unwrap(),
@@ -1024,7 +1083,7 @@ mod tests {
                 environment: Mutex::new(Vec::new()),
                 db,
                 sink: Recorder::default(),
-                registry: TurnRegistry::default(),
+                registry,
             }
         }
 
@@ -1074,6 +1133,11 @@ mod tests {
                 stall_timeout: STALL_TIMEOUT,
                 tool_stall_timeout: TOOL_STALL_TIMEOUT,
                 group: None,
+                sandbox: sandbox::Scope {
+                    home: Some(PathBuf::from(TEST_HOME)),
+                    data_dir: self.data.path().to_path_buf(),
+                    temp: PathBuf::from("/var/folders/test/T"),
+                },
             }
         }
 
@@ -1102,7 +1166,7 @@ mod tests {
     fn recording(world: &World, rest: &str) -> String {
         let records = world.records().display();
         format!(
-            "n=$(ls \"{records}\" | grep -c '^args' || true)\nfor a in \"$@\"; do echo \"$a\"; done > \"{records}/args.$n\"\ncat > \"{records}/stdin.$n\"\nprintf '%s' \"$ANTHROPIC_API_KEY\" > \"{records}/key.$n\"\nprintf '%s' \"$ANTHROPIC_AUTH_TOKEN\" > \"{records}/token.$n\"\nprintf '%s' \"$ANTHROPIC_BASE_URL\" > \"{records}/base.$n\"\nprintf '%s' \"$LC_KEPT\" > \"{records}/kept.$n\"\n{rest}"
+            "n=$(ls \"{records}\" | grep -c '^args' || true)\nfor a in \"$@\"; do echo \"$a\"; done > \"{records}/args.$n\"\nprev=\"\"; for a in \"$@\"; do if [ \"$prev\" = \"--settings\" ]; then cp \"$a\" \"{records}/settings.$n\"; stat -f %Lp \"$a\" > \"{records}/settings-mode.$n\"; fi; prev=\"$a\"; done\ncat > \"{records}/stdin.$n\"\nprintf '%s' \"$ANTHROPIC_API_KEY\" > \"{records}/key.$n\"\nprintf '%s' \"$ANTHROPIC_AUTH_TOKEN\" > \"{records}/token.$n\"\nprintf '%s' \"$ANTHROPIC_BASE_URL\" > \"{records}/base.$n\"\nprintf '%s' \"$LC_KEPT\" > \"{records}/kept.$n\"\n{rest}"
         )
     }
 
@@ -1154,9 +1218,10 @@ mod tests {
         assert_isolated(&args);
         assert_eq!(args[12..14], ["--model", "haiku"]);
         assert_eq!(args[14], "--session-id");
-        assert_eq!(args.len(), 16);
+        assert_eq!(args.len(), 18);
         assert_eq!(args[15].len(), 36);
         assert_ne!(args[15], FIXTURE_SESSION);
+        assert_eq!(args[16], "--settings");
         assert!(!args.iter().any(|arg| arg.contains("pong")));
         assert_eq!(read(&world, "stdin.0"), "Reply with the word pong");
         assert_eq!(world.session().as_deref(), Some(FIXTURE_SESSION));
@@ -1175,7 +1240,7 @@ mod tests {
         world.send("two", ApiKey::Subscription).await;
         let second = args(&world, 1);
         assert_isolated(&second);
-        assert_eq!(second[14..], ["--resume", FIXTURE_SESSION]);
+        assert_eq!(second[14..16], ["--resume", FIXTURE_SESSION]);
         assert!(!second.iter().any(|arg| arg == "--session-id"));
         assert_eq!(world.turns().len(), 2);
     }
@@ -1609,7 +1674,7 @@ mod tests {
         let first = args(&world, 0);
         let second = args(&world, 1);
         assert_isolated(&second);
-        assert_eq!(first[14..], ["--resume", "old-id"]);
+        assert_eq!(first[14..16], ["--resume", "old-id"]);
         assert_eq!(second[14], "--session-id");
         assert_ne!(second[15], "old-id");
         assert_eq!(read(&world, "stdin.1"), "hello again");
@@ -2329,6 +2394,196 @@ mod tests {
             only_turn(&world).error.as_deref(),
             Some("Not logged in · Please run /login Sign in again, then press Resume.")
         );
+    }
+
+    fn arg_after(args: &[String], flag: &str) -> String {
+        let at = args.iter().position(|arg| arg == flag).unwrap();
+        args[at + 1].clone()
+    }
+
+    #[tokio::test]
+    async fn every_turn_passes_a_private_settings_file_with_the_turn_settings_and_removes_it() {
+        let world = World::new();
+        let fixture = world.fixture("basic.jsonl", BASIC);
+        world.install(&recording(
+            &world,
+            &format!("cat \"{}\"", fixture.display()),
+        ));
+        world.send("hi", ApiKey::Subscription).await;
+        let args = args(&world, 0);
+        assert_isolated(&args);
+        let path = PathBuf::from(arg_after(&args, "--settings"));
+        assert!(path.starts_with(world.data.path().join("tmp")));
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("settings-") && name.ends_with(".json"));
+        assert_eq!(read(&world, "settings-mode.0").trim(), "600");
+        let expected = sandbox::turn_settings(
+            &fs::canonicalize(world.workspace.path()).unwrap(),
+            Path::new("/var/folders/test/T"),
+            Path::new(TEST_HOME),
+            &fs::canonicalize(world.data.path()).unwrap(),
+            &[],
+        );
+        let written: serde_json::Value = serde_json::from_str(&read(&world, "settings.0")).unwrap();
+        assert_eq!(written, expected);
+        assert!(written["sandbox"]["failIfUnavailable"].as_bool().unwrap());
+        assert!(!path.exists());
+        assert_eq!(
+            fs::read_dir(world.data.path().join("tmp")).unwrap().count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn the_settings_of_a_turn_protect_the_other_agents_workspaces_but_not_its_own_folder() {
+        let world = World::new();
+        let other = tempfile::tempdir().unwrap();
+        let other_path = other.path().to_string_lossy().into_owned();
+        world.db.with_connection(|c| {
+            c.execute(
+                "INSERT INTO agents (id, name, color, provider, model, workspace_path, created_at, last_activity_at)
+                 VALUES ('b', 'Bo', 'blue', 'claude-code', 'haiku', ?1, 1, 1)",
+                [other_path],
+            )
+            .unwrap();
+        });
+        let fixture = world.fixture("basic.jsonl", BASIC);
+        world.install(&recording(
+            &world,
+            &format!("cat \"{}\"", fixture.display()),
+        ));
+        world.send("hi", ApiKey::Subscription).await;
+        let written: serde_json::Value = serde_json::from_str(&read(&world, "settings.0")).unwrap();
+        let denied: Vec<&str> = written["sandbox"]["filesystem"]["denyRead"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|path| path.as_str().unwrap())
+            .collect();
+        let own = fs::canonicalize(world.workspace.path()).unwrap();
+        let theirs = fs::canonicalize(other.path()).unwrap();
+        assert!(denied.contains(&theirs.to_string_lossy().as_ref()));
+        assert!(!denied.contains(&own.to_string_lossy().as_ref()));
+        assert!(denied.contains(&"/Users/test-home/.ssh"));
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_that_cannot_start_ends_the_turn_failed_with_the_message_and_holds_the_agent()
+    {
+        let world = World::new();
+        world.install(&recording(
+            &world,
+            "echo 'Error: sandbox required but unavailable: seatbelt is missing' >&2\necho '  Refusing to start without a working sandbox (see sandbox.failIfUnavailable).' >&2\nexit 1",
+        ));
+        let launch = world.launch("hi");
+        let end = run(
+            &world.db,
+            &world.sink,
+            &world.registry,
+            launch,
+            ApiKey::Subscription,
+        )
+        .await;
+        assert_eq!(end, RunEnd::AgentFailed);
+        let turn = only_turn(&world);
+        assert_eq!(turn.status, "failed");
+        assert_eq!(
+            turn.error.as_deref(),
+            Some("The sandbox could not start, so this agent did not run.")
+        );
+        assert!(turn.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_refusal_reported_before_the_session_starts_also_fails_the_turn_closed() {
+        let world = World::new();
+        world.install(&recording(
+            &world,
+            "echo '{\"type\":\"result\",\"subtype\":\"error\",\"is_error\":true,\"result\":\"Error: sandbox required but unavailable: x\"}'\nexit 1",
+        ));
+        let launch = world.launch("hi");
+        let end = run(
+            &world.db,
+            &world.sink,
+            &world.registry,
+            launch,
+            ApiKey::Subscription,
+        )
+        .await;
+        assert_eq!(end, RunEnd::AgentFailed);
+        assert_eq!(
+            only_turn(&world).error.as_deref(),
+            Some("The sandbox could not start, so this agent did not run.")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_sandbox_text_inside_a_running_session_is_an_ordinary_failure() {
+        let world = World::new();
+        world.install(&recording(
+            &world,
+            "echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\"}'\necho '{\"type\":\"result\",\"subtype\":\"error\",\"is_error\":true,\"result\":\"sandbox required but unavailable\"}'\nexit 1",
+        ));
+        let launch = world.launch("hi");
+        let end = run(
+            &world.db,
+            &world.sink,
+            &world.registry,
+            launch,
+            ApiKey::Subscription,
+        )
+        .await;
+        assert_eq!(end, RunEnd::Finished);
+        assert_eq!(
+            only_turn(&world).error.as_deref(),
+            Some("sandbox required but unavailable")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_without_a_known_home_fails_closed_and_starts_no_process() {
+        let world = World::new();
+        world.install(&recording(&world, "exit 0"));
+        let mut launch = world.launch("hi");
+        launch.sandbox.home = None;
+        let end = run(
+            &world.db,
+            &world.sink,
+            &world.registry,
+            launch,
+            ApiKey::Subscription,
+        )
+        .await;
+        assert_eq!(end, RunEnd::AgentFailed);
+        assert_eq!(
+            only_turn(&world).error.as_deref(),
+            Some("The sandbox could not start, so this agent did not run.")
+        );
+        assert!(!has_record(&world, "args.0"));
+    }
+
+    #[tokio::test]
+    async fn a_settings_file_that_cannot_be_written_fails_closed_and_starts_no_process() {
+        let mut world = World::new();
+        let blocker = world.data.path().join("blocker");
+        fs::write(&blocker, "x").unwrap();
+        world.registry = TurnRegistry::with_temp_dir(blocker.join("tmp"));
+        world.install(&recording(&world, "exit 0"));
+        let launch = world.launch("hi");
+        let end = run(
+            &world.db,
+            &world.sink,
+            &world.registry,
+            launch,
+            ApiKey::Subscription,
+        )
+        .await;
+        assert_eq!(end, RunEnd::AgentFailed);
+        assert_eq!(
+            only_turn(&world).error.as_deref(),
+            Some("The sandbox could not start, so this agent did not run.")
+        );
+        assert!(!has_record(&world, "args.0"));
     }
 
     #[tokio::test]

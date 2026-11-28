@@ -235,7 +235,7 @@ impl Fixture {
         let fixture = self.records.path().join("basic.jsonl");
         fs::write(&fixture, BASIC).unwrap();
         let script = format!(
-            "#!/bin/sh\ncase \"$1\" in --help) [ -f \"{records}/help-delay\" ] && sleep 2; echo '  --system-prompt-snapshot <on|off>'; exit 0;; esac\nn=$(ls \"{records}\" | grep -c '^args' || true)\nfor a in \"$@\"; do printf '%s\\0' \"$a\"; done > \"{records}/args.$n\"\nprev=\"\"; for a in \"$@\"; do if [ \"$prev\" = --append-system-prompt-file ]; then cp \"$a\" \"{records}/prompt.$n\"; stat -f %Lp \"$a\" > \"{records}/mode.$n\"; echo \"$a\" > \"{records}/promptpath.$n\"; fi; prev=\"$a\"; done\ncat > \"{records}/stdin.$n\"\npwd > \"{records}/pwd.$n\"\n{body}\ncat \"{}\"\n",
+            "#!/bin/sh\ncase \"$1\" in --help) [ -f \"{records}/help-delay\" ] && sleep 2; echo '  --system-prompt-snapshot <on|off>'; exit 0;; esac\nn=$(ls \"{records}\" | grep -c '^args' || true)\nfor a in \"$@\"; do printf '%s\\0' \"$a\"; done > \"{records}/args.$n\"\nprev=\"\"; for a in \"$@\"; do if [ \"$prev\" = --append-system-prompt-file ]; then cp \"$a\" \"{records}/prompt.$n\"; stat -f %Lp \"$a\" > \"{records}/mode.$n\"; echo \"$a\" > \"{records}/promptpath.$n\"; fi; prev=\"$a\"; done\nprev=\"\"; for a in \"$@\"; do if [ \"$prev\" = --settings ]; then cp \"$a\" \"{records}/settings.$n\"; fi; prev=\"$a\"; done\ncat > \"{records}/stdin.$n\"\npwd > \"{records}/pwd.$n\"\n{body}\ncat \"{}\"\n",
             fixture.display()
         );
         let claude = self.bin.path().join("claude");
@@ -618,6 +618,42 @@ fn a_missing_oversized_or_linked_folder_instructions_file_is_left_out() {
 }
 
 #[tokio::test]
+async fn a_group_turn_is_confined_to_the_group_folder_and_protects_every_member_workspace() {
+    let fx = Fixture::new();
+    fx.install("");
+    let launch = fx.started("g", "hello");
+    fx.run(launch).await;
+    let settings: serde_json::Value = serde_json::from_str(&fx.record("settings.0")).unwrap();
+    let folder = fs::canonicalize(fx.folder.path()).unwrap();
+    let folder = folder.to_string_lossy().into_owned();
+    let write = settings["sandbox"]["filesystem"]["allowWrite"]
+        .as_array()
+        .unwrap();
+    assert_eq!(write[0].as_str(), Some(folder.as_str()));
+    let read: Vec<&str> = settings["sandbox"]["filesystem"]["denyRead"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|path| path.as_str().unwrap())
+        .collect();
+    assert!(!read.contains(&folder.as_str()));
+    let data = fs::canonicalize(fx._data.path()).unwrap();
+    assert!(read.contains(&data.to_string_lossy().as_ref()));
+    for name in ["Ada", "Bo"] {
+        let workspace = fs::canonicalize(fx.workspaces.path().join(name)).unwrap();
+        assert!(
+            read.contains(&workspace.to_string_lossy().as_ref()),
+            "{name}"
+        );
+    }
+    assert_eq!(settings["sandbox"]["failIfUnavailable"], true);
+    assert_eq!(
+        settings["permissions"]["allow"][1],
+        format!("Edit(/{folder}/**)")
+    );
+}
+
+#[tokio::test]
 async fn a_group_turn_runs_in_the_group_folder_isolated_with_the_prompt_and_the_input() {
     let fx = Fixture::new();
     fx.install("");
@@ -663,7 +699,11 @@ async fn a_group_turn_runs_in_the_group_folder_isolated_with_the_prompt_and_the_
         0
     );
     assert!(!args.iter().any(|arg| arg == "--append-system-prompt"));
-    assert_eq!(args[args.len() - 2..], ["--system-prompt-snapshot", "off"]);
+    assert_eq!(
+        args[args.len() - 4..args.len() - 2],
+        ["--system-prompt-snapshot", "off"]
+    );
+    assert_eq!(args[args.len() - 2], "--settings");
     assert!(args.contains(&"--session-id".to_owned()));
     let second_args = fx.args(1);
     assert_isolated(&second_args);

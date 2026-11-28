@@ -194,6 +194,13 @@ impl TurnRegistry {
         self.held().contains(agent_id)
     }
 
+    fn data_dir(&self) -> PathBuf {
+        self.temp_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default()
+    }
+
     fn temp_dir(&self) -> PathBuf {
         if self.temp_dir.as_os_str().is_empty() {
             std::env::temp_dir()
@@ -414,6 +421,7 @@ pub struct Launch {
     pub stall_timeout: Duration,
     pub tool_stall_timeout: Duration,
     pub group: Option<GroupRun>,
+    pub sandbox: crate::sandbox::Scope,
 }
 
 fn stall_timeout() -> Duration {
@@ -492,6 +500,7 @@ fn launch_of(
         stall_timeout: stall_timeout(),
         tool_stall_timeout: TOOL_STALL_TIMEOUT,
         group: None,
+        sandbox: crate::sandbox::Scope::current(registry.data_dir()),
     })
 }
 
@@ -546,6 +555,7 @@ fn launch_of_group(
         stall_timeout: stall_timeout(),
         tool_stall_timeout: TOOL_STALL_TIMEOUT,
         group: Some(run),
+        sandbox: crate::sandbox::Scope::current(registry.data_dir()),
     })
 }
 
@@ -913,7 +923,7 @@ pub fn drop_departed_hand_offs(
     group::drop_for_departed(connection, group_id, agent_id, now_millis())
 }
 
-pub fn sweep_instruction_files(dir: &Path) -> usize {
+pub fn sweep_temp_files(dir: &Path) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
@@ -922,9 +932,9 @@ pub fn sweep_instruction_files(dir: &Path) -> usize {
         .filter(|entry| {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            name.starts_with("instructions-")
-                && name.ends_with(".md")
-                && entry.file_type().is_ok_and(|kind| kind.is_file())
+            let ours = (name.starts_with("instructions-") && name.ends_with(".md"))
+                || (name.starts_with("settings-") && name.ends_with(".json"));
+            ours && entry.file_type().is_ok_and(|kind| kind.is_file())
         })
         .filter(|entry| std::fs::remove_file(entry.path()).is_ok())
         .count()
@@ -1589,12 +1599,18 @@ mod tests {
     }
 
     #[test]
-    fn the_startup_sweep_removes_only_regular_instruction_files_of_its_own_folder() {
+    fn the_startup_sweep_removes_only_regular_instruction_and_settings_files_of_its_own_folder() {
         use std::os::unix::fs::symlink;
         let outside = tempfile::tempdir().unwrap();
         let victim = outside.path().join("instructions-victim.md");
         fs::write(&victim, "keep").unwrap();
+        let settings_victim = outside.path().join("settings-victim.json");
+        fs::write(&settings_victim, "keep").unwrap();
         let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("settings-a.json"), "x").unwrap();
+        fs::write(dir.path().join("settings-b.md"), "x").unwrap();
+        fs::write(dir.path().join("other-c.json"), "x").unwrap();
+        symlink(&settings_victim, dir.path().join("settings-link.json")).unwrap();
         fs::write(dir.path().join("instructions-a.md"), "x").unwrap();
         fs::write(dir.path().join("instructions-b.md"), "x").unwrap();
         fs::write(dir.path().join("notes.md"), "x").unwrap();
@@ -1608,7 +1624,7 @@ mod tests {
         )
         .unwrap();
         symlink(&victim, dir.path().join("instructions-link.md")).unwrap();
-        assert_eq!(sweep_instruction_files(dir.path()), 2);
+        assert_eq!(sweep_temp_files(dir.path()), 3);
         let mut left: Vec<String> = fs::read_dir(dir.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
@@ -1620,16 +1636,20 @@ mod tests {
                 "instructions-c.txt",
                 "instructions-d.md",
                 "instructions-link.md",
-                "notes.md"
+                "notes.md",
+                "other-c.json",
+                "settings-b.md",
+                "settings-link.json"
             ]
         );
         assert!(victim.is_file());
+        assert!(settings_victim.is_file());
         assert!(dir
             .path()
             .join("instructions-d.md")
             .join("instructions-e.md")
             .is_file());
-        assert_eq!(sweep_instruction_files(&dir.path().join("missing")), 0);
+        assert_eq!(sweep_temp_files(&dir.path().join("missing")), 0);
     }
 
     #[test]
