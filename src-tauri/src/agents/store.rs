@@ -135,7 +135,7 @@ pub fn list(connection: &Connection) -> rusqlite::Result<Vec<AgentRow>> {
                    ORDER BY t.started_at DESC, t.rowid DESC LIMIT 1),
                 a.auth_mode,
                 EXISTS(SELECT 1 FROM approvals ap JOIN turns t ON t.id = ap.turn_id
-                       WHERE t.agent_id = a.id AND ap.status = 'pending')
+                       WHERE t.agent_id = a.id AND t.group_id IS NULL AND ap.status = 'pending')
          FROM agents a
          ORDER BY a.last_activity_at DESC, a.created_at DESC, a.rowid DESC",
     )?;

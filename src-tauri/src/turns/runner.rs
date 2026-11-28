@@ -39,7 +39,7 @@ const TEXT_WRITE_INTERVAL: Duration = Duration::from_millis(500);
 const EXIT_GRACE: Duration = Duration::from_secs(5);
 const STDERR_GRACE: Duration = Duration::from_secs(2);
 const SNAPSHOT_FLAG: &str = "--system-prompt-snapshot";
-const MINIMUM_VERSION: [u32; 3] = [2, 1, 285];
+const MINIMUM_VERSION: [u32; 3] = [2, 1, 314];
 const TOO_OLD_MESSAGE: &str =
     "This Claude Code version is too old to run safely. Update it, then press Resume.";
 const VERSION_UNREADABLE_MESSAGE: &str =
@@ -936,6 +936,8 @@ impl Runner<'_> {
         });
         let mut signals = self.registry.open_signals(&self.turn_id);
         let mut last_activity = tokio::time::Instant::now();
+        let mut requests_open = true;
+        let mut signals_open = true;
         loop {
             let limit = if self.step_inputs.is_empty() {
                 launch.stall_timeout
@@ -948,7 +950,7 @@ impl Runner<'_> {
                 .unwrap_or(last_activity + limit);
             let read = tokio::select! {
                 line = lines.recv() => Some(line.unwrap_or(Ok(Line::End))),
-                inbound = approvals.next() => {
+                inbound = approvals.next(), if requests_open => {
                     match inbound {
                         Some(Inbound::Request { conn, id, tool, input, .. }) => {
                             self.open_approval(&approvals, conn, id, tool, input).await;
@@ -956,18 +958,18 @@ impl Runner<'_> {
                         Some(Inbound::Closed { conn }) => {
                             self.drop_connection(&approvals, conn).await;
                         }
-                        None => std::future::pending().await,
+                        None => requests_open = false,
                     }
                     None
                 }
-                message = signals.recv() => {
+                message = signals.recv(), if signals_open => {
                     match message {
                         Some(Message::Answer { approval_id, allow }) => {
                             self.answer_approval(&approvals, &approval_id, allow).await;
                         }
                         Some(Message::Stop) => self.deny_approvals(&approvals, false).await,
                         Some(Message::Shutdown) => self.deny_approvals(&approvals, true).await,
-                        None => std::future::pending().await,
+                        None => signals_open = false,
                     }
                     None
                 }
@@ -2975,7 +2977,7 @@ mod tests {
     async fn a_claude_code_older_than_the_minimum_or_unreadable_fails_closed_and_starts_no_turn() {
         for (version, message) in [
             (
-                "2.1.284 (Claude Code)",
+                "2.1.313 (Claude Code)",
                 "This Claude Code version is too old to run safely. Update it, then press Resume.",
             ),
             (
@@ -3044,7 +3046,7 @@ mod tests {
         fs::write(
             &path,
             format!(
-                "#!/bin/sh\ncase \"$1\" in --version) echo '2.1.285 (Claude Code)'; exit 0;; esac\n{body}\n"
+                "#!/bin/sh\ncase \"$1\" in --version) echo '2.1.314 (Claude Code)'; exit 0;; esac\n{body}\n"
             ),
         )
         .unwrap();

@@ -19,6 +19,7 @@ pub const LINE_LIMIT: usize = 1024 * 1024;
 const SOCKET_PATH_LIMIT: usize = 100;
 const SOCKET_FILE_LENGTH: usize = 13;
 const HELLO_WAIT: Duration = Duration::from_secs(5);
+const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Inbound {
@@ -32,6 +33,21 @@ pub enum Inbound {
     Closed {
         conn: u64,
     },
+}
+
+#[cfg(test)]
+thread_local! {
+    static LAST_ACCEPTER: std::cell::RefCell<Option<tokio::task::AbortHandle>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub fn abort_last_accepter() {
+    LAST_ACCEPTER.with(|last| {
+        if let Some(handle) = last.borrow_mut().take() {
+            handle.abort();
+        }
+    });
 }
 
 type Writers = Arc<Mutex<HashMap<u64, OwnedWriteHalf>>>;
@@ -165,6 +181,8 @@ impl Channel {
             Arc::clone(&writers),
             sender,
         ));
+        #[cfg(test)]
+        LAST_ACCEPTER.with(|last| *last.borrow_mut() = Some(accepter.abort_handle()));
         Ok(Self {
             path,
             token,
@@ -172,6 +190,11 @@ impl Channel {
             writers,
             accepter,
         })
+    }
+
+    #[cfg(test)]
+    pub fn stop_accepting(&self) {
+        self.accepter.abort();
     }
 
     pub fn path(&self) -> &Path {
@@ -215,7 +238,8 @@ async fn accept_loop(
     let mut next_conn = 0u64;
     loop {
         let Ok((stream, _)) = listener.accept().await else {
-            break;
+            tokio::time::sleep(ACCEPT_RETRY).await;
+            continue;
         };
         next_conn += 1;
         connections.spawn(serve(

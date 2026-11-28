@@ -363,3 +363,11 @@ fn a_short_folder_keeps_its_socket_where_it_is() {
     let dir = tempfile::tempdir().unwrap();
     assert_eq!(socket_dir(dir.path()), dir.path());
 }
+
+#[tokio::test]
+async fn a_channel_whose_accepter_has_ended_reports_no_more_requests() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut channel = Channel::bind(dir.path()).unwrap();
+    channel.stop_accepting();
+    assert_eq!(timeout(WAIT, channel.next()).await.unwrap(), None);
+}

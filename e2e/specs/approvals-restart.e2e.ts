@@ -12,7 +12,7 @@ describe("approval cards after a restart", () => {
   it("keeps the outcome and the time of every past card in an agent chat", async () => {
     await $(sidebar).$("button*=Ada").click();
     await expect($(`${agentView} h2`)).toHaveText("Ada");
-    await expect($$(`${agentView} ${card}`)).toBeElementsArrayOfSize(7, { wait: 20000 });
+    await expect($$(`${agentView} ${card}`)).toBeElementsArrayOfSize(8, { wait: 20000 });
     const outcomes = await $$(`${agentView} ${card} [data-approval-outcome]`).map((outcome) =>
       outcome.getText(),
     );
@@ -23,12 +23,20 @@ describe("approval cards after a restart", () => {
       "Allowed",
       "Timed out",
       "Denied because the turn stopped",
+      "Allowed",
       "Denied because Shikigami closed",
     ]);
     for (const text of outcomes) {
       expect(text).toMatch(/\d{1,2}:\d{2}\s?[AP]M$/);
     }
-    await expect($(`${agentView} ${card} button`)).not.toExist();
+    const open = await browser.execute(
+      () =>
+        Array.from(
+          document.querySelectorAll('section[aria-label="Approval request"] button'),
+        ).filter((button) => button.textContent === "Allow once" || button.textContent === "Deny")
+          .length,
+    );
+    expect(open).toBe(0);
     await expect($(`${sidebar} [aria-label="Waiting for you"]`)).not.toExist();
     await browser.execute(() => {
       const scroller = document.querySelector('section[aria-label="Agent"] .overflow-y-auto');

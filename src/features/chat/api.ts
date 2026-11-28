@@ -26,7 +26,7 @@ export interface TextItem {
 }
 
 export type ApprovalStatus = "pending" | "allowed" | "denied" | "timed-out";
-export type ApprovalAnsweredBy = "user" | "timeout" | "stop" | "shutdown";
+export type ApprovalAnsweredBy = "user" | "timeout" | "stop" | "shutdown" | "relay";
 
 export interface Approval {
   type: "approval";
@@ -35,6 +35,7 @@ export interface Approval {
   summary: string;
   detail: string;
   reason: string | null;
+  target: string | null;
   status: ApprovalStatus;
   answeredBy: ApprovalAnsweredBy | null;
   createdAt: number;

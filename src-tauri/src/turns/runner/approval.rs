@@ -3,20 +3,21 @@ use tokio::time::Instant;
 
 use super::Runner;
 use crate::approvals::store::{
-    self, NewApproval, Outcome, ALLOWED_BY_USER, DENIED_BY_SHUTDOWN, DENIED_BY_STOP,
-    DENIED_BY_USER, TIMED_OUT,
+    self, NewApproval, Outcome, ALLOWED_BY_USER, DENIED_BY_RELAY, DENIED_BY_SHUTDOWN,
+    DENIED_BY_STOP, DENIED_BY_USER, TIMED_OUT,
 };
 use crate::approvals::{
-    allow_reply, deny_reply, Channel, DENY_BUSY, DENY_SHUTDOWN, DENY_STOP, DENY_TIMEOUT,
-    DENY_UNREACHABLE, DENY_USER, MAX_OPEN,
+    allow_reply, deny_reply, Channel, DENY_BUSY, DENY_INTERRUPTED, DENY_SHUTDOWN, DENY_STOP,
+    DENY_TIMEOUT, DENY_UNREACHABLE, DENY_USER, MAX_OPEN,
 };
 use crate::turns::claude_code::{truncate, DETAIL_LIMIT};
 use crate::turns::redact::Redactor;
 use crate::turns::TurnEvent;
 
-const SUMMARY_LIMIT: usize = 600;
+const SUMMARY_LIMIT: usize = DETAIL_LIMIT;
 const REASON_LIMIT: usize = 400;
 const TARGET_FIELDS: [&str; 6] = ["command", "file_path", "path", "url", "pattern", "query"];
+const LOCATION_FIELDS: [&str; 3] = ["file_path", "path", "url"];
 
 pub(super) struct Pending {
     conn: u64,
@@ -29,6 +30,7 @@ pub(super) struct Described {
     summary: String,
     detail: String,
     reason: Option<String>,
+    target: Option<String>,
 }
 
 fn text_field<'a>(input: &'a Value, name: &str) -> Option<&'a str> {
@@ -53,6 +55,10 @@ pub(super) fn describe(redactor: &Redactor, tool: &str, input: &Value) -> Descri
     Described {
         summary: truncate(&redactor.redact(&summary), SUMMARY_LIMIT),
         detail: truncate(&detail, DETAIL_LIMIT),
+        target: LOCATION_FIELDS
+            .iter()
+            .find_map(|field| text_field(input, field))
+            .map(|target| truncate(&redactor.redact(target), SUMMARY_LIMIT)),
         reason: text_field(input, "description")
             .map(|reason| truncate(&redactor.redact(reason), REASON_LIMIT)),
     }
@@ -62,6 +68,10 @@ pub(super) fn describe(redactor: &Redactor, tool: &str, input: &Value) -> Descri
 impl Described {
     pub(super) fn summary(&self) -> &str {
         &self.summary
+    }
+
+    pub(super) fn target(&self) -> Option<&str> {
+        self.target.as_deref()
     }
 
     pub(super) fn reason(&self) -> Option<&str> {
@@ -110,6 +120,7 @@ impl Runner<'_> {
                     summary: &described.summary,
                     detail: &described.detail,
                     reason: described.reason.as_deref(),
+                    target: described.target.as_deref(),
                     created_at,
                 },
             )?;
@@ -204,7 +215,7 @@ impl Runner<'_> {
             .map(|(id, _)| id.clone())
             .collect();
         for id in ids {
-            self.decide(session, &id, DENIED_BY_STOP).await;
+            self.decide(session, &id, DENIED_BY_RELAY).await;
         }
     }
 }
@@ -214,6 +225,7 @@ fn denial_message(outcome: &Outcome) -> &'static str {
         "timeout" => DENY_TIMEOUT,
         "stop" => DENY_STOP,
         "shutdown" => DENY_SHUTDOWN,
+        "relay" => DENY_INTERRUPTED,
         _ => DENY_USER,
     }
 }

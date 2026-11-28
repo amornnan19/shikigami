@@ -878,6 +878,7 @@ mod tests {
                         summary: "ls",
                         detail: "{}",
                         reason: None,
+                        target: None,
                         created_at: at,
                     },
                 )

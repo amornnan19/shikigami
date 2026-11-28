@@ -32,6 +32,7 @@ describe("applyEvent", () => {
       summary: "ls -la",
       detail: "{}",
       reason: null,
+      target: null,
       status: "pending",
       answeredBy: null,
       createdAt: 5,

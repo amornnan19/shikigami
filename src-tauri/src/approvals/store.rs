@@ -9,6 +9,7 @@ pub struct ApprovalView {
     pub summary: String,
     pub detail: String,
     pub reason: Option<String>,
+    pub target: Option<String>,
     pub status: String,
     pub answered_by: Option<String>,
     pub created_at: i64,
@@ -23,6 +24,7 @@ pub struct NewApproval<'a> {
     pub summary: &'a str,
     pub detail: &'a str,
     pub reason: Option<&'a str>,
+    pub target: Option<&'a str>,
     pub created_at: i64,
 }
 
@@ -47,12 +49,17 @@ pub const DENIED_BY_STOP: Outcome = Outcome {
     status: "denied",
     answered_by: "stop",
 };
+pub const DENIED_BY_RELAY: Outcome = Outcome {
+    status: "denied",
+    answered_by: "relay",
+};
 pub const DENIED_BY_SHUTDOWN: Outcome = Outcome {
     status: "denied",
     answered_by: "shutdown",
 };
 
-const VIEW_COLUMNS: &str = "a.id, a.tool, a.summary, a.detail, a.reason, a.status, a.answered_by,
+const VIEW_COLUMNS: &str =
+    "a.id, a.tool, a.summary, a.detail, a.reason, a.target, a.status, a.answered_by,
         a.created_at, a.answered_at, COALESCE(g.folder_path, ag.workspace_path, '')";
 const VIEW_JOINS: &str = "FROM approvals a
         JOIN turns t ON t.id = a.turn_id
@@ -66,18 +73,19 @@ fn view_of(row: &rusqlite::Row) -> rusqlite::Result<ApprovalView> {
         summary: row.get(2)?,
         detail: row.get(3)?,
         reason: row.get(4)?,
-        status: row.get(5)?,
-        answered_by: row.get(6)?,
-        created_at: row.get(7)?,
-        answered_at: row.get(8)?,
-        folder: row.get(9)?,
+        target: row.get(5)?,
+        status: row.get(6)?,
+        answered_by: row.get(7)?,
+        created_at: row.get(8)?,
+        answered_at: row.get(9)?,
+        folder: row.get(10)?,
     })
 }
 
 pub fn insert(connection: &Connection, approval: &NewApproval) -> rusqlite::Result<()> {
     connection.execute(
-        "INSERT INTO approvals (id, turn_id, tool, summary, detail, reason, status, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7)",
+        "INSERT INTO approvals (id, turn_id, tool, summary, detail, reason, target, status, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8)",
         params![
             approval.id,
             approval.turn_id,
@@ -85,6 +93,7 @@ pub fn insert(connection: &Connection, approval: &NewApproval) -> rusqlite::Resu
             approval.summary,
             approval.detail,
             approval.reason,
+            approval.target,
             approval.created_at
         ],
     )?;
@@ -193,6 +202,7 @@ mod tests {
                     summary: "ls",
                     detail: "{}",
                     reason: Some("why"),
+                    target: None,
                     created_at,
                 },
             )
