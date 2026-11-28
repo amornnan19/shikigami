@@ -9,6 +9,10 @@ pub const PROTECTED_FOLDER_MESSAGE: &str = "It is inside a protected location.";
 pub const CANARY_TOOL: &str = "NotebookEdit";
 pub const API_KEY_VARIABLE: &str = "ANTHROPIC_API_KEY";
 pub const SCRUB_VARIABLE: &str = "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB";
+pub const HELPER_TTL_VARIABLE: &str = "CLAUDE_CODE_API_KEY_HELPER_TTL_MS";
+pub const HELPER_TTL_MS: &str = "2147483647";
+const BACKUP_EXCLUDE_ATTRIBUTE: &str = "com.apple.metadata:com_apple_backup_excludeItem";
+const BACKUP_EXCLUDE_VALUE: &str = "com.apple.backupd";
 
 const UNAVAILABLE_MARKERS: [&str; 6] = [
     "sandbox required but unavailable",
@@ -109,6 +113,47 @@ impl Scope {
             temp: std::env::temp_dir(),
         }
     }
+}
+
+pub fn exclude_from_backups(path: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let (Ok(path), Ok(name)) = (
+        std::ffi::CString::new(path.as_os_str().as_bytes()),
+        std::ffi::CString::new(BACKUP_EXCLUDE_ATTRIBUTE),
+    ) else {
+        return;
+    };
+    unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            BACKUP_EXCLUDE_VALUE.as_ptr().cast(),
+            BACKUP_EXCLUDE_VALUE.len(),
+            0,
+            0,
+        );
+    }
+}
+
+#[cfg(test)]
+pub fn backup_exclusion(path: &Path) -> Option<String> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let name = std::ffi::CString::new(BACKUP_EXCLUDE_ATTRIBUTE).ok()?;
+    let mut buffer = [0u8; 64];
+    let size = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            0,
+            0,
+        )
+    };
+    usize::try_from(size)
+        .ok()
+        .map(|size| String::from_utf8_lossy(&buffer[..size]).into_owned())
 }
 
 pub fn real_path(path: &Path) -> PathBuf {
@@ -491,6 +536,18 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn a_folder_is_excluded_from_backups_and_a_missing_one_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(backup_exclusion(dir.path()), None);
+        exclude_from_backups(dir.path());
+        assert_eq!(
+            backup_exclusion(dir.path()).as_deref(),
+            Some("com.apple.backupd")
+        );
+        exclude_from_backups(&dir.path().join("missing"));
     }
 
     #[test]

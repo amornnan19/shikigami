@@ -100,6 +100,7 @@ pub struct StepStart {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Parsed {
+    AuthRejected,
     Tools(Vec<String>),
     Session(String),
     TextDelta {
@@ -128,7 +129,8 @@ pub enum Parsed {
     },
 }
 
-const SIGN_IN_MARKERS: [&str; 5] = [
+const SIGN_IN_MARKERS: [&str; 6] = [
+    "your apikeyhelper script is failing",
     "authentication_error",
     "invalid x-api-key",
     "invalid api key",
@@ -343,6 +345,19 @@ impl StreamParser {
                 parsed
             }
             Some("compact_boundary") => vec![Parsed::Compacted],
+            Some("api_retry") => {
+                let rejected = value.get("error").and_then(Value::as_str)
+                    == Some("authentication_failed")
+                    || matches!(
+                        value.get("error_status").and_then(Value::as_u64),
+                        Some(401 | 403)
+                    );
+                if rejected {
+                    vec![Parsed::AuthRejected]
+                } else {
+                    Vec::new()
+                }
+            }
             _ => Vec::new(),
         }
     }

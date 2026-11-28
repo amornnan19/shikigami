@@ -95,6 +95,13 @@ never on a status or list path. A failed read must never block turning the featu
 it. The value never reaches the UI, logs, errors, the database or Debug output. Redact a secret passed
 to a child from every text that reaches the database or an event: step input and output, reply
 text, notices and errors.
+Exception: in API-key mode the key is handed to Claude Code through `apiKeyHelper` in the turn's
+`--settings`, never through the CLI's environment. The helper prints a 0600 key file in
+`<data>/tmp` (excluded from backups) and deletes it as it prints, so the key is on disk only from
+just before the spawn until the CLI's first read; the CLI is given a very large
+`CLAUDE_CODE_API_KEY_HELPER_TTL_MS` so it does not reread it, and a rejected sign-in
+(`system/api_retry` with 401/403) ends the turn as a sign-in failure. Files left by a crash are
+swept at startup.
 
 ## Planning
 
