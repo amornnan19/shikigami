@@ -59,6 +59,8 @@ PATH. Start each CLI in its own process group and kill the group on timeout or s
 output is read. Start each agent CLI isolated from the user's own configuration of that CLI: no
 user-level settings, hooks, plugins, output styles or MCP servers. For Claude Code:
 `--setting-sources project --strict-mcp-config --permission-mode manual --permission-prompts none`.
+A CLI started in a folder the user picked (a group folder) loads no setting sources
+(`--setting-sources ""`); Shikigami passes that folder's CLAUDE.md text itself.
 Keep the CLI's own sign-in working.
 Build an agent CLI's environment from an allowlist (HOME, USER, LOGNAME, SHELL, TMPDIR, LANG, LC_*,
 TERM, PATH); never pass the app's whole environment.

@@ -89,17 +89,22 @@ describe("turns in a group chat", () => {
     await browser.saveScreenshot(join(artifacts, "group-turns-answer.png"));
   });
 
-  it("runs the turn in the group folder with the instructions, the briefing and the message", async () => {
+  it("runs the turn in the group folder with no setting sources, the instructions and the briefing", async () => {
     expect(records(fakeClaudeCwds).map((cwd) => cwd.trim())).toEqual([realpathSync(pickedFolder)]);
-    expect(records(fakeClaudeStdins)).toEqual(["hello"]);
-    const [prompt] = records(fakeClaudePrompts);
-    const instructions = readFileSync(join(workspacesRoot, "ada", "CLAUDE.md"), "utf8").trimEnd();
-    expect(prompt?.startsWith(instructions)).toBe(true);
-    expect(prompt).toContain(
+    const [stdin] = records(fakeClaudeStdins);
+    expect(stdin).toContain(
       'You are Ada, a member of the group chat "Team". Members: Ada (you, lead), Bo.',
     );
-    expect(prompt).toContain("start a line with @Name followed by the task.");
+    expect(stdin).toContain("start a line with @Name followed by the task.");
+    expect(stdin).toContain("PROBE-LINE: zebra-quartz-4471");
+    expect(stdin?.endsWith("Messages:\nhello")).toBe(true);
+    const [prompt] = records(fakeClaudePrompts);
+    const instructions = readFileSync(join(workspacesRoot, "ada", "CLAUDE.md"), "utf8").trimEnd();
+    expect(prompt).toBe(instructions);
     const [line] = invocations();
+    expect(line).toContain("--setting-sources  --strict-mcp-config");
+    expect(line).toContain("--append-system-prompt-file");
+    expect(line).toContain("--system-prompt-snapshot off");
     expect(line).toContain("--session-id");
     expect(line).not.toContain("--resume");
   });
@@ -112,7 +117,8 @@ describe("turns in a group chat", () => {
     expect(lines).toHaveLength(2);
     expect(lines[1]).toContain("--resume");
     expect(lines[1]).not.toContain("--session-id");
-    expect(records(fakeClaudeStdins)).toEqual(["hello", "second message"]);
+    const messages = records(fakeClaudeStdins).map((entry) => entry.split("Messages:\n")[1]);
+    expect(messages).toEqual(["hello", "second message"]);
   });
 
   it("keeps the one-to-one chat of the lead separate and on its own session", async () => {

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 
 use serde_json::Value;
 
@@ -23,7 +24,12 @@ const ISOLATION_FLAGS: [&str; 6] = [
     "--permission-prompts",
 ];
 
-pub fn arguments(model: &str, session: &Session, system_prompt: Option<&str>) -> Vec<String> {
+pub struct GroupFlags<'a> {
+    pub instructions_file: Option<&'a Path>,
+    pub snapshot_off: bool,
+}
+
+pub fn arguments(model: &str, session: &Session, group: Option<&GroupFlags>) -> Vec<String> {
     let mut args: Vec<String> = [
         "-p",
         "--output-format",
@@ -50,9 +56,18 @@ pub fn arguments(model: &str, session: &Session, system_prompt: Option<&str>) ->
             args.push(id.clone());
         }
     }
-    if let Some(prompt) = system_prompt {
-        args.push("--append-system-prompt".to_owned());
-        args.push(prompt.to_owned());
+    if let Some(group) = group {
+        if let Some(at) = args.iter().position(|arg| arg == "--setting-sources") {
+            args[at + 1] = String::new();
+        }
+        if let Some(file) = group.instructions_file {
+            args.push("--append-system-prompt-file".to_owned());
+            args.push(file.to_string_lossy().into_owned());
+        }
+        if group.snapshot_off {
+            args.push("--system-prompt-snapshot".to_owned());
+            args.push("off".to_owned());
+        }
     }
     args
 }
@@ -362,7 +377,9 @@ pub fn assert_isolated(args: &[String]) {
         .iter()
         .position(|arg| arg == "--setting-sources")
         .expect("--setting-sources missing");
-    assert_eq!(args[at..at + ISOLATION.len()], ISOLATION);
+    assert_eq!(args[at], ISOLATION[0]);
+    assert!(args[at + 1] == "project" || args[at + 1].is_empty());
+    assert_eq!(args[at + 2..at + ISOLATION.len()], ISOLATION[2..]);
     for forbidden in ["bypassPermissions", "acceptEdits", "auto", "dontAsk"] {
         assert!(!args.iter().any(|arg| arg == forbidden), "{forbidden}");
     }
@@ -441,8 +458,15 @@ mod tests {
     fn every_argument_list_keeps_the_isolation_flags_and_no_widening_value() {
         for model in ["default", "haiku"] {
             for session in [Session::New("abc".into()), Session::Resume("abc".into())] {
-                for prompt in [None, Some("be brief")] {
-                    let args = arguments(model, &session, prompt);
+                let file = Path::new("/data/tmp/instructions.md");
+                for group in [
+                    None,
+                    Some(GroupFlags {
+                        instructions_file: Some(file),
+                        snapshot_off: true,
+                    }),
+                ] {
+                    let args = arguments(model, &session, group.as_ref());
                     assert_isolated(&args);
                 }
             }
@@ -450,12 +474,18 @@ mod tests {
     }
 
     #[test]
-    fn a_system_prompt_is_appended_as_one_argument_after_the_session() {
+    fn a_group_turn_loads_no_setting_sources_and_takes_its_instructions_from_a_file() {
+        let file = Path::new("/data/tmp/instructions.md");
         let args = arguments(
             "haiku",
             &Session::Resume("abc".into()),
-            Some("line one\nline two"),
+            Some(&GroupFlags {
+                instructions_file: Some(file),
+                snapshot_off: true,
+            }),
         );
+        assert_eq!(args[5], "--setting-sources");
+        assert_eq!(args[6], "");
         assert_eq!(
             &args[12..],
             [
@@ -463,17 +493,24 @@ mod tests {
                 "haiku",
                 "--resume",
                 "abc",
-                "--append-system-prompt",
-                "line one\nline two"
+                "--append-system-prompt-file",
+                "/data/tmp/instructions.md",
+                "--system-prompt-snapshot",
+                "off"
             ]
         );
-        assert_eq!(
-            args.iter()
-                .filter(|arg| *arg == "--setting-sources")
-                .count(),
-            1
+        let bare = arguments(
+            "haiku",
+            &Session::Resume("abc".into()),
+            Some(&GroupFlags {
+                instructions_file: None,
+                snapshot_off: false,
+            }),
         );
-        assert_eq!(args[6], "project");
+        assert_eq!(&bare[12..], ["--model", "haiku", "--resume", "abc"]);
+        assert_eq!(bare[6], "");
+        let plain = arguments("haiku", &Session::Resume("abc".into()), None);
+        assert_eq!(plain[6], "project");
     }
 
     #[test]

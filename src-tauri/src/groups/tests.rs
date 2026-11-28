@@ -476,6 +476,63 @@ fn deleting_a_group_keeps_its_folder_and_files_and_the_agents() {
 }
 
 #[test]
+fn queued_messages_of_removed_members_move_to_the_lead_when_members_change() {
+    let fx = Fixture::new();
+    let folder = fx.project("repo");
+    let a = fx.agent("Ada");
+    let b = fx.agent("Bo");
+    let c = fx.agent("Cy");
+    let created = fx
+        .create(fx.input("Team", &[&a, &b, &c], &a, Some(&folder)))
+        .unwrap();
+    let id = created.group.id;
+    let queue = |agent: &str, position: i64| {
+        fx.db.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO group_queue (id, group_id, addressed_agent_id, content, position, created_at)
+                 VALUES (?1, ?2, ?3, 'text', ?4, 1)",
+                params![format!("q{position}"), id, agent, position],
+            )
+            .unwrap()
+        });
+    };
+    queue(&c, 0);
+    queue(&b, 1);
+    queue(&a, 2);
+    let addressed = || -> Vec<String> {
+        fx.db.with_connection(|conn| {
+            conn.prepare("SELECT addressed_agent_id FROM group_queue ORDER BY position")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        })
+    };
+    update(
+        &fx.db,
+        &id,
+        UpdateGroupInput {
+            member_ids: Some(vec![a.clone(), b.clone()]),
+            ..UpdateGroupInput::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(addressed(), [a.clone(), b.clone(), a.clone()]);
+    update(
+        &fx.db,
+        &id,
+        UpdateGroupInput {
+            member_ids: Some(vec![b.clone(), c.clone()]),
+            lead_agent_id: Some(c.clone()),
+            ..UpdateGroupInput::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(addressed(), [c.clone(), b.clone(), c.clone()]);
+}
+
+#[test]
 fn a_group_with_a_running_turn_cannot_be_deleted_until_the_turn_ends() {
     let fx = Fixture::new();
     let folder = fx.project("repo");

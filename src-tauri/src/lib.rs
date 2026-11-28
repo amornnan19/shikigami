@@ -90,7 +90,7 @@ pub fn run() {
             }
             app.manage(secrets::select_store());
             app.manage(api_key::StatusCache::default());
-            app.manage(turns::TurnRegistry::default());
+            app.manage(turns::TurnRegistry::with_temp_dir(data_dir.join("tmp")));
             app.manage(agents::WorkspacesRoot(agents::resolve_workspaces_root(
                 app.path().home_dir().ok(),
                 std::env::var_os(agents::WORKSPACES_DIR_ENV),

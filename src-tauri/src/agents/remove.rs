@@ -145,8 +145,25 @@ fn delete_row(connection: &Connection, agent_id: &str) -> Result<(String, bool),
         .any(|other| overlaps(&target, &resolved(other)));
     crate::groups::store::reassign_leads(&transaction, agent_id).map_err(AgentError::database)?;
     transaction
-        .execute("DELETE FROM agents WHERE id = ?1", [agent_id])
+        .execute(
+            "UPDATE group_queue
+             SET addressed_agent_id = (SELECT lead_agent_id FROM groups WHERE id = group_queue.group_id)
+             WHERE addressed_agent_id = ?1
+               AND (SELECT lead_agent_id FROM groups WHERE id = group_queue.group_id) IS NOT NULL",
+            [agent_id],
+        )
         .map_err(AgentError::database)?;
+    for statement in [
+        "DELETE FROM steps WHERE turn_id IN (SELECT id FROM turns WHERE agent_id = ?1 AND group_id IS NULL)",
+        "DELETE FROM messages WHERE agent_id = ?1 AND group_id IS NULL",
+        "DELETE FROM turns WHERE agent_id = ?1 AND group_id IS NULL",
+        "DELETE FROM queued_messages WHERE agent_id = ?1",
+        "DELETE FROM agents WHERE id = ?1",
+    ] {
+        transaction
+            .execute(statement, [agent_id])
+            .map_err(AgentError::database)?;
+    }
     transaction.commit().map_err(AgentError::database)?;
     Ok((recorded, shared))
 }

@@ -121,7 +121,7 @@ mod tests {
     fn fresh_database_migrates_to_the_latest_version_with_all_tables() {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(dir.path()).unwrap();
-        assert_eq!(schema_version(&db), 5);
+        assert_eq!(schema_version(&db), 6);
         for table in [
             "agents",
             "turns",
@@ -159,7 +159,7 @@ mod tests {
             .unwrap();
         drop(connection);
         let db = Database::open(dir.path()).unwrap();
-        assert_eq!(schema_version(&db), 5);
+        assert_eq!(schema_version(&db), 6);
         assert_eq!(count(&db, "agents"), 1);
         assert_eq!(count(&db, "turns"), 1);
         assert_eq!(count(&db, "settings"), 0);
@@ -170,8 +170,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         drop(Database::open(dir.path()).unwrap());
         let db = Database::open(dir.path()).unwrap();
-        assert_eq!(schema_version(&db), 5);
-        assert_eq!(count(&db, "refinery_schema_history"), 5);
+        assert_eq!(schema_version(&db), 6);
+        assert_eq!(count(&db, "refinery_schema_history"), 6);
     }
 
     #[test]
@@ -209,7 +209,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(dir.path()).unwrap();
         seed_agent_tree(&db);
-        db.with_connection(|c| c.execute("DELETE FROM agents WHERE id = 'a'", []).unwrap());
+        db.with_connection(|c| {
+            c.execute("UPDATE turns SET status = 'completed'", [])
+                .unwrap()
+        });
+        crate::agents::remove::delete(&db, &Err(String::new()), "a", false, &|_| Ok(())).unwrap();
         for table in [
             "turns",
             "messages",
@@ -265,7 +269,12 @@ mod tests {
             )
             .unwrap(),
             refinery::Migration::unapplied(
-                "V6__broken",
+                "V6__group_history",
+                include_str!("../../migrations/V6__group_history.sql"),
+            )
+            .unwrap(),
+            refinery::Migration::unapplied(
+                "V7__broken",
                 "CREATE TABLE probe (x INTEGER); INSERT INTO missing_table VALUES (1);",
             )
             .unwrap(),
@@ -279,7 +288,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         let probe_tables: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE name = 'probe'",
@@ -349,7 +358,12 @@ mod tests {
             )
             .unwrap(),
             refinery::Migration::unapplied(
-                "V6__rebuild_agents",
+                "V6__group_history",
+                include_str!("../../migrations/V6__group_history.sql"),
+            )
+            .unwrap(),
+            refinery::Migration::unapplied(
+                "V7__rebuild_agents",
                 "CREATE TABLE agents_new (
                    id TEXT PRIMARY KEY,
                    name TEXT NOT NULL COLLATE NOCASE UNIQUE,
@@ -372,7 +386,7 @@ mod tests {
         let db = Database {
             connection: Mutex::new(connection),
         };
-        assert_eq!(schema_version(&db), 6);
+        assert_eq!(schema_version(&db), 7);
         for table in [
             "agents",
             "turns",
@@ -439,7 +453,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             version_two_database(dir.path(), old);
             let db = Database::open(dir.path()).unwrap();
-            assert_eq!(schema_version(&db), 5);
+            assert_eq!(schema_version(&db), 6);
             assert_eq!(
                 setting(&db, "claude.auth-mode").as_deref(),
                 expected,
@@ -499,7 +513,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         version_three_database(dir.path());
         let db = Database::open(dir.path()).unwrap();
-        assert_eq!(schema_version(&db), 5);
+        assert_eq!(schema_version(&db), 6);
         for table in ["agents", "turns", "messages", "queued_messages", "settings"] {
             assert_eq!(count(&db, table), 1, "{table}");
         }
@@ -561,7 +575,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         version_four_database(dir.path());
         let db = Database::open(dir.path()).unwrap();
-        assert_eq!(schema_version(&db), 5);
+        assert_eq!(schema_version(&db), 6);
         for table in [
             "turns",
             "messages",
@@ -641,33 +655,207 @@ mod tests {
         assert_eq!(count(&db, "agents"), 2);
     }
 
-    #[test]
-    fn deleting_an_agent_clears_its_authorship_and_removes_its_group_sessions_and_queue() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Database::open(dir.path()).unwrap();
-        seed_group_chat(&db);
-        db.with_connection(|c| {
-            c.execute_batch(
-                "INSERT INTO messages (id, agent_id, turn_id, group_id, author_agent_id, role, content, created_at)
-                 VALUES ('m3', 'a', 't', 'g', 'b', 'assistant', 'from bo', 3);
+    fn version_five_database(dir: &Path) {
+        let mut connection = Connection::open(dir.join(DATABASE_FILE)).unwrap();
+        configure(&connection).unwrap();
+        let sources = [
+            (
+                "V1__initial",
+                include_str!("../../migrations/V1__initial.sql"),
+            ),
+            (
+                "V2__settings",
+                include_str!("../../migrations/V2__settings.sql"),
+            ),
+            (
+                "V3__auth_mode",
+                include_str!("../../migrations/V3__auth_mode.sql"),
+            ),
+            (
+                "V4__groups",
+                include_str!("../../migrations/V4__groups.sql"),
+            ),
+            (
+                "V5__group_turns",
+                include_str!("../../migrations/V5__group_turns.sql"),
+            ),
+        ];
+        let v5: Vec<_> = sources
+            .into_iter()
+            .map(|(name, sql)| refinery::Migration::unapplied(name, sql).unwrap())
+            .collect();
+        migrate(&mut connection, Runner::new(&v5)).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO agents (id, name, color, provider, model, workspace_path, created_at, last_activity_at)
+                 VALUES ('a', 'Ada', 'red', 'claude-code', 'm', '/a', 1, 1),
+                        ('b', 'Bo', 'blue', 'claude-code', 'm', '/b', 1, 1);
+                 INSERT INTO groups VALUES ('g', 'Team', '/g', 'a', 1, 1);
+                 INSERT INTO group_members VALUES ('g', 'a', 0, 1), ('g', 'b', 1, 1);
+                 INSERT INTO turns (id, agent_id, group_id, status, error, started_at, ended_at)
+                 VALUES ('t1', 'a', NULL, 'completed', NULL, 1, 2),
+                        ('t2', 'a', 'g', 'failed', 'boom', 3, 4),
+                        ('t3', 'b', 'g', 'completed', NULL, 5, 6);
+                 INSERT INTO messages (id, agent_id, turn_id, group_id, author_agent_id, role, content, created_at)
+                 VALUES ('m1', 'a', 't1', NULL, NULL, 'user', 'private', 1),
+                        ('m2', 'a', 't2', 'g', NULL, 'user', 'to the group', 3),
+                        ('m3', 'a', 't2', 'g', 'a', 'assistant', 'answer', 4),
+                        ('m4', 'b', 't3', 'g', 'b', 'assistant', 'from bo', 5);
+                 INSERT INTO steps VALUES ('s', 't2', 0, 'tool', 'x', NULL, 'done', 3);
+                 INSERT INTO queued_messages VALUES ('q', 'a', 'later', 0, 1);
                  INSERT INTO group_queue (id, group_id, addressed_agent_id, content, position, created_at)
-                 VALUES ('q2', 'g', 'b', 'for bo', 1, 1);",
+                 VALUES ('gq', 'g', 'b', 'for bo', 0, 1);
+                 INSERT INTO agent_group_sessions VALUES ('a', 'g', 'sess', 3), ('b', 'g', NULL, 4);",
             )
             .unwrap();
-            c.execute("DELETE FROM agents WHERE id = 'b'", []).unwrap();
+    }
+
+    #[test]
+    fn the_group_history_migration_keeps_one_to_one_and_group_rows_of_a_version_five_database() {
+        let dir = tempfile::tempdir().unwrap();
+        version_five_database(dir.path());
+        let db = Database::open(dir.path()).unwrap();
+        assert_eq!(schema_version(&db), 6);
+        for (table, rows) in [
+            ("agents", 2),
+            ("turns", 3),
+            ("messages", 4),
+            ("steps", 1),
+            ("queued_messages", 1),
+            ("groups", 1),
+            ("group_members", 2),
+            ("group_queue", 1),
+            ("agent_group_sessions", 2),
+        ] {
+            assert_eq!(count(&db, table), rows, "{table}");
+        }
+        type TurnRow = (
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            Option<String>,
+        );
+        let turns: Vec<TurnRow> = db.with_connection(|c| {
+            c.prepare("SELECT id, agent_id, group_id, status, error FROM turns ORDER BY rowid")
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
         });
-        assert_eq!(count(&db, "messages"), 3);
-        let author: Option<String> = db.with_connection(|c| {
+        assert_eq!(
+            turns,
+            [
+                (
+                    "t1".into(),
+                    Some("a".into()),
+                    None,
+                    "completed".into(),
+                    None
+                ),
+                (
+                    "t2".into(),
+                    Some("a".into()),
+                    Some("g".into()),
+                    "failed".into(),
+                    Some("boom".into())
+                ),
+                (
+                    "t3".into(),
+                    Some("b".into()),
+                    Some("g".into()),
+                    "completed".into(),
+                    None
+                ),
+            ]
+        );
+        let messages: Vec<(String, Option<String>, Option<String>, i64)> =
+            db.with_connection(|c| {
+                c.prepare("SELECT id, group_id, author_agent_id, seq FROM messages ORDER BY rowid")
+                    .unwrap()
+                    .query_map([], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                    })
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap()
+            });
+        assert_eq!(
+            messages,
+            [
+                ("m1".into(), None, None, 1),
+                ("m2".into(), Some("g".into()), None, 2),
+                ("m3".into(), Some("g".into()), Some("a".into()), 3),
+                ("m4".into(), Some("g".into()), Some("b".into()), 4),
+            ]
+        );
+        let seen: Vec<i64> = db.with_connection(|c| {
+            c.prepare("SELECT last_seen_seq FROM agent_group_sessions ORDER BY agent_id")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        });
+        assert_eq!(seen, [3, 4]);
+        db.with_connection(|c| {
+            c.execute_batch(
+                "INSERT INTO messages (id, agent_id, turn_id, role, content, created_at)
+                 VALUES ('m5', 'a', 't1', 'assistant', 'new', 9);
+                 DELETE FROM messages WHERE id = 'm5';
+                 INSERT INTO messages (id, agent_id, turn_id, role, content, created_at)
+                 VALUES ('m6', 'a', 't1', 'assistant', 'newer', 10);",
+            )
+            .unwrap()
+        });
+        let newest: i64 = db.with_connection(|c| {
+            c.query_row("SELECT seq FROM messages WHERE id = 'm6'", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+        });
+        assert_eq!(newest, 6);
+        db.with_connection(|c| c.execute("DELETE FROM agents WHERE id = 'b'", []).unwrap());
+        let (turn_agent, message_agent, author): (Option<String>, Option<String>, Option<String>) =
+            db.with_connection(|c| {
+                c.query_row(
+                    "SELECT t.agent_id, m.agent_id, m.author_agent_id
+                     FROM turns t JOIN messages m ON m.turn_id = t.id WHERE m.id = 'm4'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap()
+            });
+        assert_eq!((turn_agent, message_agent, author), (None, None, None));
+        assert_eq!(count(&db, "messages"), 5);
+        let indexes: i64 = db.with_connection(|c| {
             c.query_row(
-                "SELECT author_agent_id FROM messages WHERE id = 'm3'",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name IN
+                 ('turns_agent_started', 'turns_group_started', 'messages_agent_created', 'messages_group')",
                 [],
                 |row| row.get(0),
             )
             .unwrap()
         });
-        assert_eq!(author, None);
-        assert_eq!(count(&db, "agent_group_sessions"), 1);
-        assert_eq!(count(&db, "group_queue"), 1);
+        assert_eq!(indexes, 4);
+        let violations: i64 = db.with_connection(|c| {
+            c.prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .query([])
+                .unwrap()
+                .mapped(|_| Ok(()))
+                .count() as i64
+        });
+        assert_eq!(violations, 0);
     }
 
     #[test]

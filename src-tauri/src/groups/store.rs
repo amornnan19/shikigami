@@ -161,6 +161,17 @@ pub fn replace_members(
     Ok(())
 }
 
+pub fn readdress_queue(connection: &Connection, group_id: &str) -> rusqlite::Result<usize> {
+    connection.execute(
+        "UPDATE group_queue
+         SET addressed_agent_id = (SELECT lead_agent_id FROM groups WHERE id = ?1)
+         WHERE group_id = ?1
+           AND addressed_agent_id NOT IN (SELECT agent_id FROM group_members WHERE group_id = ?1)
+           AND (SELECT lead_agent_id FROM groups WHERE id = ?1) IS NOT NULL",
+        [group_id],
+    )
+}
+
 pub fn has_running_turn(connection: &Connection, group_id: &str) -> rusqlite::Result<bool> {
     connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM turns WHERE group_id = ?1 AND status = 'running')",

@@ -411,6 +411,7 @@ fn update(db: &Database, group_id: &str, input: UpdateGroupInput) -> Result<Grou
         if let Some(lead) = &lead {
             store::set_lead(&transaction, group_id, Some(lead))?;
         }
+        store::readdress_queue(&transaction, group_id)?;
         transaction.commit()?;
         find_with(connection, group_id)
     })

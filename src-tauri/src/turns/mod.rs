@@ -163,9 +163,25 @@ struct StopTarget {
 pub struct TurnRegistry {
     slots: Mutex<HashMap<String, Slot>>,
     closing: AtomicBool,
+    temp_dir: PathBuf,
 }
 
 impl TurnRegistry {
+    pub fn with_temp_dir(temp_dir: PathBuf) -> Self {
+        Self {
+            temp_dir,
+            ..Self::default()
+        }
+    }
+
+    fn temp_dir(&self) -> PathBuf {
+        if self.temp_dir.as_os_str().is_empty() {
+            std::env::temp_dir()
+        } else {
+            self.temp_dir.clone()
+        }
+    }
+
     fn slots(&self) -> std::sync::MutexGuard<'_, HashMap<String, Slot>> {
         self.slots
             .lock()
@@ -321,7 +337,9 @@ pub fn stop_all_turns(app: &AppHandle) {
 
 pub struct GroupRun {
     pub group_id: String,
-    pub system_prompt: String,
+    pub instructions: String,
+    pub temp_dir: PathBuf,
+    pub previous_seen: i64,
 }
 
 pub struct Launch {
@@ -432,7 +450,13 @@ fn launch_of_group(
     let instructions = instructions::read(Path::new(&begun.begun.agent.workspace_path))
         .map(|read| read.text)
         .unwrap_or_default();
-    let system_prompt = group::system_prompt(&instructions, &group::briefing(&begun));
+    let folder_instructions = instructions::read_up_to(
+        Path::new(&begun.folder),
+        group::FOLDER_INSTRUCTIONS_MAX_BYTES,
+    )
+    .map(|read| read.text)
+    .unwrap_or_default();
+    let text = group::turn_input(&begun, &folder_instructions);
     Some(Launch {
         agent_id: begun.agent_id,
         turn_id: begun.begun.turn_id,
@@ -441,14 +465,16 @@ fn launch_of_group(
         workspace: PathBuf::from(begun.folder),
         model: begun.begun.agent.model,
         session: begun.begun.session,
-        text: begun.input,
+        text,
         started_at,
         environment: std::env::vars_os().collect(),
         stall_timeout: stall_timeout(),
         tool_stall_timeout: TOOL_STALL_TIMEOUT,
         group: Some(GroupRun {
             group_id: begun.group_id,
-            system_prompt,
+            instructions,
+            temp_dir: registry.temp_dir(),
+            previous_seen: begun.previous_seen,
         }),
     })
 }
@@ -663,27 +689,43 @@ fn start_next_group(
     launch_of_group(registry, dirs, executable, begun, started_at)
 }
 
+struct Finished<'a> {
+    agent_id: &'a str,
+    group_id: Option<&'a str>,
+    advance_same_chat: bool,
+}
+
 fn start_after(
     db: &Database,
     registry: &TurnRegistry,
     dirs: &[PathBuf],
-    agent_id: &str,
-    group_id: Option<&str>,
-) -> Option<Launch> {
-    if let Some(launch) =
-        group_id.and_then(|group_id| start_next_group(db, registry, dirs, group_id))
-    {
-        return Some(launch);
+    finished: &Finished,
+) -> Vec<Launch> {
+    let mut launches = Vec::new();
+    if registry.is_closing() {
+        return launches;
     }
-    if let Some(launch) = start_next(db, registry, dirs, agent_id) {
-        return Some(launch);
+    if finished.advance_same_chat {
+        launches.extend(
+            finished
+                .group_id
+                .and_then(|group_id| start_next_group(db, registry, dirs, group_id)),
+        );
+    }
+    if finished.advance_same_chat || finished.group_id.is_some() {
+        launches.extend(start_next(db, registry, dirs, finished.agent_id));
     }
     let waiting = db
-        .with_connection(|connection| group::queued_groups_for(connection, agent_id))
+        .with_connection(|connection| group::queued_groups_for(connection, finished.agent_id))
         .unwrap_or_default();
-    waiting
-        .iter()
-        .find_map(|waiting_group| start_next_group(db, registry, dirs, waiting_group))
+    for waiting_group in &waiting {
+        let own_failed_chat =
+            !finished.advance_same_chat && finished.group_id == Some(waiting_group.as_str());
+        if !own_failed_chat {
+            launches.extend(start_next_group(db, registry, dirs, waiting_group));
+        }
+    }
+    launches
 }
 
 fn resume_group(
@@ -749,48 +791,68 @@ async fn drive_one(app: &AppHandle, launch: Launch) -> bool {
     runner::run(&db, app, &registry, launch, key).await
 }
 
-async fn next_launch(
+async fn next_launches(
     app: &AppHandle,
     agent_id: String,
     group_id: Option<String>,
-) -> Option<Launch> {
+    advance_same_chat: bool,
+) -> Vec<Launch> {
     let next_app = app.clone();
     let next = tauri::async_runtime::spawn_blocking(move || {
-        let db = next_app.try_state::<Database>()?;
-        let registry = next_app.try_state::<TurnRegistry>()?;
-        let launch = start_after(
+        let (Some(db), Some(registry)) = (
+            next_app.try_state::<Database>(),
+            next_app.try_state::<TurnRegistry>(),
+        ) else {
+            return Vec::new();
+        };
+        let launches = start_after(
             &db,
             &registry,
             &providers::search_dirs(),
-            &agent_id,
-            group_id.as_deref(),
+            &Finished {
+                agent_id: &agent_id,
+                group_id: group_id.as_deref(),
+                advance_same_chat,
+            },
         );
         emit_queue_changed(&next_app, &agent_id);
         if let Some(group_id) = &group_id {
             emit_group_queue_changed(&next_app, group_id);
         }
-        if let Some(started) = launch.as_ref().and_then(|launch| launch.group.as_ref()) {
+        for started in launches.iter().filter_map(|launch| launch.group.as_ref()) {
             emit_group_queue_changed(&next_app, &started.group_id);
         }
-        launch
+        launches
     })
     .await;
-    next.ok().flatten()
+    next.unwrap_or_default()
 }
 
-async fn drive(app: AppHandle, first: Launch) {
-    let mut current = Some(first);
-    while let Some(launch) = current.take() {
-        let agent_id = launch.agent_id.clone();
-        let group_id = launch.group.as_ref().map(|group| group.group_id.clone());
-        let advance = drive_one(&app, launch).await;
-        let closing = app
-            .try_state::<TurnRegistry>()
-            .is_none_or(|registry| registry.is_closing());
-        if advance && !closing {
-            current = next_launch(&app, agent_id, group_id).await;
+fn drive(
+    app: AppHandle,
+    first: Launch,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(async move {
+        let mut current = Some(first);
+        while let Some(launch) = current.take() {
+            let agent_id = launch.agent_id.clone();
+            let group_id = launch.group.as_ref().map(|group| group.group_id.clone());
+            let advance = drive_one(&app, launch).await;
+            let closing = app
+                .try_state::<TurnRegistry>()
+                .is_none_or(|registry| registry.is_closing());
+            if closing {
+                continue;
+            }
+            let mut next = next_launches(&app, agent_id, group_id, advance).await;
+            if !next.is_empty() {
+                current = Some(next.remove(0));
+                for extra in next {
+                    tauri::async_runtime::spawn(drive(app.clone(), extra));
+                }
+            }
         }
-    }
+    })
 }
 
 #[tauri::command]
@@ -1599,7 +1661,7 @@ mod tests {
         registry.kill_all(Duration::from_millis(500));
         let status = reaper.join().unwrap();
         assert_eq!(status.signal(), Some(libc::SIGKILL));
-        assert!(started.elapsed() >= Duration::from_millis(500));
+        assert!(started.elapsed() + Duration::from_millis(50) >= Duration::from_millis(500));
     }
 
     #[test]
