@@ -3727,7 +3727,7 @@ dependencies = [
 
 [[package]]
 name = "shikigami"
-version = "0.12.1"
+version = "0.13.0"
 dependencies = [
  "jiff 1.0.3",
  "keyring",
