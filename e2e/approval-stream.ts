@@ -26,3 +26,23 @@ export function approvalStream(requests: ApprovalRequest[]): (object | string)[]
     },
   ];
 }
+
+const say = (id: string, text: string) => ({
+  type: "assistant",
+  message: { id, content: [{ type: "text", text }] },
+});
+
+export function interleavedStream(request: ApprovalRequest): (object | string)[] {
+  return [
+    {
+      type: "system",
+      subtype: "init",
+      tools: ["Read", "Edit", "Write", "Bash"],
+      session_id: fakeClaudeSessionId(),
+    },
+    say("m1", "Before the request."),
+    `#approve ${JSON.stringify([request])}`,
+    say("m2", "After the request."),
+    { type: "result", subtype: "success", is_error: false, result: "After the request." },
+  ];
+}

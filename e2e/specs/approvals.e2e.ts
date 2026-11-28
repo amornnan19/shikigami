@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { $, $$, browser, expect } from "@wdio/globals";
-import { type ApprovalRequest, approvalStream } from "../approval-stream";
+import { type ApprovalRequest, approvalStream, interleavedStream } from "../approval-stream";
 import { fakeClaudeApprovalMarker, fakeClaudeApprovals, scriptFakeStream } from "../fake-providers";
 import { pickedFolder, workspacesRoot } from "../wdio.shared";
 
@@ -67,7 +67,14 @@ describe("approval cards", () => {
     scriptFakeStream(4, approvalStream([list]));
     scriptFakeStream(5, approvalStream([list]));
     scriptFakeStream(6, approvalStream([list]));
-    scriptFakeStream(7, approvalStream([{ tool: "Bash", input: { command: "touch left-open" } }]));
+    scriptFakeStream(
+      7,
+      interleavedStream({
+        tool: "Write",
+        input: { file_path: "/tmp/notes\u202Etxt.md", content: "hello" },
+      }),
+    );
+    scriptFakeStream(8, approvalStream([{ tool: "Bash", input: { command: "touch left-open" } }]));
     await createAgent("Ada");
   });
 
@@ -80,10 +87,21 @@ describe("approval cards", () => {
     await expect(open).toHaveText(expect.stringContaining("ls -la"));
     await expect(open).toHaveText(expect.stringContaining("List the files in the folder"));
     expect(await open.$("span[title]").getAttribute("title")).toContain(workspacesRoot);
-    await expect($(`${sidebar} ${waiting}`)).toBeExisting();
-    await expect($(`${sidebar} li:nth-child(1)`)).toHaveText(expect.stringContaining("Needs you"));
     const focused = await browser.execute(() => document.activeElement?.tagName);
     expect(focused).toBe("TEXTAREA");
+    await expect(open).toHaveText(
+      expect.stringContaining("Runs in the sandbox: no network, writes only in ada."),
+    );
+    await expect(open).toHaveText(
+      expect.stringContaining("Ada says: List the files in the folder"),
+    );
+    await open.$("button=Show full request").click();
+    await expect(open.$("[data-approval-detail]")).toHaveText(
+      expect.stringContaining('"command": "ls -la"'),
+    );
+    await open.$("button=Hide full request").click();
+    await expect($(`${sidebar} ${waiting}`)).toBeExisting();
+    await expect($(`${sidebar} li:nth-child(1)`)).toHaveText(expect.stringContaining("Needs you"));
     expect(existsSync(fakeClaudeApprovalMarker)).toBe(false);
     await scrollToEnd(agentView);
     await browser.saveScreenshot(join(artifacts, "approvals-card-open.png"));
@@ -198,6 +216,8 @@ describe("approval cards", () => {
     await expect(open).toHaveText(expect.stringContaining("Ada"));
     expect(await open.$("span[title]").getAttribute("title")).toBe(pickedFolder);
     await expect($(`${groupList} ${waiting}`)).toBeExisting();
+    await expect($(`${sidebar} section[aria-label="Agent list"] ${waiting}`)).not.toExist();
+    await expect(open).toHaveText(expect.stringMatching(/^Awants to run/));
     await expect($(`${groupList} li:nth-child(1)`)).toHaveText(
       expect.stringContaining("Needs you"),
     );
@@ -210,11 +230,46 @@ describe("approval cards", () => {
     await browser.saveScreenshot(join(artifacts, "approvals-group-card-allowed.png"));
   });
 
+  it("places the card where the request happened, escapes hidden characters and shows the full request", async () => {
+    await $(sidebar).$("button*=Ada").click();
+    await expect($(`${agentView} h2`)).toHaveText("Ada");
+    await send(agentView, "Write the notes");
+    const turn = $(`${agentView} article:nth-of-type(6)`);
+    const open = turn.$(card);
+    await expect(open).toBeDisplayed({ wait: 20000 });
+    await expect(open).toHaveText(expect.stringContaining("wants to use"));
+    await expect(open).toHaveText(expect.stringContaining("Write /tmp/notes\\u202Etxt.md"));
+    await expect(open).not.toHaveText(expect.stringContaining("Runs in the sandbox"));
+    expect(await open.$("[data-approval-where]").getText()).toBe("/tmp/notes\\u202Etxt.md");
+    await open.$("button=Show full request").click();
+    await expect(open.$("[data-approval-detail]")).toHaveText(
+      expect.stringContaining('"content": "hello"'),
+    );
+    await scrollToEnd(agentView);
+    await browser.saveScreenshot(join(artifacts, "approvals-interleaved-open.png"));
+    await open.$("button=Allow once").click();
+    await expect(open).toHaveText(expect.stringContaining("Allowed"));
+    await turnEnded(agentView);
+    const order = await browser.execute(() => {
+      const root = document.querySelector('section[aria-label="Agent"] article:nth-of-type(6)');
+      const nodes = Array.from(root?.querySelectorAll("p, section") ?? []);
+      const at = (needle: string) =>
+        nodes.findIndex((node) => node.textContent?.includes(needle) && node.tagName === "P");
+      const cardAt = nodes.findIndex((node) => node.tagName === "SECTION");
+      return [at("Before the request."), cardAt, at("After the request.")];
+    });
+    expect(order[0]).toBeGreaterThanOrEqual(0);
+    expect(order[0]).toBeLessThan(order[1] ?? -1);
+    expect(order[1]).toBeLessThan(order[2] ?? -1);
+    await scrollToEnd(agentView);
+    await browser.saveScreenshot(join(artifacts, "approvals-interleaved-answered.png"));
+  });
+
   it("leaves a card open for the restart check", async () => {
     await $(sidebar).$("button*=Ada").click();
     await expect($(`${agentView} h2`)).toHaveText("Ada");
     await send(agentView, "Leave this open");
-    const open = $(`${agentView} article:nth-of-type(6) ${card}`);
+    const open = $(`${agentView} article:nth-of-type(7) ${card}`);
     await expect(open).toBeDisplayed({ wait: 20000 });
     await expect(open).toHaveText(expect.stringContaining("touch left-open"));
   });

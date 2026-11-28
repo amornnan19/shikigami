@@ -366,7 +366,7 @@ async fn a_relay_that_disappears_denies_its_open_cards() {
         let card = wait_for_rows(&world, 1).await.remove(0);
         drop(relay);
         let row = wait_for_status(&world, &card.id, "denied").await;
-        assert_eq!(row.answered_by.as_deref(), Some("stop"));
+        assert_eq!(row.answered_by.as_deref(), Some("relay"));
         finish_cli(&world);
     })
     .await;
@@ -425,6 +425,7 @@ async fn a_pending_row_whose_turn_is_not_running_cannot_be_answered() {
                 summary: "ls",
                 detail: "{}",
                 reason: None,
+                target: None,
                 created_at: 1,
             },
         )
@@ -519,7 +520,7 @@ async fn a_long_input_is_bounded_in_the_summary_and_the_detail() {
             .request(1, "Bash", json!({"command": "x".repeat(20_000)}))
             .await;
         let card = wait_for_rows(&world, 1).await.remove(0);
-        assert!(card.summary.len() < 700);
+        assert!(card.summary.len() > 3000 && card.summary.len() <= 4100);
         assert!(card.detail.len() < 4200);
         answer(&world, &card.id, false).unwrap();
         relay.reply().await;
@@ -561,6 +562,15 @@ fn a_tool_without_a_target_is_described_by_its_name_and_other_tools_by_name_and_
     let command = approval::describe(&redactor, "Bash", &json!({"command": "  ls -la  "}));
     assert_eq!(command.summary(), "ls -la");
     assert_eq!(command.reason(), None);
+    assert_eq!(command.target(), None);
+    assert_eq!(read.target(), Some("/etc/hosts"));
+    assert_eq!(fetch.target(), Some("https://a.test/x"));
+    let write = approval::describe(
+        &redactor,
+        "Write",
+        &json!({"file_path": "/w/a.txt", "content": "x"}),
+    );
+    assert_eq!(write.target(), Some("/w/a.txt"));
 }
 
 #[tokio::test]
@@ -693,4 +703,115 @@ async fn a_card_that_times_out_after_the_stall_limit_has_passed_does_not_stall_t
     .await;
     assert_eq!(end, RunEnd::Finished);
     assert_eq!(only_turn(&world).status, "completed");
+}
+
+#[tokio::test]
+async fn a_write_the_settings_refuse_makes_no_card_and_the_settings_pin_the_refusal() {
+    let world = World::new();
+    let lines = stream_lines(&[
+        serde_json::json!({"type":"system","subtype":"init","session_id":"s1","tools":["Read","Edit","Write","Bash"]}),
+        serde_json::json!({"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"w1","name":"Write","input":{"file_path":"/Users/test-home/Library/LaunchAgents/probe.plist","content":"x"}}]}}),
+        serde_json::json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"w1","content":"outside the working directory","is_error":true}]}}),
+        serde_json::json!({"type":"result","is_error":false,"result":"ok"}),
+    ]);
+    let fixture = world.fixture("refused.jsonl", &lines);
+    world.install(&recording(
+        &world,
+        &format!("cat \"{}\"", fixture.display()),
+    ));
+    world.send("write it", ApiKey::Subscription).await;
+    assert_eq!(only_turn(&world).status, "completed");
+    assert!(rows(&world).is_empty());
+    assert_eq!(kinds_of(&world, "approval-requested"), 0);
+    let settings: Value = serde_json::from_str(&read(&world, "settings.0")).unwrap();
+    let permissions = &settings["permissions"];
+    assert_eq!(permissions["blockWritesOutsideWorkingDirectories"], true);
+    let deny: Vec<&str> = permissions["deny"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    let folder = sandbox::real_path(world.workspace.path());
+    for relative in [
+        ".claude",
+        ".git/hooks",
+        ".git/config",
+        ".husky",
+        ".envrc",
+        ".mcp.json",
+    ] {
+        assert!(
+            deny.iter().any(|rule| rule.starts_with("Edit(/")
+                && rule.contains(&folder.join(relative).to_string_lossy().to_string())),
+            "{relative}"
+        );
+    }
+    assert!(deny.contains(&"mcp__shikigami__approve"));
+}
+
+#[tokio::test]
+async fn a_closed_message_channel_does_not_park_the_turn_and_output_and_the_end_still_work() {
+    let world = World::new();
+    install_waiting(&world);
+    let launch = world.launch("go");
+    let world_ref = &world;
+    let end = drive(&world, launch, |turn_id| async move {
+        let world = world_ref;
+        let _relay = Relay::connect(world).await;
+        world.registry.close_signals(&turn_id);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        finish_cli(world);
+    })
+    .await;
+    assert_eq!(end, RunEnd::Finished);
+    assert_eq!(only_turn(&world).status, "completed");
+}
+
+#[tokio::test]
+async fn a_closed_message_channel_does_not_switch_off_the_stall_timer() {
+    let world = World::new();
+    install_waiting(&world);
+    let mut launch = world.launch("go");
+    launch.stall_timeout = Duration::from_millis(500);
+    launch.tool_stall_timeout = Duration::from_millis(500);
+    let world_ref = &world;
+    let end = drive(&world, launch, |turn_id| async move {
+        let world = world_ref;
+        let _relay = Relay::connect(world).await;
+        world.registry.close_signals(&turn_id);
+    })
+    .await;
+    assert_eq!(end, RunEnd::Finished);
+    assert_eq!(only_turn(&world).status, "failed");
+}
+
+#[tokio::test]
+async fn an_ended_request_listener_does_not_park_the_turn_and_the_end_and_the_stall_timer_still_work(
+) {
+    for stalls in [false, true] {
+        let world = World::new();
+        install_waiting(&world);
+        let mut launch = world.launch("go");
+        if stalls {
+            launch.stall_timeout = Duration::from_millis(500);
+            launch.tool_stall_timeout = Duration::from_millis(500);
+        }
+        let world_ref = &world;
+        let end = drive(&world, launch, |_| async move {
+            let world = world_ref;
+            let _relay = Relay::connect(world).await;
+            approvals::abort_last_accepter();
+            if !stalls {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                finish_cli(world);
+            }
+        })
+        .await;
+        assert_eq!(end, RunEnd::Finished);
+        assert_eq!(
+            only_turn(&world).status,
+            if stalls { "failed" } else { "completed" }
+        );
+    }
 }

@@ -96,6 +96,15 @@ const PROTECTED_IN_HOME: [&str; 68] = [
 
 const PROTECTED_ABSOLUTE: [&str; 1] = ["/Volumes"];
 
+const SETTINGS_IN_FOLDER: [&str; 6] = [
+    ".claude",
+    ".git/hooks",
+    ".git/config",
+    ".husky",
+    ".envrc",
+    ".mcp.json",
+];
+
 #[derive(Debug, Clone)]
 pub struct Scope {
     pub home: Option<PathBuf>,
@@ -259,6 +268,12 @@ pub fn turn_settings(
                 .flat_map(move |tool| [format!("{tool}({rule})"), format!("{tool}({rule}/**)")])
         })
         .collect();
+    for relative in SETTINGS_IN_FOLDER {
+        let rule = rule_path(&folder.join(relative));
+        deny.push(format!("Edit({rule})"));
+        deny.push(format!("Edit({rule}/**)"));
+    }
+    deny.push(crate::approvals::PROMPT_TOOL.to_owned());
     deny.push(CANARY_TOOL.to_owned());
     let blocked: Vec<String> = protected.iter().map(|path| text(path)).collect();
     json!({
@@ -282,6 +297,7 @@ pub fn turn_settings(
         },
         "permissions": {
             "blockReadsOutsideWorkingDirectories": true,
+            "blockWritesOutsideWorkingDirectories": true,
             "ask": ["Bash", "WebFetch", "WebSearch"],
             "allow": [format!("Read({own}/**)"), format!("Edit({own}/**)")],
             "deny": deny
@@ -338,6 +354,10 @@ mod tests {
             true
         );
         assert_eq!(
+            value["permissions"]["blockWritesOutsideWorkingDirectories"],
+            true
+        );
+        assert_eq!(
             value["permissions"]["ask"],
             json!(["Bash", "WebFetch", "WebSearch"])
         );
@@ -364,11 +384,24 @@ mod tests {
             "Edit(//Users/me/Agents/bo/**)",
             "Read(//Users/me/Library/Application Support/Shikigami/**)",
             "Edit(//Users/me/Library/Application Support/Shikigami)",
+            "Edit(//Users/me/Agents/ada/.claude)",
+            "Edit(//Users/me/Agents/ada/.claude/**)",
+            "Edit(//Users/me/Agents/ada/.git/hooks)",
+            "Edit(//Users/me/Agents/ada/.git/hooks/**)",
+            "Edit(//Users/me/Agents/ada/.git/config)",
+            "Edit(//Users/me/Agents/ada/.git/config/**)",
+            "Edit(//Users/me/Agents/ada/.husky)",
+            "Edit(//Users/me/Agents/ada/.husky/**)",
+            "Edit(//Users/me/Agents/ada/.envrc)",
+            "Edit(//Users/me/Agents/ada/.envrc/**)",
+            "Edit(//Users/me/Agents/ada/.mcp.json)",
+            "Edit(//Users/me/Agents/ada/.mcp.json/**)",
         ] {
             assert!(deny.contains(&rule), "{rule}");
         }
         assert_eq!(deny.last(), Some(&"NotebookEdit"));
-        assert!(deny[..deny.len() - 1]
+        assert_eq!(deny[deny.len() - 2], "mcp__shikigami__approve");
+        assert!(deny[..deny.len() - 2]
             .iter()
             .all(|rule| rule.starts_with("Read(//") || rule.starts_with("Edit(//")));
     }
@@ -438,7 +471,7 @@ mod tests {
         );
         assert_eq!(
             strings(&value["permissions"]["deny"]).len(),
-            read.len() * 4 + 1
+            read.len() * 4 + 14
         );
         for path in [
             "/Users/me/.ssh",
@@ -492,7 +525,15 @@ mod tests {
         assert!(!read.contains(&"/Users/me/Agents"));
         assert!(read.contains(&"/Users/me/Agents/bo"));
         let deny = strings(&value["permissions"]["deny"]);
-        assert!(deny.iter().all(|rule| !rule.contains("Agents/ada")));
+        for rule in deny.iter().filter(|rule| rule.contains("Agents/ada")) {
+            assert!(rule.starts_with("Edit(//Users/me/Agents/ada/."), "{rule}");
+        }
+        assert_eq!(
+            deny.iter()
+                .filter(|rule| rule.contains("Agents/ada"))
+                .count(),
+            12
+        );
         assert!(deny
             .iter()
             .all(|rule| !rule.contains("(//Users/me/Agents)")));

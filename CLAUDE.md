@@ -72,6 +72,9 @@ Build an agent CLI's environment from an allowlist (HOME, USER, LOGNAME, SHELL, 
 TERM, PATH); never pass the app's whole environment.
 Anything that starts a turn or spawns a provider process must refuse while the app is shutting down
 (`TurnRegistry` closing); `kill_all` runs on the main thread while runner tasks keep running.
+Anything that can reach the permission prompt host must be a request the spec says to ask about. Refused
+actions (writes outside the folder, protected-path and settings-file writes) are refused in the turn
+settings themselves, never left to the user's answer.
 
 ## Provider sign-in
 

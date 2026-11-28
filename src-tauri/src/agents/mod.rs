@@ -1132,6 +1132,20 @@ mod tests {
             .unwrap()
         });
         assert_eq!(states(&fx)["Waiting"], AgentState::Working);
+        let grouped = fx.create("Grouped", "claude-code").unwrap();
+        fx.db.with_connection(|c| {
+            c.execute_batch(
+                "INSERT INTO groups VALUES ('g', 'Team', '/g', NULL, 1, 1);",
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO turns (id, agent_id, status, started_at, group_id) VALUES ('t9', ?1, 'running', 1, 'g')",
+                [&grouped.id],
+            )
+            .unwrap();
+        });
+        add("p9", "t9", "pending");
+        assert_eq!(states(&fx)["Grouped"], AgentState::Working);
     }
 
     #[test]

@@ -250,20 +250,28 @@ export function TurnView({
     : null;
   const reply = (
     <>
-      {steps.length > 0 && (
-        <Steps steps={steps} tint={tintClass(author?.color ?? color ?? "slate")} />
-      )}
-      {texts.map((item) => (
-        <Markdown key={item.id} text={item.text} members={members} />
-      ))}
-      {approvals.map((approval) => (
-        <ApprovalCard
-          key={approval.id}
-          approval={approval}
-          name={author?.name ?? name ?? "Agent"}
-          color={author?.color ?? color ?? "slate"}
-        />
-      ))}
+      {turn.items.map((item) => {
+        if (item.type === "step") {
+          return item.id === steps[0]?.id ? (
+            <Steps key="steps" steps={steps} tint={tintClass(author?.color ?? color ?? "slate")} />
+          ) : null;
+        }
+        if (item.type === "text") {
+          return <Markdown key={item.id} text={item.text} members={members} />;
+        }
+        if (item.type === "approval") {
+          return (
+            <ApprovalCard
+              key={item.id}
+              approval={item}
+              name={author?.name ?? name ?? "Agent"}
+              color={author?.color ?? color ?? "slate"}
+              showName={!author}
+            />
+          );
+        }
+        return null;
+      })}
       <HandOffMarkers turn={turn} members={members} />
       {turn.status === "running" &&
         texts.length === 0 &&

@@ -12,6 +12,8 @@ use tauri::State;
 use crate::db::Database;
 use crate::turns::TurnRegistry;
 
+#[cfg(test)]
+pub use session::abort_last_accepter;
 pub use session::{socket_dir, Channel, Inbound};
 pub use store::{group_waiting, ApprovalView};
 
@@ -24,6 +26,7 @@ pub const MAX_OPEN: usize = 32;
 pub const DENY_USER: &str = "The user denied this request.";
 pub const DENY_TIMEOUT: &str = "No answer within 10 minutes, so this request was denied.";
 pub const DENY_STOP: &str = "The turn stopped, so this request was denied.";
+pub const DENY_INTERRUPTED: &str = "The request was interrupted, so it was denied.";
 pub const DENY_SHUTDOWN: &str = "Shikigami was closing, so this request was denied.";
 pub const DENY_UNREACHABLE: &str = "Shikigami could not ask the user, so this request was denied.";
 pub const DENY_BUSY: &str = "Too many requests are waiting for the user, so this one was denied.";
